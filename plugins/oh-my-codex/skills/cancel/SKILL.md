@@ -81,6 +81,14 @@ When cancellation targets Ralph state in a scope, completion requires all of the
 
 `--all` is intentionally unsupported. Workspace-wide destructive cancellation requires a separately reviewed command and authority contract. Unknown flags and mixed flag combinations fail before mutation.
 
+### Exact canonical recovery under resumed ownership drift
+
+The native `PreToolUse` exemption accepts an inherited non-empty `NODE_EXTRA_CA_CERTS` only for the exact canonical `omx cancel` command shape (and workflow-supported `--force`). This does not relax `NODE_OPTIONS`, loader/import hooks, `OPENSSL_CONF`, shell startup/function injection, PATH/PATHEXT shadowing, leading assignments, command chaining, noncanonical executable resolution, or unrelated commands.
+
+For session-scoped cancellation, a stale top-level `owner_codex_session_id` in `skill-active-state.json` may be replaced—not aliased—only inside the existing cancellation transaction after the current pointer, native owner sidecar, canonical target session, and all nested owner/session evidence agree. Displaced owner evidence must be positively absent or stale/dead; live, malformed, foreign, indeterminate, nested-contradictory, or cross-session evidence fails closed. If the skill marker is absent, mode-only cancellation keeps its existing behavior and does not create one.
+
+The replacement and terminal skill state are serialized as one final skill payload. Cancellation retains all-target prevalidation, `O_NOFOLLOW`, content/identity revalidation, per-file sync, and reverse rollback. These are in-process transaction guarantees, not crash-atomic multi-file visibility; rollback restoration failures are reported rather than presented as successful cleanup.
+
 ```text
 /cancel
 /cancel --force

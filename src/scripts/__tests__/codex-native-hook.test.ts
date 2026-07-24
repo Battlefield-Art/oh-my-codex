@@ -12852,20 +12852,29 @@ exit 0
 					delete process.env.OMX_QUESTION_RETURN_PANE;
 				}
 			})(), /OMX_QUESTION_RETURN_PANE=\$TMUX_PANE/);
-			await assertAllowed("direct documented cancellation", await withCleanRunnerNodeEnvironment(async () => {
+			const directCancelResults = await withCleanRunnerNodeEnvironment(async () => {
 				const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
 				const trustedBinDir = await mkdtemp(join(tmpdir(), "omx-di-trusted-bin-"));
 				await symlink(workspacePackageCli, join(trustedBinDir, "omx"));
 				const inheritedPath = process.env.PATH;
 				process.env.PATH = `${trustedBinDir}:${dirname(process.execPath)}`;
 				try {
-					return await bash("omx cancel", "omx-cancel");
+					const plain = await bash("omx cancel", "omx-cancel");
+					process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
+					return {
+						plain,
+						caPlain: await bash("omx cancel", "omx-cancel-ca"),
+						caForce: await bash("omx cancel --force", "omx-cancel-ca-force"),
+					};
 				} finally {
 					if (inheritedPath === undefined) delete process.env.PATH;
 					else process.env.PATH = inheritedPath;
 					await rm(trustedBinDir, { recursive: true, force: true });
 				}
-			}));
+			});
+			await assertAllowed("direct documented cancellation", directCancelResults.plain);
+			await assertAllowed("inherited CA direct documented cancellation", directCancelResults.caPlain);
+			await assertDenied("inherited CA does not bypass Deep Interview force cancellation guard", directCancelResults.caForce, /Deep-interview is active|write intent|handoff|direct/);
 			await assertDenied("chained cancellation is not documented direct cancellation", await bash("printf ready && omx cancel", "omx-cancel-chained"), /Deep-interview is active|write intent|handoff|direct/);
 			await assertDenied("force cancellation is ralplan/conductor-only", await bash("omx cancel --force", "omx-cancel-force"), /Deep-interview is active|write intent|handoff|direct/);
 			await assertDenied("bom lookalike is not direct cancellation", await bash("\ufeffomx cancel", "omx-cancel-bom"), /Deep-interview is active|write intent|handoff|direct/);
@@ -20906,11 +20915,10 @@ PY`,
 
   // Direct-cancel positives must prove behavior in a clean execution context,
   // but the test runner itself may inherit Node startup/output instrumentation
-  // (e.g. NODE_V8_COVERAGE from the coverage lane). Clear only the runner's
-  // baseline values around clean-context assertions; per-case injected values
-  // in denial tests are set explicitly afterwards and still exercise the
-  // product predicate. Mirrors DIRECT_OMX_CANCEL_UNSAFE_INHERITED_ENV_NAMES
-  // and CONDUCTOR_NODE_OUTPUT_ENVIRONMENT_NAMES in the hook.
+  // (e.g. NODE_V8_COVERAGE from the coverage lane). Clear all listed baseline
+  // values, including the tolerated NODE_EXTRA_CA_CERTS, solely to establish a
+  // deterministic baseline; denial cases inject unsafe values explicitly.
+  // The list is a test-environment reset, not the hook's unsafe-env denylist.
   const RUNNER_BASELINE_NODE_ENV_NAMES = [
     "NODE_OPTIONS",
     "NODE_EXTRA_CA_CERTS",
@@ -21194,6 +21202,15 @@ PY`,
       }));
       assert.equal(cleanPositives.plain.outputJson, null);
       assert.equal(cleanPositives.force.outputJson, null);
+      const inheritedCaPositives = await withCleanRunnerNodeEnvironment(async () => {
+        process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
+        return {
+          plain: await bashTrusted("omx cancel"),
+          force: await bashTrusted("omx cancel --force"),
+        };
+      });
+      assert.equal(inheritedCaPositives.plain.outputJson, null);
+      assert.equal(inheritedCaPositives.force.outputJson, null);
       assert.equal((await bash("omx cancel")).outputJson?.decision, "block",
         "ambient non-package omx resolution is not trusted");
 
@@ -21254,13 +21271,17 @@ PY`,
         ["inherited node coverage output", "NODE_V8_COVERAGE", "/tmp/coverage-out"],
       ] as const) {
         const previousValue = process.env[envName];
+        const previousCa = process.env.NODE_EXTRA_CA_CERTS;
         process.env[envName] = envValue;
+        process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
         try {
           const poisoned = await bashTrusted("omx cancel");
-          assert.equal(poisoned.outputJson?.decision, "block", label);
+          assert.equal(poisoned.outputJson?.decision, "block", `${label} with inherited CA`);
         } finally {
           if (previousValue === undefined) delete process.env[envName];
           else process.env[envName] = previousValue;
+          if (previousCa === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+          else process.env.NODE_EXTRA_CA_CERTS = previousCa;
         }
       }
 
@@ -31654,6 +31675,15 @@ PY`,
       }));
       assert.equal(cleanPositives.plain.outputJson, null);
       assert.equal(cleanPositives.force.outputJson, null);
+      const inheritedCaPositives = await withCleanRunnerNodeEnvironment(async () => {
+        process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
+        return {
+          plain: await bashTrusted("omx cancel"),
+          force: await bashTrusted("omx cancel --force"),
+        };
+      });
+      assert.equal(inheritedCaPositives.plain.outputJson, null);
+      assert.equal(inheritedCaPositives.force.outputJson, null);
       assert.equal((await bash("omx cancel")).outputJson?.decision, "block",
         "ambient non-package omx resolution is not trusted");
 
@@ -31681,12 +31711,16 @@ PY`,
       ] as const) {
         const previousValue = process.env[envName];
         process.env[envName] = envValue;
+        const previousCa = process.env.NODE_EXTRA_CA_CERTS;
+        process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
         try {
           const poisoned = await bashTrusted("omx cancel");
-          assert.equal(poisoned.outputJson?.decision, "block", label);
+          assert.equal(poisoned.outputJson?.decision, "block", `${label} with inherited CA`);
         } finally {
           if (previousValue === undefined) delete process.env[envName];
           else process.env[envName] = previousValue;
+          if (previousCa === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+          else process.env.NODE_EXTRA_CA_CERTS = previousCa;
         }
       }
 

@@ -8883,7 +8883,6 @@ function isAllowedDeepInterviewCommandSpecificBash(
 // and runtime-startup safety model instead of inventing a parallel one.
 const DIRECT_OMX_CANCEL_UNSAFE_INHERITED_ENV_NAMES = [
   "NODE_OPTIONS",
-  "NODE_EXTRA_CA_CERTS",
   "OPENSSL_CONF",
 ];
 

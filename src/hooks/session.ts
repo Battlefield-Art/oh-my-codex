@@ -20,7 +20,7 @@ import {
   unlink as nodeUnlink,
   writeFile as nodeWriteFile,
 } from 'fs/promises';
-import { readFileSync } from 'fs';
+import { constants as fsConstants, readFileSync } from 'fs';
 import type { FileHandle } from 'fs/promises';
 import { createHash, randomUUID } from 'crypto';
 import { basename, dirname, join } from 'path';
@@ -82,6 +82,8 @@ export interface SessionPointerReadResult {
   raw?: string;
 }
 
+/** Classified native session-owner sidecar evidence for fail-closed consumers. */
+export interface NativeSessionOwnerEvidence extends SessionPointerReadResult {}
 export type SessionPointerTransactionOperation =
   | 'pointer-context-resolve'
   | 'state-dir-create'
@@ -2409,24 +2411,83 @@ export async function writeNativeSessionOwner(
   return result.value;
 }
 
+/** Read and classify the exact native session-owner sidecar without consulting alternate roots. */
+export async function readNativeSessionOwnerEvidence(
+  cwd: string,
+  nativeSessionId: string,
+): Promise<NativeSessionOwnerEvidence> {
+  const normalized = normalizeSessionId(nativeSessionId);
+  if (!normalized) return { status: 'malformed' };
+  const context = resolveNativeSessionOwnerContext(cwd, normalized);
+  const nativeOwnerDir = dirname(context.sessionPath);
+  const sessionsDir = dirname(nativeOwnerDir);
+  const stateRootDir = dirname(sessionsDir);
+  const directoryPaths = [stateRootDir, sessionsDir, nativeOwnerDir];
+  const directoryIdentities: Array<{ path: string; dev: number; ino: number }> = [];
+  try {
+    for (const directoryPath of directoryPaths) {
+      const stat = await transactionDependencies.fs.lstat(directoryPath);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return { status: 'malformed' };
+      directoryIdentities.push({ path: directoryPath, dev: stat.dev, ino: stat.ino });
+    }
+    const pathStat = await transactionDependencies.fs.lstat(context.sessionPath);
+    if (pathStat.isSymbolicLink() || !pathStat.isFile()) return { status: 'malformed' };
+  } catch (error) {
+    if (isNotFound(error)) return { status: 'absent' };
+    throw error;
+  }
+
+  const handle = await open(context.sessionPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let raw: string;
+  try {
+    const openedStat = await handle.stat();
+    if (!openedStat.isFile()) return { status: 'malformed' };
+    raw = await handle.readFile({ encoding: 'utf8' });
+    const finalPathStat = await transactionDependencies.fs.lstat(context.sessionPath);
+    if (finalPathStat.isSymbolicLink()
+      || finalPathStat.dev !== openedStat.dev
+      || finalPathStat.ino !== openedStat.ino) {
+      return { status: 'malformed', raw };
+    }
+    for (const identity of directoryIdentities) {
+      const finalDirectoryStat = await transactionDependencies.fs.lstat(identity.path);
+      if (finalDirectoryStat.isSymbolicLink()
+        || !finalDirectoryStat.isDirectory()
+        || finalDirectoryStat.dev !== identity.dev
+        || finalDirectoryStat.ino !== identity.ino) {
+        return { status: 'malformed', raw };
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+
+  let pointer: SessionPointerReadResult;
+  try {
+    pointer = classifyParsedSessionPointer(context, JSON.parse(raw), raw);
+  } catch (error) {
+    if (error instanceof SyntaxError) return { status: 'malformed', raw };
+    throw error;
+  }
+  if (pointer.status === 'absent' || pointer.status === 'foreign-cwd' || pointer.status === 'malformed' || pointer.status === 'identity-indeterminate') {
+    return pointer;
+  }
+  const state = pointer.state;
+  return state?.session_id === normalized
+    && state.native_session_id === normalized
+    && state.platform === process.platform
+    && isSessionStateAuthoritativeForCwd(state, context.cwd)
+    ? pointer
+    : { status: 'malformed', state, raw: pointer.raw };
+}
+
 export async function readNativeSessionOwner(
   cwd: string,
   nativeSessionId: string,
 ): Promise<SessionState | null> {
-  const normalized = normalizeSessionId(nativeSessionId);
-  if (!normalized) return null;
   try {
-    const context = resolveNativeSessionOwnerContext(cwd, normalized);
-    const pointer = await readSessionPointer(
-      context,
-    );
-    const state = pointer.status === 'usable' ? pointer.state : undefined;
-    return state?.session_id === normalized
-      && state.native_session_id === normalized
-      && state.platform === process.platform
-      && isSessionStateAuthoritativeForCwd(state, context.cwd)
-      ? state
-      : null;
+    const evidence = await readNativeSessionOwnerEvidence(cwd, nativeSessionId);
+    return evidence.status === 'usable' ? evidence.state ?? null : null;
   } catch {
     return null;
   }

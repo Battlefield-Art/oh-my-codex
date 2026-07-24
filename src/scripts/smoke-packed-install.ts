@@ -3580,6 +3580,78 @@ PY`],
     symlinkSync(workspacePackageCli, packedNpmOmxShim);
     const packedNpmPath = `${packedNpmBinDir}:${process.env.PATH || '/usr/bin:/bin'}`;
     const packedNpmCommandPrefix = `PATH="${packedNpmBinDir}:/usr/bin:/bin"`;
+    const packedCancelCwd = join(smokeCwd, 'issue-3280-packed-cancel');
+    const packedCancelStateDir = join(packedCancelCwd, '.omx', 'state');
+    const packedCancelSessionId = 'issue-3280-current';
+    const packedCancelNativeId = 'issue-3280-native';
+    const packedCancelStaleOwner = 'issue-3280-stale';
+    const packedCancelSessionDir = join(packedCancelStateDir, 'sessions', packedCancelSessionId);
+    mkdirSync(packedCancelSessionDir, { recursive: true });
+    writeFileSync(join(packedCancelStateDir, 'session.json'), JSON.stringify({
+      session_id: packedCancelSessionId,
+      native_session_id: packedCancelNativeId,
+      cwd: packedCancelCwd,
+      state_root: packedCancelStateDir,
+    }));
+    const packedCancelOwnerDir = join(packedCancelStateDir, 'sessions', packedCancelNativeId);
+    mkdirSync(packedCancelOwnerDir, { recursive: true });
+    writeFileSync(join(packedCancelOwnerDir, 'session-owner.json'), JSON.stringify({
+      session_id: packedCancelNativeId,
+      native_session_id: packedCancelNativeId,
+      cwd: packedCancelCwd,
+      platform: process.platform,
+    }));
+    writeFileSync(join(packedCancelSessionDir, 'skill-active-state.json'), JSON.stringify({
+      active: true,
+      skill: 'ultragoal',
+      session_id: packedCancelSessionId,
+      owner_codex_session_id: packedCancelStaleOwner,
+      active_skills: [{
+        skill: 'ultragoal',
+        active: true,
+        session_id: packedCancelSessionId,
+        owner_codex_session_id: packedCancelNativeId,
+      }],
+    }, null, 2));
+    writeFileSync(join(packedCancelSessionDir, 'ultragoal-state.json'), JSON.stringify({
+      active: true,
+      mode: 'ultragoal',
+      session_id: packedCancelSessionId,
+    }, null, 2));
+    const packedCancelHookResult = invokeAuthorizationProbe({
+      hook_event_name: 'PreToolUse',
+      cwd: smokeCwd,
+      session_id: leaderAgentId,
+      agent_id: leaderAgentId,
+      thread_id: leaderAgentId,
+      tool_name: 'Bash',
+      tool_use_id: 'packed-install-issue-3280-cancel',
+      tool_input: { command: 'omx cancel --force' },
+    }, {
+      ...childEnv,
+      PATH: packedNpmPath,
+      NODE_EXTRA_CA_CERTS: '/nonexistent/enterprise-ca.pem',
+    });
+    if (Object.keys(parseNativeHookSmokeOutput('PreToolUse packed issue 3280 cancel', String(packedCancelHookResult.stdout))).length !== 0) {
+      throw new Error('packed native hook blocked exact canonical cancel with inherited NODE_EXTRA_CA_CERTS');
+    }
+    const packedCancelResult = spawnSync(process.execPath, [workspacePackageCli, 'cancel', '--force'], {
+      cwd: packedCancelCwd,
+      encoding: 'utf-8',
+      env: {
+        ...process.env,
+        PATH: packedNpmPath,
+        NODE_EXTRA_CA_CERTS: '/nonexistent/enterprise-ca.pem',
+      },
+    });
+    assertBoundedProbeExit('packed issue 3280 exact-session cancel', packedCancelResult, 0);
+    const packedCancelledSkill = JSON.parse(readFileSync(join(packedCancelSessionDir, 'skill-active-state.json'), 'utf-8')) as Record<string, unknown>;
+    if (packedCancelledSkill.active !== false || packedCancelledSkill.owner_codex_session_id !== packedCancelNativeId) {
+      throw new Error('packed issue 3280 cancellation did not reconcile and terminalize the exact skill state');
+    }
+    if (existsSync(join(packedCancelStateDir, 'skill-active-state.json'))) {
+      throw new Error('packed issue 3280 cancellation mutated root compatibility state');
+    }
     requireNativeHookPermissionDeny(
       'main-root boxed planning CLI poisoned state root',
       runActorProbe(
