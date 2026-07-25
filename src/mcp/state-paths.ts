@@ -2,6 +2,7 @@ import { delimiter, isAbsolute, join, relative, resolve as resolvePath } from 'p
 import { existsSync, realpathSync, readFileSync } from 'fs';
 import { readFile, readdir } from 'fs/promises';
 import {
+  classifySessionStateLiveness,
   isSessionStateUsable,
   readUsableSessionState,
   type SessionState,
@@ -20,6 +21,8 @@ const OMX_SESSION_ID_ENV = 'OMX_SESSION_ID';
 export const WRITABLE_STATE_SCOPE_ERRORS = {
   unusableSession: 'Cannot resolve writable state scope: session.json is present but unusable.',
   unboundEnvironment: 'Cannot resolve writable state scope: OMX_SESSION_ID is not bound to session.json.',
+  sessionBindingMismatch: 'Cannot resolve writable state scope: OMX_SESSION_ID does not match the live session recorded in session.json.',
+  scopeChangedDuringWrite: 'Cannot commit the state write: the writable state scope changed while the write was in progress.',
 } as const;
 
 
@@ -99,7 +102,7 @@ export function validateStateModeSegment(mode: unknown): string {
   return normalized;
 }
 
-function getStateFilename(mode: string): string {
+export function getStateFilename(mode: string): string {
   return `${validateStateModeSegment(mode)}${STATE_FILE_SUFFIX}`;
 }
 
@@ -406,34 +409,71 @@ function resolveCanonicalSessionId(candidate: string | undefined, metadata: Reso
     : candidate;
 }
 
+interface AuthoritativeSessionSnapshot {
+  raw: string;
+  state: SessionState;
+  recordedCwd: string;
+}
+
+/**
+ * Read the selected session.json once and return the parsed snapshot only
+ * when it holds full selected-root authority for this exact base state
+ * directory: a nonempty recorded cwd that contains the observed cwd, and a
+ * recorded state_root canonical-equal to the selected base (with the
+ * historical cwd-derived fallback when state_root is absent). Usability/
+ * liveness is deliberately NOT checked here so stale-dead recovery can
+ * evaluate authority AND liveness from the same immutable bytes. A malformed
+ * or non-authoritative pointer returns null (fail closed); unexpected read
+ * I/O errors propagate instead of being collapsed into a generic classification.
+ */
+async function readAuthoritativeSessionSnapshotFromBaseStateDir(
+  cwd: string,
+  baseStateDir = getBaseStateDir(cwd),
+): Promise<AuthoritativeSessionSnapshot | null> {
+  const sessionPath = join(baseStateDir, 'session.json');
+  let raw: string;
+  try {
+    raw = await readFile(sessionPath, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw error;
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    if (error instanceof SyntaxError) return null;
+    throw error;
+  }
+  // JSON null, arrays, and scalars are syntactically valid but are not pointer
+  // objects; treat them as malformed so they fail closed on the stable
+  // unusable-session error instead of throwing on property access.
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+  const state = parsed as SessionState;
+  const recordedCwd = typeof state.cwd === 'string' ? canonicalizeExistingPath(resolvePath(state.cwd)) : '';
+  const recordedStateRoot = typeof state.state_root === 'string'
+    ? canonicalizeExistingPath(resolvePath(state.state_root))
+    : recordedCwd
+      ? canonicalizeExistingPath(join(recordedCwd, '.omx', 'state'))
+      : '';
+  const canonicalBaseStateDir = canonicalizeExistingPath(baseStateDir);
+  const canonicalObservedCwd = canonicalizeExistingPath(resolvePath(cwd));
+  const authorityOwnsObservedCwd = Boolean(
+    recordedCwd
+    && recordedStateRoot === canonicalBaseStateDir
+    && isWithinRoot(canonicalObservedCwd, recordedCwd),
+  );
+  if (!authorityOwnsObservedCwd) return null;
+  return { raw, state, recordedCwd };
+}
+
 async function readUsableSessionStateFromBaseStateDir(
   cwd: string,
   baseStateDir = getBaseStateDir(cwd),
 ): Promise<SessionState | null> {
-  const sessionPath = join(baseStateDir, 'session.json');
-  if (!existsSync(sessionPath)) return null;
-
-  try {
-    const content = await readFile(sessionPath, 'utf-8');
-    const state = JSON.parse(content) as SessionState;
-    const recordedCwd = typeof state.cwd === 'string' ? canonicalizeExistingPath(resolvePath(state.cwd)) : '';
-    const recordedStateRoot = typeof state.state_root === 'string'
-      ? canonicalizeExistingPath(resolvePath(state.state_root))
-      : recordedCwd
-        ? canonicalizeExistingPath(join(recordedCwd, '.omx', 'state'))
-        : '';
-    const canonicalBaseStateDir = canonicalizeExistingPath(baseStateDir);
-    const canonicalObservedCwd = canonicalizeExistingPath(resolvePath(cwd));
-    const authorityOwnsObservedCwd = Boolean(
-      recordedCwd
-      && recordedStateRoot === canonicalBaseStateDir
-      && isWithinRoot(canonicalObservedCwd, recordedCwd),
-    );
-    if (!authorityOwnsObservedCwd) return null;
-    return isSessionStateUsable(state, recordedCwd) ? state : null;
-  } catch {
-    return null;
-  }
+  const snapshot = await readAuthoritativeSessionSnapshotFromBaseStateDir(cwd, baseStateDir);
+  return snapshot && isSessionStateUsable(snapshot.state, snapshot.recordedCwd) ? snapshot.state : null;
 }
 function normalizeSessionMetadata(state: SessionState | null, sourcePath?: string): ResolvedSessionMetadata | undefined {
   const sessionId = normalizeSessionId(state?.session_id);
@@ -510,12 +550,73 @@ function isKnownSessionAlias(sessionId: string, metadata: ResolvedSessionMetadat
 }
 
 
+export type WritableCommitOperation =
+  | 'startMode'
+  | 'updateModeState'
+  | 'state_write'
+  | 'state_clear'
+  | 'completeRalplanSession';
+
+export type WritableCommitKind = 'write' | 'unlink';
+
+export type WritableCommitSite =
+  | 'transition.source-mode-detail'
+  | 'mode.primary'
+  | 'run-state.mode-sync'
+  | 'skill-active.root-copy'
+  | 'skill-active.session-copy'
+  | 'skill-active.session-unlink'
+  | 'state-clear.primary'
+  | 'native-stop.root'
+  | 'native-stop.session'
+  | 'ralplan.root-state'
+  | 'ralplan.session-state'
+  | 'ralplan.root-skill-write'
+  | 'ralplan.root-skill-unlink'
+  | 'ralplan.session-skill-write';
+
+export interface WritableCommitAttempt {
+  site: WritableCommitSite;
+  kind: WritableCommitKind;
+  path: string;
+}
+
+export interface WritableScopeRevalidationEvent extends WritableCommitAttempt {
+  operation: WritableCommitOperation;
+  commitOrdinal: number;
+}
+
+export type BeforeWritableCommit = (event: WritableCommitAttempt) => Promise<void>;
+
+export interface WritableStateScopeTestHooks {
+  beforeRecoveryReread?: () => Promise<void>;
+  beforeScopeRevalidation?: (event: Readonly<WritableScopeRevalidationEvent>) => Promise<void>;
+  onSelectedDecisionSnapshotRead?: (event: Readonly<{ ordinal: number; raw: string }>) => void;
+  onRecoveryStabilityReread?: (event: Readonly<{ ordinal: number; raw: string | undefined }>) => void;
+}
+
+let selectedPointerRecoveryHookForTests: (() => Promise<void>) | undefined;
+let writableScopeRevalidationHookForTests: WritableStateScopeTestHooks['beforeScopeRevalidation'];
+let selectedDecisionSnapshotReadHookForTests: WritableStateScopeTestHooks['onSelectedDecisionSnapshotRead'];
+let recoveryStabilityRereadHookForTests: WritableStateScopeTestHooks['onRecoveryStabilityReread'];
+
+export function __setWritableStateScopeTestHooksForTests(hooks: WritableStateScopeTestHooks): void {
+  selectedPointerRecoveryHookForTests = hooks.beforeRecoveryReread;
+  writableScopeRevalidationHookForTests = hooks.beforeScopeRevalidation;
+  selectedDecisionSnapshotReadHookForTests = hooks.onSelectedDecisionSnapshotRead;
+  recoveryStabilityRereadHookForTests = hooks.onRecoveryStabilityReread;
+}
+
+
 /**
  * Writable scope precedence:
  * - explicit session_id preserves explicit fork writes;
  * - a usable session.json supplies the only implicit session scope;
  * - OMX_SESSION_ID may bind a known alias only when the live tmux pane proves
  *   the canonical session tag;
+ * - a stale-dead session.json yields to an explicit exact-current
+ *   OMX_SESSION_ID binding (the dead owner holds no authority; SessionStart
+ *   remains the only pointer writer);
  * - root writes are allowed only when session.json is absent.
  */
 export async function resolveWritableStateScope(
@@ -524,7 +625,14 @@ export async function resolveWritableStateScope(
 ): Promise<ResolvedStateScope> {
   const cwd = resolveWorkingDirectoryForState(workingDirectory);
   const baseStateDir = getBaseStateDir(cwd);
-  const metadata = await readSessionMetadataFromBaseStateDir(cwd, baseStateDir);
+  let selectedDecisionSnapshotReadOrdinalForTests = 0;
+  let recoveryStabilityRereadOrdinalForTests = 0;
+  const snapshot = await readAuthoritativeSessionSnapshotFromBaseStateDir(cwd, baseStateDir);
+  const liveness = snapshot ? classifySessionStateLiveness(snapshot.state) : undefined;
+  const metadata = normalizeSessionMetadata(
+    snapshot && liveness === 'usable' ? snapshot.state : null,
+    join(baseStateDir, 'session.json'),
+  );
   const validatedExplicit = validateSessionId(explicitSessionId);
   if (validatedExplicit) {
     const sessionId = resolveCanonicalSessionId(validatedExplicit, metadata) ?? validatedExplicit;
@@ -536,7 +644,40 @@ export async function resolveWritableStateScope(
   }
 
   if (!metadata) {
-    if (existsSync(join(baseStateDir, 'session.json'))) {
+    const sessionPath = join(baseStateDir, 'session.json');
+    if (existsSync(sessionPath)) {
+      const envSessionId = normalizeSessionId(process.env[OMX_SESSION_ID_ENV]);
+      if (snapshot && selectedDecisionSnapshotReadHookForTests) {
+        selectedDecisionSnapshotReadHookForTests({
+          ordinal: ++selectedDecisionSnapshotReadOrdinalForTests,
+          raw: snapshot.raw,
+        });
+      }
+      if (
+        envSessionId
+        && snapshot
+        && normalizeSessionId(snapshot.state.session_id)
+        && liveness === 'stale-dead'
+      ) {
+        if (selectedPointerRecoveryHookForTests) await selectedPointerRecoveryHookForTests();
+        const reread = await readFile(sessionPath, 'utf-8').catch((error: NodeJS.ErrnoException) => {
+          if (error.code === 'ENOENT') return undefined;
+          throw error;
+        });
+        if (recoveryStabilityRereadHookForTests) {
+          recoveryStabilityRereadHookForTests({
+            ordinal: ++recoveryStabilityRereadOrdinalForTests,
+            raw: reread,
+          });
+        }
+        if (reread === snapshot.raw) {
+          return {
+            source: 'session',
+            sessionId: envSessionId,
+            stateDir: join(baseStateDir, 'sessions', envSessionId),
+          };
+        }
+      }
       throw new Error(WRITABLE_STATE_SCOPE_ERRORS.unusableSession);
     }
     if (normalizeSessionId(process.env[OMX_SESSION_ID_ENV])) {
@@ -558,12 +699,63 @@ export async function resolveWritableStateScope(
   }
 
   if (!isKnownSessionAlias(envSessionId, metadata)) {
-    throw new Error(WRITABLE_STATE_SCOPE_ERRORS.unboundEnvironment);
+    throw new Error(WRITABLE_STATE_SCOPE_ERRORS.sessionBindingMismatch);
   }
   return {
     source: 'session',
     sessionId: metadata.sessionId,
     stateDir: join(baseStateDir, 'sessions', metadata.sessionId),
+  };
+}
+
+/**
+ * Point-in-time check performed immediately before the caller's commit. It
+ * reduces, but does not eliminate, the window for a pointer or root
+ * publication to move the selected target: one can still land after this
+ * check returns and before the caller's write, rename, or unlink. Multi-file
+ * sequences are not atomic.
+ */
+export async function assertWritableStateScopeUnchanged(
+  workingDirectory: string | undefined,
+  explicitSessionId: string | undefined,
+  expected: ResolvedStateScope,
+  expectedBaseStateDir: string,
+  event?: Readonly<WritableScopeRevalidationEvent>,
+): Promise<void> {
+  if (writableScopeRevalidationHookForTests) await writableScopeRevalidationHookForTests(event!);
+  const current = await resolveWritableStateScope(workingDirectory, explicitSessionId);
+  const currentBaseStateDir = getBaseStateDirWithSource(workingDirectory).baseStateDir;
+  if (
+    current.source !== expected.source
+    || current.sessionId !== expected.sessionId
+    || current.stateDir !== expected.stateDir
+    || currentBaseStateDir !== expectedBaseStateDir
+  ) {
+    throw new Error(WRITABLE_STATE_SCOPE_ERRORS.scopeChangedDuringWrite);
+  }
+}
+
+export function createWritableCommitRevalidator(options: {
+  operation: WritableCommitOperation;
+  cwd: string;
+  explicitSessionId: string | undefined;
+  capturedScope: ResolvedStateScope;
+  baseStateDir: string;
+}): BeforeWritableCommit {
+  let commitOrdinal = 0;
+  return async (attempt) => {
+    const event: WritableScopeRevalidationEvent = {
+      operation: options.operation,
+      commitOrdinal: ++commitOrdinal,
+      ...attempt,
+    };
+    await assertWritableStateScopeUnchanged(
+      options.cwd,
+      options.explicitSessionId,
+      options.capturedScope,
+      options.baseStateDir,
+      event,
+    );
   };
 }
 

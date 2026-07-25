@@ -1,6 +1,8 @@
 import { existsSync } from 'node:fs';
 import { appendFile, mkdir, open, readFile, rename, rm, writeFile } from 'node:fs/promises';
 import { join, relative } from 'node:path';
+import { resolveWritableStateScope, WRITABLE_STATE_SCOPE_ERRORS } from '../mcp/state-paths.js';
+import type { ResolvedStateScope } from '../mcp/state-paths.js';
 import {
   formatCodexGoalReconciliation,
   buildCompletedCodexGoalRemediation,
@@ -19,6 +21,10 @@ export const ULTRAGOAL_BRIEF = 'brief.md';
 export const ULTRAGOAL_GOALS = 'goals.json';
 export const ULTRAGOAL_LEDGER = 'ledger.jsonl';
 const ULTRAGOAL_MUTATION_LOCK = '.mutation.lock';
+
+export type UltragoalWritableAuthority =
+  | { kind: 'resolved'; source: ResolvedStateScope['source']; sessionId: string | undefined; stateDir: string }
+  | { kind: 'no-pointer-compat' };
 
 export type UltragoalStatus = 'pending' | 'in_progress' | 'complete' | 'failed' | 'review_blocked' | 'needs_user_decision';
 export type UltragoalCodexGoalMode = 'aggregate' | 'per_story';
@@ -802,7 +808,59 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/**
+ * Mutation entry and post-lock acquisition each perform a point-in-time
+ * writable-authority check. A SessionStart publication can still occur after
+ * the second check and before a filesystem write; unrelated resolver failures
+ * propagate and block the mutation.
+ */
+export async function assertUltragoalWritableLifecycleAuthority(cwd: string): Promise<UltragoalWritableAuthority> {
+  try {
+    const scope = await resolveWritableStateScope(cwd);
+    return {
+      kind: 'resolved',
+      source: scope.source,
+      sessionId: scope.sessionId,
+      stateDir: scope.stateDir,
+    };
+  } catch (error) {
+    if (error instanceof Error && error.message === WRITABLE_STATE_SCOPE_ERRORS.unusableSession) {
+      throw new UltragoalError(
+        `Refusing a durable ultragoal mutation before writable lifecycle authority is restored: ${error.message} Bind the exact current session (set OMX_SESSION_ID to the current session id); see docs/troubleshooting.md (stale session pointer recovery).`,
+      );
+    }
+    // Documented compatibility exception only: root-mode projects and unbound
+    // environments (no selected session pointer) keep their existing behavior.
+    // Every other resolver failure — allowlist violations, conflicting
+    // authoritative roots, live-owner binding mismatches, unexpected I/O
+    // errors — stays fail-closed and propagates.
+    if (error instanceof Error && error.message === WRITABLE_STATE_SCOPE_ERRORS.unboundEnvironment) {
+      return { kind: 'no-pointer-compat' };
+    }
+    throw error;
+  }
+}
+
+function writableAuthorityEquals(
+  beforeLock: UltragoalWritableAuthority,
+  afterLock: UltragoalWritableAuthority,
+): boolean {
+  if (beforeLock.kind !== afterLock.kind) return false;
+  if (beforeLock.kind === 'no-pointer-compat') return true;
+  const resolvedAfterLock = afterLock as Extract<UltragoalWritableAuthority, { kind: 'resolved' }>;
+  return beforeLock.source === resolvedAfterLock.source
+    && beforeLock.sessionId === resolvedAfterLock.sessionId
+    && beforeLock.stateDir === resolvedAfterLock.stateDir;
+}
+
+function describeWritableAuthority(authority: UltragoalWritableAuthority): string {
+  return authority.kind === 'no-pointer-compat'
+    ? 'no-pointer-compat'
+    : `resolved(source=${authority.source}, sessionId=${authority.sessionId ?? 'undefined'}, stateDir=${authority.stateDir})`;
+}
+
 async function withUltragoalMutationLock<T>(cwd: string, operation: () => Promise<T>): Promise<T> {
+  const beforeLock = await assertUltragoalWritableLifecycleAuthority(cwd);
   await mkdir(ultragoalDir(cwd), { recursive: true });
   const lockPath = join(ultragoalDir(cwd), ULTRAGOAL_MUTATION_LOCK);
   let handle: Awaited<ReturnType<typeof open>> | undefined;
@@ -821,6 +879,15 @@ async function withUltragoalMutationLock<T>(cwd: string, operation: () => Promis
     throw new UltragoalError(`Timed out waiting for ultragoal mutation lock at ${repoRelative(cwd, lockPath)}.`);
   }
   try {
+    // The post-lock comparison addresses pointer changes while waiting for this
+    // lock only. A SessionStart publication can still land after it and before
+    // the operation's filesystem writes.
+    const afterLock = await assertUltragoalWritableLifecycleAuthority(cwd);
+    if (!writableAuthorityEquals(beforeLock, afterLock)) {
+      throw new UltragoalError(
+        `Refusing durable ultragoal mutation after writable lifecycle authority drift while waiting for the mutation lock: before lock ${describeWritableAuthority(beforeLock)}; after lock ${describeWritableAuthority(afterLock)}.`,
+      );
+    }
     return await operation();
   } finally {
     await handle.close().catch(() => undefined);
@@ -834,7 +901,8 @@ async function appendLedger(cwd: string, entry: UltragoalLedgerEntry): Promise<v
   await appendFile(path, `${JSON.stringify(entry)}\n`);
 }
 
-export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
+/** Pure plan read: no durable writes, no migration. */
+async function readUltragoalPlanFile(cwd: string): Promise<UltragoalPlan> {
   const path = ultragoalGoalsPath(cwd);
   let raw: string;
   try {
@@ -846,22 +914,54 @@ export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
   if (parsed.version !== 1 || !Array.isArray(parsed.goals)) {
     throw new UltragoalError(`Invalid ultragoal plan at ${repoRelative(cwd, path)}.`);
   }
-  if (codexGoalMode(parsed) === 'aggregate' && isLegacyEnumeratedAggregateObjective(parsed.codexObjective)) {
-    const previousObjective = parsed.codexObjective;
-    const now = iso();
-    parsed.codexObjective = aggregateCodexObjective(parsed.goals);
-    parsed.codexObjectiveAliases = Array.from(new Set([...(parsed.codexObjectiveAliases ?? []), previousObjective].filter((value): value is string => typeof value === 'string' && value.length > 0)));
-    parsed.updatedAt = now;
-    await writePlan(cwd, parsed);
-    await appendLedger(cwd, {
-      ts: now,
-      event: 'aggregate_objective_migrated',
-      message: 'Migrated legacy enumerated aggregate Codex objective to the stable pointer objective.',
-      before: { codexObjective: previousObjective },
-      after: { codexObjective: parsed.codexObjective },
-    });
-  }
   return parsed;
+}
+
+/**
+ * Pure, lock-free plan read for read-only surfaces such as
+ * `omx ultragoal status`: never migrates, never writes, and is therefore safe
+ * for Team workers. Durable legacy migration only happens through
+ * readUltragoalPlan or the mutators, under the mutation lock and authority gate.
+ */
+export async function readUltragoalPlanSnapshot(cwd: string): Promise<UltragoalPlan> {
+  return readUltragoalPlanFile(cwd);
+}
+
+function requiresAggregateObjectiveMigration(plan: UltragoalPlan): boolean {
+  return codexGoalMode(plan) === 'aggregate' && isLegacyEnumeratedAggregateObjective(plan.codexObjective);
+}
+
+/** Durable legacy-objective migration; caller MUST hold the mutation lock. */
+async function migrateAggregateObjectiveUnderLock(cwd: string, parsed: UltragoalPlan): Promise<UltragoalPlan> {
+  if (!requiresAggregateObjectiveMigration(parsed)) return parsed;
+  const previousObjective = parsed.codexObjective;
+  const now = iso();
+  parsed.codexObjective = aggregateCodexObjective(parsed.goals);
+  parsed.codexObjectiveAliases = Array.from(new Set([...(parsed.codexObjectiveAliases ?? []), previousObjective].filter((value): value is string => typeof value === 'string' && value.length > 0)));
+  parsed.updatedAt = now;
+  await writePlan(cwd, parsed);
+  await appendLedger(cwd, {
+    ts: now,
+    event: 'aggregate_objective_migrated',
+    message: 'Migrated legacy enumerated aggregate Codex objective to the stable pointer objective.',
+    before: { codexObjective: previousObjective },
+    after: { codexObjective: parsed.codexObjective },
+  });
+  return parsed;
+}
+
+/** Locked plan read for mutators that already hold the mutation lock. */
+async function readUltragoalPlanUnderLock(cwd: string): Promise<UltragoalPlan> {
+  return migrateAggregateObjectiveUnderLock(cwd, await readUltragoalPlanFile(cwd));
+}
+
+export async function readUltragoalPlan(cwd: string): Promise<UltragoalPlan> {
+  const parsed = await readUltragoalPlanFile(cwd);
+  if (!requiresAggregateObjectiveMigration(parsed)) return parsed;
+  // The legacy objective migration is a durable story transition: it requires
+  // writable lifecycle authority and the mutation lock, and re-reads the plan
+  // under the lock so a concurrent mutator cannot be clobbered or duplicated.
+  return withUltragoalMutationLock(cwd, async () => readUltragoalPlanUnderLock(cwd));
 }
 
 async function writePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
@@ -980,7 +1080,7 @@ function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions 
 
 export async function addUltragoalGoal(cwd: string, options: AddUltragoalGoalOptions): Promise<{ plan: UltragoalPlan; goal: UltragoalItem }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnderLock(cwd);
   const now = iso(options.now);
   const goal = appendGoalToPlan(plan, options);
   await writePlan(cwd, plan);
@@ -1263,7 +1363,7 @@ function applySteeringMutation(plan: UltragoalPlan, proposal: UltragoalSteeringP
 
 export async function steerUltragoal(cwd: string, proposal: UltragoalSteeringProposal, options: { now?: Date; directiveText?: string } = {}): Promise<SteerUltragoalResult> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnderLock(cwd);
   const existing = proposal.idempotencyKey
     ? (await readSteeringLedgerEntries(cwd)).find((entry) => entry.event === 'steering_accepted' && (entry.idempotencyKey === proposal.idempotencyKey || entry.steering?.idempotencyKey === proposal.idempotencyKey) && entry.steering)
     : undefined;
@@ -1536,7 +1636,7 @@ function validateQualityGate(value: unknown, requiredInvariants: readonly Requir
 
 export async function startNextUltragoal(cwd: string, options: StartNextOptions = {}): Promise<{ plan: UltragoalPlan; goal: UltragoalItem | null; resumed: boolean; done: boolean }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnderLock(cwd);
   const now = iso(options.now);
   if (plan.aggregateCompletion?.status === 'complete') return { plan, goal: null, resumed: false, done: true };
   const existing = plan.goals.find((goal) => goal.status === 'in_progress' && isScheduleEligibleGoal(goal));
@@ -1569,7 +1669,7 @@ export async function startNextUltragoal(cwd: string, options: StartNextOptions 
 
 export async function checkpointUltragoal(cwd: string, options: CheckpointOptions): Promise<UltragoalPlan> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnderLock(cwd);
   const goal = plan.goals.find((candidate) => candidate.id === options.goalId);
   if (!goal) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
   const now = iso(options.now);
@@ -1836,7 +1936,7 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
 
 export async function recordFinalReviewBlockers(cwd: string, options: RecordFinalReviewBlockersOptions): Promise<{ plan: UltragoalPlan; blockedGoal: UltragoalItem; addedGoal: UltragoalItem }> {
   return withUltragoalMutationLock(cwd, async () => {
-  const plan = await readUltragoalPlan(cwd);
+  const plan = await readUltragoalPlanUnderLock(cwd);
   const goal = plan.goals.find((candidate) => candidate.id === options.goalId);
   if (!goal) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
   assertNonEmpty(options.evidence, '--evidence');
