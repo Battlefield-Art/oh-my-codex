@@ -74,7 +74,11 @@ async function withPointerDependencies(
   overrides: Parameters<typeof __setSessionPointerTransactionDependenciesForTests>[0],
   run: () => Promise<void>,
 ): Promise<void> {
-  __setSessionPointerTransactionDependenciesForTests(overrides);
+  __setSessionPointerTransactionDependenciesForTests({
+    atomicRenameNoReplace: defaultTestAtomicRenameNoReplace,
+    ...overrides,
+  });
+
   try {
     await run();
   } finally {
@@ -115,6 +119,56 @@ function validLockOwner(overrides: Record<string, unknown> = {}): Record<string,
     created_at: '2026-07-14T00:00:00.000Z',
     ...overrides,
   };
+}
+/** Safe test seam for capability probes: no-replace rename without overwriting destinations. */
+async function defaultTestAtomicRenameNoReplace(from: string, to: string): Promise<'moved' | 'not-moved' | 'unsupported'> {
+  if (existsSync(to)) return 'not-moved';
+  await rename(from, to);
+  return 'moved';
+}
+
+/** Wrap a lock-directory-focused seam so capability probes keep working. */
+function withProbeFallback(
+  contextLockPath: string,
+  move: (from: string, to: string) => Promise<'moved' | 'not-moved' | 'unsupported'>,
+): (from: string, to: string) => Promise<'moved' | 'not-moved' | 'unsupported'> {
+  return async (from, to) => {
+    if (
+      from === contextLockPath
+      || to === contextLockPath
+      || from.startsWith(`${contextLockPath}.`)
+      || to.startsWith(`${contextLockPath}.`)
+    ) {
+      return await move(from, to);
+    }
+    return await defaultTestAtomicRenameNoReplace(from, to);
+  };
+}
+
+async function assertDurableDirectoryRecovery(cwd: string, options: { atomicRenameNoReplace?: Parameters<typeof __setSessionPointerTransactionDependenciesForTests>[0]['atomicRenameNoReplace'] } = {}): Promise<void> {
+  const context = resolveSessionPointerContext(cwd);
+  await writeLockOwner(cwd, validLockOwner());
+  await withPointerDependencies({
+    token: () => SUCCESSOR_TOKEN,
+    probePid: () => 'dead',
+    atomicRenameNoReplace: options.atomicRenameNoReplace ?? defaultTestAtomicRenameNoReplace,
+  }, async () => {
+    const recovered = await recoverSessionPointerLock(cwd);
+    assert.equal(recovered.recovered, true, recovered.reason);
+    assert.equal(recovered.action, 'quarantined');
+    const parked = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`;
+    const completed = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.completed`;
+    assert.equal(existsSync(context.lockPath), false);
+    assert.equal(existsSync(parked), true);
+    assert.equal(existsSync(completed), true);
+    assert.equal(existsSync(recovered.quarantinePath!), true);
+    const quarantine = await lstat(recovered.quarantinePath!);
+    const parkedOwner = await lstat(join(parked, 'owner.json'));
+    assert.deepEqual({ dev: quarantine.dev, ino: quarantine.ino }, { dev: parkedOwner.dev, ino: parkedOwner.ino });
+    const repeated = await recoverSessionPointerLock(cwd);
+    assert.equal(repeated.recovered, false);
+    assert.equal(repeated.status, 'absent');
+  });
 }
 
 async function linuxProcessStartTicks(pid: number): Promise<number> {
@@ -914,50 +968,8 @@ describe('session pointer transaction', () => {
   });
 
   it('atomically quarantines dead canonical owner evidence and stays idempotent', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-dead-canonical-'));
-    try {
-      const context = resolveSessionPointerContext(cwd);
-      await writeLockOwner(cwd, validLockOwner());
-      const links: Array<[string, string]> = [];
-      const renames: Array<[string, string]> = [];
-      await withPointerDependencies({
-        token: () => SUCCESSOR_TOKEN,
-        probePid: () => 'dead',
-        fs: {
-          link: async (from, to) => {
-            links.push([from, to]);
-            await link(from, to);
-          },
-          rename: async (from, to) => {
-            renames.push([from, to]);
-            await rename(from, to);
-          },
-        },
-      }, async () => {
-        const inspected = await inspectSessionPointerLock(cwd);
-        assert.equal(inspected.status, 'dead');
-        assert.equal(inspected.evidenceSource, 'owner.json');
-        assert.equal(inspected.safeToRecover, true);
-        const recovered = await recoverSessionPointerLock(cwd);
-        assert.equal(recovered.recovered, true);
-        assert.equal(recovered.action, 'quarantined');
-        assert.equal(existsSync(context.lockPath), false);
-        assert.equal(existsSync(recovered.quarantinePath!), true);
-        const repeated = await recoverSessionPointerLock(cwd);
-        assert.equal(repeated.recovered, false);
-        assert.equal(repeated.action, 'none');
-        assert.equal(repeated.status, 'absent');
-      });
-      assert.match(links[0]![0], /owner\.json$/);
-      assert.match(links[0]![1], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
-      assert.match(links[1]![0], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
-      assert.equal(links[1]![1].includes('.quarantine.'), true);
-      assert.match(renames[0]![0], /owner\.json$/);
-      assert.match(renames[1]![0], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
-      assert.equal(renames[2]![0], context.lockPath);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-preserved-'));
+    try { await assertDurableDirectoryRecovery(cwd); } finally { await rm(cwd, { recursive: true, force: true }); }
   });
 
   it('launches only after explicit recovery of a dead canonical owner lock', async () => {
@@ -989,110 +1001,146 @@ describe('session pointer transaction', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-canonical-race-'));
     try {
       const context = resolveSessionPointerContext(cwd);
-      const staleOwner = join(context.lockPath, 'owner.json');
+      const ownerPath = join(context.lockPath, 'owner.json');
       const successorTemp = join(context.lockPath, `owner.${SUCCESSOR_TOKEN}.tmp`);
       const displacedPath = `${context.lockPath}.displaced`;
+      const staleOwner = JSON.stringify(validLockOwner());
+      const successorOwner = JSON.stringify(validLockOwner({ token: SUCCESSOR_TOKEN }));
       await writeLockOwner(cwd, validLockOwner());
       let displaced = false;
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
-        fs: {
-          link: async (from, to) => {
-            if (!displaced && from === staleOwner) {
-              displaced = true;
-              await rename(context.lockPath, displacedPath);
-              await mkdir(context.lockPath);
-              await writeFile(successorTemp, JSON.stringify(validLockOwner({ token: SUCCESSOR_TOKEN })), 'utf-8');
-            }
-            await link(from, to);
-          },
+        atomicRenameNoReplace: async (from, to) => {
+          if (from === context.lockPath && to === `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`) {
+            displaced = true;
+            await rename(from, displacedPath);
+            await mkdir(context.lockPath);
+            await writeFile(successorTemp, successorOwner, 'utf-8');
+            return 'not-moved';
+          }
+          if (existsSync(to)) return 'not-moved';
+          await rename(from, to);
+          return 'moved';
         },
       }, async () => {
         const recovered = await recoverSessionPointerLock(cwd);
         assert.equal(recovered.recovered, false);
         assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /Unable to create exact recovery claim \(ENOENT\)/);
+        assert.match(recovered.reason, /Atomic recovery move|recovery checkpoint/i);
       });
       assert.equal(displaced, true);
+      assert.equal(await readFile(join(displacedPath, 'owner.json'), 'utf-8'), staleOwner);
       assert.deepEqual(await readdir(context.lockPath), [`owner.${SUCCESSOR_TOKEN}.tmp`]);
-      assert.equal(await readFile(successorTemp, 'utf-8'), JSON.stringify(validLockOwner({ token: SUCCESSOR_TOKEN })));
+      assert.equal(await readFile(successorTemp, 'utf-8'), successorOwner);
+      assert.equal(existsSync(ownerPath), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
+
   it('rolls back a claim that lands on a displaced successor canonical owner', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-canonical-claim-race-'));
     try {
       const context = resolveSessionPointerContext(cwd);
-      const staleOwner = join(context.lockPath, 'owner.json');
-      const successorOwner = JSON.stringify(validLockOwner({ token: SUCCESSOR_TOKEN }));
-      const displacedPath = `${context.lockPath}.displaced`;
+      const ownerPath = join(context.lockPath, 'owner.json');
+      const parkedPath = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`;
+      const quarantinePath = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
+      const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
+      const staleOwner = JSON.stringify(validLockOwner());
+      const successorPid = process.pid + 100_000;
+      const successorOwner = JSON.stringify(validLockOwner({ token: SUCCESSOR_TOKEN, pid: successorPid }));
       await writeLockOwner(cwd, validLockOwner());
-      let displaced = false;
+      let moved = false;
+      let rollbackAttempted = false;
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
-        fs: {
-          link: async (from, to) => {
-            if (!displaced && from === staleOwner) {
-              displaced = true;
-              await rename(context.lockPath, displacedPath);
-              await mkdir(context.lockPath);
-              await writeFile(staleOwner, successorOwner, 'utf-8');
-            }
-            await link(from, to);
-          },
+        atomicRenameNoReplace: async (from, to) => {
+          if (from === context.lockPath && to === parkedPath) {
+            await rename(from, to);
+            await mkdir(context.lockPath);
+            await writeFile(ownerPath, successorOwner, 'utf-8');
+            moved = true;
+            return 'moved';
+          }
+          if (from === parkedPath && to === context.lockPath) {
+            rollbackAttempted = true;
+            return 'not-moved';
+          }
+          if (existsSync(to)) return 'not-moved';
+          await rename(from, to);
+          return 'moved';
         },
       }, async () => {
         const recovered = await recoverSessionPointerLock(cwd);
         assert.equal(recovered.recovered, false);
         assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /changed before recovery claim/i);
-        assert.equal(recovered.quarantinePath, undefined);
+        assert.match(recovered.reason, /captured object|token-bound|source pathname/i);
       });
-      assert.equal(displaced, true);
-      assert.deepEqual(await readdir(context.lockPath), ['owner.json']);
-      assert.equal(await readFile(staleOwner, 'utf-8'), successorOwner);
+      assert.equal(moved, true);
+      assert.equal(rollbackAttempted, true);
+      assert.equal(await readFile(ownerPath, 'utf-8'), successorOwner);
+      assert.equal(await readFile(join(parkedPath, 'owner.json'), 'utf-8'), staleOwner);
+      assert.equal(await readFile(quarantinePath, 'utf-8'), staleOwner);
+      assert.equal(existsSync(checkpointPath), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
 
   it('live canonical successor survives a refused recovery claim and stays recognizable, releasable, and acquirable', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-live-successor-'));
     try {
       const context = resolveSessionPointerContext(cwd);
       const ownerPath = join(context.lockPath, 'owner.json');
+      const parkedPath = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`;
       const successorPid = process.pid + 100_000;
-      const successor = JSON.stringify(validLockOwner({ token: SUCCESSOR_TOKEN, pid: successorPid }));
-      let displaced = false;
+      const successorOwner = JSON.stringify(validLockOwner({ token: SUCCESSOR_TOKEN, pid: successorPid }));
       await writeLockOwner(cwd, validLockOwner());
-      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: (pid) => pid === successorPid ? 'alive' : 'dead', readProcessIdentity: () => matchingProcessIdentity(), fs: {
-        link: async (from, to) => {
-          if (!displaced && from === ownerPath) {
-            displaced = true;
-            await rename(context.lockPath, `${context.lockPath}.displaced`);
+      let rollbackAttempted = false;
+      await withPointerDependencies({
+        token: () => SUCCESSOR_TOKEN,
+        probePid: (pid) => pid === successorPid ? 'alive' : 'dead',
+        readProcessIdentity: () => matchingProcessIdentity(),
+        atomicRenameNoReplace: async (from, to) => {
+          if (from === context.lockPath && to === parkedPath) {
+            await rename(from, to);
             await mkdir(context.lockPath);
-            await writeFile(ownerPath, successor, 'utf-8');
+            await writeFile(ownerPath, successorOwner, 'utf-8');
+            return 'moved';
           }
-          await link(from, to);
+          if (from === parkedPath && to === context.lockPath) {
+            rollbackAttempted = true;
+            return 'not-moved';
+          }
+          if (existsSync(to)) return 'not-moved';
+          await rename(from, to);
+          return 'moved';
         },
-      } }, async () => {
-        assert.equal((await recoverSessionPointerLock(cwd)).recovered, false);
+      }, async () => {
+        const refused = await recoverSessionPointerLock(cwd);
+        assert.equal(refused.recovered, false);
+        assert.equal(refused.action, 'none');
         const inspected = await inspectSessionPointerLock(cwd);
         assert.equal(inspected.status, 'live');
         assert.equal(inspected.safeToRecover, false);
-        assert.equal((await recoverSessionPointerLock(cwd)).status, 'live');
-        assert.equal(await readFile(ownerPath, 'utf-8'), successor);
+        assert.equal(await readFile(ownerPath, 'utf-8'), successorOwner);
         assert.deepEqual(await __releasePointerLockForTests(cwd, SUCCESSOR_TOKEN), []);
         assert.equal(existsSync(context.lockPath), false);
-        await writeSessionStart(cwd, 'sess-after-survival', { platform: 'win32' });
-        assert.equal((await readSessionState(cwd))?.session_id, 'sess-after-survival');
+        const started = await writeSessionStart(cwd, 'sess-after-survival', { platform: 'win32' });
+        assert.equal(started.session_id, 'sess-after-survival');
+        assert.equal(existsSync(context.lockPath), false);
       });
-    } finally { await rm(cwd, { recursive: true, force: true }); }
+      assert.equal(rollbackAttempted, true);
+      assert.equal(existsSync(parkedPath), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
+
 
   it('fails closed without mutating a foreign target when the lock directory is replaced by a symlink before the claim rename', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-lock-symlink-'));
@@ -1151,30 +1199,59 @@ describe('session pointer transaction', () => {
   it('retries a transient token-bound park collision without allocating a second parked name', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-park-retry-'));
     try {
-      await writeLockOwner(cwd, validLockOwner());
       const context = resolveSessionPointerContext(cwd);
-      const ownerPath = join(context.lockPath, 'owner.json');
-      const parks: string[] = [];
-      let failOnce = true;
+      const parkedPath = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`;
+      const quarantinePath = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
+      const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
+      const foreignMarker = 'foreign transient park destination';
+      const parkAttempts: string[] = [];
+      let tokenCalls = 0;
+      let collision = true;
+      await writeLockOwner(cwd, validLockOwner());
       await withPointerDependencies({
-        token: () => SUCCESSOR_TOKEN,
-        probePid: () => 'dead',
-        fs: {
-          rename: async (from, to) => {
-            if (from === ownerPath && failOnce) {
-              failOnce = false;
-              throw codedError('EBUSY');
-            }
-            if (from === ownerPath) parks.push(to);
-            await rename(from, to);
-          },
+        token: () => {
+          tokenCalls += 1;
+          return SUCCESSOR_TOKEN;
         },
-      }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, true));
-      assert.deepEqual(parks, [`${context.lockPath}.parked-${SUCCESSOR_TOKEN}`]);
+        probePid: () => 'dead',
+        atomicRenameNoReplace: async (from, to) => {
+          if (from === context.lockPath && to === parkedPath) {
+            parkAttempts.push(to);
+            if (collision) {
+              collision = false;
+              await mkdir(to);
+              await writeFile(join(to, 'foreign'), foreignMarker, 'utf-8');
+              return 'not-moved';
+            }
+          }
+          if (existsSync(to)) return 'not-moved';
+          await rename(from, to);
+          return 'moved';
+        },
+      }, async () => {
+        const refused = await recoverSessionPointerLock(cwd);
+        assert.equal(refused.recovered, false);
+        assert.equal(refused.action, 'none');
+        assert.equal(existsSync(checkpointPath), true);
+        assert.equal(existsSync(context.lockPath), true);
+        assert.equal(await readFile(join(parkedPath, 'foreign'), 'utf-8'), foreignMarker);
+        await rm(parkedPath, { recursive: true, force: true });
+        const recovered = await recoverSessionPointerLock(cwd);
+        assert.equal(recovered.recovered, true, recovered.reason);
+        assert.equal(recovered.action, 'quarantined');
+      });
+      assert.equal(tokenCalls, 1);
+      assert.deepEqual(parkAttempts, [parkedPath, parkedPath]);
+      assert.equal(existsSync(context.lockPath), false);
+      assert.equal(existsSync(parkedPath), true);
+      assert.equal(existsSync(quarantinePath), true);
+      assert.equal(existsSync(checkpointPath), false);
+      assert.equal(existsSync(checkpointPath.replace(/\.json$/, '.completed')), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
 
   it('rolls back a claim when checkpoint creation fails', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-checkpoint-write-fail-'));
@@ -1195,18 +1272,59 @@ describe('session pointer transaction', () => {
     try {
       const context = resolveSessionPointerContext(cwd);
       const ownerPath = join(context.lockPath, 'owner.json');
-      await writeLockOwner(cwd, validLockOwner());
+      const quarantinePath = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
+      const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
+      const staleOwner = JSON.stringify(validLockOwner());
       let failures = 2;
-      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', fs: { rename: async (from, to) => {
-        if (from === ownerPath && failures-- > 0) throw codedError('EBUSY');
-        await rename(from, to);
-      } } }, async () => {
-        assert.equal((await recoverSessionPointerLock(cwd)).recovered, false);
-        assert.deepEqual(await readdir(context.lockPath), ['owner.json']);
-        assert.equal((await recoverSessionPointerLock(cwd)).recovered, true);
+      let tokenCalls = 0;
+      let linkAttempts = 0;
+      await writeLockOwner(cwd, validLockOwner());
+      await withPointerDependencies({
+        token: () => {
+          tokenCalls += 1;
+          return SUCCESSOR_TOKEN;
+        },
+        probePid: () => 'dead',
+        fs: {
+          link: async (from, to) => {
+            if (to === quarantinePath && failures > 0) {
+              failures -= 1;
+              linkAttempts += 1;
+              throw codedError('EBUSY');
+            }
+            await link(from, to);
+          },
+        },
+      }, async () => {
+        const first = await recoverSessionPointerLock(cwd);
+        assert.equal(first.recovered, false);
+        assert.equal(first.action, 'none');
+        assert.equal(existsSync(checkpointPath), true);
+        assert.equal(await readFile(ownerPath, 'utf-8'), staleOwner);
+        assert.equal(existsSync(quarantinePath), false);
+
+        const second = await recoverSessionPointerLock(cwd);
+        assert.equal(second.recovered, false);
+        assert.equal(second.action, 'none');
+        assert.equal(existsSync(checkpointPath), true);
+        assert.equal(await readFile(ownerPath, 'utf-8'), staleOwner);
+        assert.equal(existsSync(quarantinePath), false);
+
+        const recovered = await recoverSessionPointerLock(cwd);
+        assert.equal(recovered.recovered, true, recovered.reason);
+        assert.equal(recovered.action, 'quarantined');
       });
-    } finally { await rm(cwd, { recursive: true, force: true }); }
+      assert.equal(tokenCalls, 1);
+      assert.equal(linkAttempts, 2);
+      assert.equal(existsSync(context.lockPath), false);
+      assert.equal(await readFile(quarantinePath, 'utf-8'), staleOwner);
+      assert.equal(existsSync(checkpointPath), false);
+      assert.equal(existsSync(checkpointPath.replace(/\.json$/, '.completed')), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
   });
+
 
   it('resumes an evidence-pending checkpoint without minting another recovery token', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-resume-'));
@@ -1220,7 +1338,8 @@ describe('session pointer transaction', () => {
       await link(ownerPath, claimPath);
       await rename(ownerPath, parkPath);
       const parked = await lstat(parkPath);
-      await writeFile(`${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`, JSON.stringify({ version: 1, sourcePath: ownerPath, parkPath, identity: { dev: parked.dev, ino: parked.ino }, phase: 'evidence-pending' }));
+      const lock = await lstat(context.lockPath);
+      await writeFile(`${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`, JSON.stringify({ version: 1, sourcePath: ownerPath, parkPath, lockParkPath: `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`, identity: { dev: parked.dev, ino: parked.ino }, lockIdentity: { dev: lock.dev, ino: lock.ino }, phase: 'evidence-pending' }));
       await withPointerDependencies({ token: () => { throw new Error('resume must reuse checkpoint token'); }, probePid: () => 'dead' }, async () => {
         const resumed = await recoverSessionPointerLock(cwd);
         assert.equal(resumed.recovered, true);
@@ -1243,9 +1362,76 @@ describe('session pointer transaction', () => {
       await link(ownerPath, claimPath);
       await rename(ownerPath, parkPath);
       const parked = await lstat(parkPath);
-      await writeFile(`${context.lockPath}.recovery.${TEST_TOKEN}.${claimToken}.json`, JSON.stringify({ version: 1, sourcePath: ownerPath, parkPath, identity: { dev: parked.dev, ino: parked.ino }, phase: 'evidence-pending' }));
+      const lock = await lstat(context.lockPath);
+      await writeFile(`${context.lockPath}.recovery.${TEST_TOKEN}.${claimToken}.json`, JSON.stringify({ version: 1, sourcePath: ownerPath, parkPath, lockParkPath: `${context.lockPath}.parked-lock-${claimToken}`, identity: { dev: parked.dev, ino: parked.ino }, lockIdentity: { dev: lock.dev, ino: lock.ino }, phase: 'evidence-pending' }));
       await withPointerDependencies({ token: () => { throw new Error('resume must not mint a replacement token'); }, probePid: () => 'dead' }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, true));
       assert.equal(await readFile(`${context.lockPath}.quarantine.${TEST_TOKEN}.${claimToken}`, 'utf-8'), JSON.stringify(validLockOwner()));
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it('resumes a checkpoint written before evidence parking', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-source-checkpoint-'));
+    try {
+      const context = resolveSessionPointerContext(cwd);
+      const ownerPath = join(context.lockPath, 'owner.json');
+      const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
+      const parkPath = `${context.lockPath}.parked-${SUCCESSOR_TOKEN}`;
+      const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
+      await writeLockOwner(cwd, validLockOwner());
+      await link(ownerPath, claimPath);
+      const owner = await lstat(ownerPath);
+      const lock = await lstat(context.lockPath);
+      await writeFile(checkpointPath, JSON.stringify({ version: 1, sourcePath: ownerPath, parkPath, lockParkPath: `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`, identity: { dev: owner.dev, ino: owner.ino }, lockIdentity: { dev: lock.dev, ino: lock.ino }, phase: 'evidence-pending' }));
+      await withPointerDependencies({ token: () => { throw new Error('resume must not mint token'); }, probePid: () => 'dead' }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, true));
+      assert.equal(existsSync(context.lockPath), false);
+      assert.equal(existsSync(checkpointPath), false);
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it('resumes after quarantine hard-link creation but before claim and park cleanup', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-dual-evidence-checkpoint-'));
+    try {
+      const context = resolveSessionPointerContext(cwd);
+      const ownerPath = join(context.lockPath, 'owner.json');
+      const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
+      const parkPath = `${context.lockPath}.parked-${SUCCESSOR_TOKEN}`;
+      const quarantinePath = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
+      const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
+      await writeLockOwner(cwd, validLockOwner());
+      await link(ownerPath, claimPath);
+      await rename(ownerPath, parkPath);
+      await link(parkPath, quarantinePath);
+      const parked = await lstat(parkPath);
+      const lock = await lstat(context.lockPath);
+      await writeFile(checkpointPath, JSON.stringify({ version: 1, sourcePath: ownerPath, parkPath, lockParkPath: `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`, identity: { dev: parked.dev, ino: parked.ino }, lockIdentity: { dev: lock.dev, ino: lock.ino }, phase: 'evidence-pending' }));
+      await withPointerDependencies({ token: () => { throw new Error('resume must not mint token'); }, probePid: () => 'dead' }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, true));
+      assert.equal(await readFile(quarantinePath, 'utf-8'), JSON.stringify(validLockOwner()));
+      assert.equal(existsSync(checkpointPath), false);
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it('reports absent recovery on a fresh workspace without a state directory', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-fresh-'));
+    try {
+      const recovered = await recoverSessionPointerLock(cwd);
+      assert.equal(recovered.recovered, false);
+      assert.equal(recovered.status, 'absent');
+      assert.match(recovered.reason, /No session pointer lock exists/);
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it('fails closed when recovery checkpoint discovery cannot be enumerated', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-checkpoint-readdir-error-'));
+    try {
+      const context = resolveSessionPointerContext(cwd);
+      await writeLockOwner(cwd, validLockOwner());
+      await withPointerDependencies({ probePid: () => 'dead', fs: { readdir: async () => { throw codedError('EACCES'); } } }, async () => {
+        const recovered = await recoverSessionPointerLock(cwd);
+        assert.equal(recovered.recovered, false);
+        assert.equal(recovered.status, 'io-error');
+        assert.match(recovered.reason, /enumerate.*checkpoints/i);
+      });
+      assert.deepEqual(await readdir(context.lockPath), ['owner.json']);
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });
 
@@ -1300,58 +1486,75 @@ describe('session pointer transaction', () => {
       const context = resolveSessionPointerContext(cwd); await mkdir(context.lockPath, { recursive: true });
       const parkPath = `${context.lockPath}.parked-${SUCCESSOR_TOKEN}`; await writeFile(parkPath, 'stale', 'utf-8'); const stat = await lstat(parkPath);
       const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
-      await writeFile(checkpointPath, JSON.stringify({ version: 1, sourcePath: join(context.lockPath, 'owner.json'), parkPath, identity: { dev: stat.dev, ino: stat.ino }, phase: 'evidence-pending' }));
+      const lock = await lstat(context.lockPath);
+      await writeFile(checkpointPath, JSON.stringify({ version: 1, sourcePath: join(context.lockPath, 'owner.json'), parkPath, lockParkPath: `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`, identity: { dev: stat.dev, ino: stat.ino }, lockIdentity: { dev: lock.dev, ino: lock.ino }, phase: 'evidence-pending' }));
       await withPointerDependencies({ token: () => { throw new Error('must not mint token'); }, probePid: () => 'dead' }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, false));
       assert.equal(await readFile(checkpointPath, 'utf-8').then(Boolean), true); assert.equal(await readFile(parkPath, 'utf-8'), 'stale');
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });
 
-  it('preserves a resumable checkpoint when checkpoint quarantine rename is busy', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-checkpoint-rename-busy-'));
+
+  it('refuses an advanced checkpoint when a live successor replaces the bound lock directory', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-checkpoint-successor-swap-'));
     try {
-      const context = resolveSessionPointerContext(cwd); const ownerPath = join(context.lockPath, 'owner.json'); const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`); const parkPath = `${context.lockPath}.parked-${SUCCESSOR_TOKEN}`;
-      await writeLockOwner(cwd, validLockOwner()); await link(ownerPath, claimPath); await rename(ownerPath, parkPath); const stat = await lstat(parkPath);
-      const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`; await writeFile(checkpointPath, JSON.stringify({ version: 1, sourcePath: ownerPath, parkPath, identity: { dev: stat.dev, ino: stat.ino }, phase: 'evidence-pending' }));
-      await withPointerDependencies({ token: () => { throw new Error('must not mint token'); }, probePid: () => 'dead', fs: { rename: async (from, to) => { if (from === parkPath) throw codedError('EBUSY'); await rename(from, to); } } }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, false));
-      assert.equal(await readFile(checkpointPath, 'utf-8').then(Boolean), true); assert.equal(await readFile(parkPath, 'utf-8'), JSON.stringify(validLockOwner())); assert.equal(await readFile(claimPath, 'utf-8'), JSON.stringify(validLockOwner()));
+      const context = resolveSessionPointerContext(cwd);
+      const ownerPath = join(context.lockPath, 'owner.json');
+      const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
+      const parkPath = `${context.lockPath}.parked-${SUCCESSOR_TOKEN}`;
+      const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
+      const quarantinePath = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
+      await writeLockOwner(cwd, validLockOwner());
+      await link(ownerPath, claimPath);
+      await rename(ownerPath, parkPath);
+      const parked = await lstat(parkPath);
+      const lock = await lstat(context.lockPath);
+      await writeFile(checkpointPath, JSON.stringify({ version: 1, sourcePath: ownerPath, parkPath, lockParkPath: `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`, identity: { dev: parked.dev, ino: parked.ino }, lockIdentity: { dev: lock.dev, ino: lock.ino }, phase: 'evidence-pending' }));
+      await rename(parkPath, quarantinePath);
+      await rm(claimPath);
+      await rename(context.lockPath, `${context.lockPath}.displaced`);
+      const successorPid = process.pid + 100_000;
+      const successor = JSON.stringify(validLockOwner({ token: FOREIGN_TOKEN, pid: successorPid }));
+      await mkdir(context.lockPath);
+      await writeFile(ownerPath, successor, 'utf-8');
+      await withPointerDependencies({ token: () => { throw new Error('resume must not mint token'); }, probePid: (pid) => pid === successorPid ? 'alive' : 'dead', readProcessIdentity: () => matchingProcessIdentity() }, async () => {
+        const refused = await recoverSessionPointerLock(cwd);
+        assert.equal(refused.recovered, false);
+        assert.match(refused.reason, /recovery state/i);
+        assert.deepEqual(await readdir(context.lockPath), ['owner.json']);
+        assert.equal(await readFile(ownerPath, 'utf-8'), successor);
+        assert.deepEqual(await __releasePointerLockForTests(cwd, FOREIGN_TOKEN), []);
+        assert.equal(existsSync(context.lockPath), false);
+      });
+      assert.equal(await readFile(quarantinePath, 'utf-8'), JSON.stringify(validLockOwner()));
+      assert.equal(existsSync(checkpointPath), true);
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });
 
-  it('rolls a checkpoint quarantine move back when claim unlink is transiently busy', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-checkpoint-unlink-busy-'));
+  it('does not remove a live successor swapped in before final checkpoint lock removal', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-final-successor-'));
     try {
-      const context = resolveSessionPointerContext(cwd); const ownerPath = join(context.lockPath, 'owner.json'); const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`); const parkPath = `${context.lockPath}.parked-${SUCCESSOR_TOKEN}`; const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
-      await writeLockOwner(cwd, validLockOwner()); await link(ownerPath, claimPath); await rename(ownerPath, parkPath); const stat = await lstat(parkPath);
-      await writeFile(checkpointPath, JSON.stringify({ version: 1, sourcePath: ownerPath, parkPath, identity: { dev: stat.dev, ino: stat.ino }, phase: 'evidence-pending' }));
-      let fail = true;
-      await withPointerDependencies({ token: () => { throw new Error('must not mint token'); }, probePid: () => 'dead', fs: { unlink: async (path) => { if (path === claimPath && fail) { fail = false; throw codedError('EBUSY'); } await rm(path); } } }, async () => {
-        assert.equal((await recoverSessionPointerLock(cwd)).recovered, false);
-        assert.equal(await readFile(parkPath, 'utf-8'), JSON.stringify(validLockOwner()));
-        assert.equal((await recoverSessionPointerLock(cwd)).recovered, true);
-      });
-      assert.equal(existsSync(checkpointPath), false);
+      const context = resolveSessionPointerContext(cwd); const ownerPath = join(context.lockPath, 'owner.json');
+      const checkpointPath = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`; const lockPark = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`;
+      await writeLockOwner(cwd, validLockOwner()); const owner = await lstat(ownerPath); const lock = await lstat(context.lockPath);
+      await writeFile(checkpointPath, JSON.stringify({ version: 3, sourcePath: ownerPath, identity: { dev: owner.dev, ino: owner.ino }, evidenceIdentity: { dev: owner.dev, ino: owner.ino }, evidenceBytes: JSON.stringify(validLockOwner()), lockIdentity: { dev: lock.dev, ino: lock.ino }, lockParkPath: lockPark, phase: 'evidence-pending' }));
+      const successor = JSON.stringify(validLockOwner({ token: FOREIGN_TOKEN, pid: process.pid + 100_000 })); let moved = false;
+      await withPointerDependencies({ token: () => { throw new Error('resume must not mint'); }, probePid: () => 'dead', atomicRenameNoReplace: async (from, to) => {
+        if (from === context.lockPath && to === lockPark) { await rename(from, to); await mkdir(context.lockPath); await writeFile(ownerPath, successor); moved = true; return 'moved'; }
+        return 'not-moved';
+      } }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, false));
+      assert.equal(moved, true); assert.equal(await readFile(ownerPath, 'utf8'), successor); assert.deepEqual(await __releasePointerLockForTests(cwd, FOREIGN_TOKEN), []); assert.equal(existsSync(context.lockPath), false); assert.equal(existsSync(lockPark), true);
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });
 
   it('refuses a quarantine path that appears after its preflight check without overwriting it', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-quarantine-race-'));
     try {
-      const context = resolveSessionPointerContext(cwd);
-      const ownerPath = join(context.lockPath, 'owner.json');
-      const owner = JSON.stringify(validLockOwner());
-      const marker = 'foreign quarantine marker';
+      const context = resolveSessionPointerContext(cwd); const ownerPath = join(context.lockPath, 'owner.json'); const quarantine = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`; const foreign = 'foreign quarantine marker';
       await writeLockOwner(cwd, validLockOwner());
-      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', fs: { link: async (from, to) => {
-        if (to.includes('.quarantine.')) await writeFile(to, marker);
-        await link(from, to);
-      } } }, async () => {
-        const recovered = await recoverSessionPointerLock(cwd);
-        assert.equal(recovered.recovered, false);
-        assert.match(recovered.reason, /Recovery quarantine path already exists/);
+      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', fs: { link: async (from, to) => { if (to === quarantine) await writeFile(to, foreign); await link(from, to); } } }, async () => {
+        const result = await recoverSessionPointerLock(cwd); assert.equal(result.recovered, false); assert.match(result.reason, /EEXIST|quarantine/i);
       });
-      assert.equal(await readFile(ownerPath, 'utf-8'), owner);
-      assert.equal((await readdir(context.lockPath)).some((entry) => entry.includes('.recovery')), false);
-      assert.equal(await readFile(`${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`, 'utf-8'), marker);
+      assert.equal(await readFile(ownerPath, 'utf8'), JSON.stringify(validLockOwner())); assert.equal(await readFile(quarantine, 'utf8'), foreign);
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });
 
@@ -1359,230 +1562,288 @@ describe('session pointer transaction', () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-claim-exist-'));
     try {
       const context = resolveSessionPointerContext(cwd);
-      const staleOwner = JSON.stringify(validLockOwner());
-      await writeLockOwner(cwd, validLockOwner());
-      const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
-      const foreignMarker = 'foreign claim destination';
-      await withPointerDependencies({
-        token: () => SUCCESSOR_TOKEN,
-        probePid: () => 'dead',
-        fs: {
-          link: async (from, to) => {
-            if (to === claimPath) await writeFile(to, foreignMarker, 'utf-8');
-            await link(from, to);
-          },
-        },
-      }, async () => {
-        const recovered = await recoverSessionPointerLock(cwd);
-        assert.equal(recovered.recovered, false);
-        assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /changed before recovery claim/i);
-      });
-      assert.equal(await readFile(join(context.lockPath, 'owner.json'), 'utf-8'), staleOwner);
-      assert.equal(await readFile(claimPath, 'utf-8'), foreignMarker);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
-  });
-
-  it('does not overwrite a rollback destination that appears before the no-clobber rollback link', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-rollback-exist-'));
-    try {
-      const context = resolveSessionPointerContext(cwd);
-      const staleOwner = JSON.stringify(validLockOwner());
-      await writeLockOwner(cwd, validLockOwner());
       const ownerPath = join(context.lockPath, 'owner.json');
-      const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
-      const foreignMarker = 'foreign rollback destination';
-      let armed = false;
+      const claim = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
+      let moved = false;
+      await writeLockOwner(cwd, validLockOwner());
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
         fs: {
-          rename: async (from, to) => {
-            await rename(from, to);
-            if (from === ownerPath) armed = true;
-          },
-          readdir: async (path) => {
-            const entries = await readdir(path);
-            if (armed && path === context.lockPath) entries.push('foreign-extra');
-            return entries;
-          },
-          link: async (from, to) => {
-            if (to === ownerPath) await writeFile(to, foreignMarker, 'utf-8');
-            await link(from, to);
+          writeFile: async (path, data, options) => {
+            await writeFile(path, data, options);
+            if (path.includes('.recovery.') && path.endsWith('.json')) await writeFile(claim, 'foreign claim');
           },
         },
+        atomicRenameNoReplace: withProbeFallback(context.lockPath, async () => {
+          moved = true;
+          return 'moved';
+        }),
       }, async () => {
         const recovered = await recoverSessionPointerLock(cwd);
-        assert.equal(recovered.recovered, false);
-        assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /revalidation failed/i);
-        assert.match(recovered.reason, /reappeared during rollback/i);
+        assert.equal(recovered.recovered, false, recovered.reason);
+        assert.match(recovered.reason, /foreign|changed|claim/i);
       });
-      assert.equal(await readFile(ownerPath, 'utf-8'), foreignMarker);
-      assert.equal(await readFile(claimPath, 'utf-8'), staleOwner);
+      assert.equal(moved, false);
+      assert.equal(await readFile(ownerPath, 'utf8'), JSON.stringify(validLockOwner()));
+      assert.equal(await readFile(claim, 'utf8'), 'foreign claim');
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
   it('preserves a swapped parked quarantine claim rather than unlinking it', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-claim-swap-'));
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-parked-claim-swap-'));
     try {
-      const context = resolveSessionPointerContext(cwd);
-      const staleOwner = JSON.stringify(validLockOwner());
-      await writeLockOwner(cwd, validLockOwner());
-      const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
-      const quarantinePath = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
-      const foreignMarker = 'foreign parked claim';
-      let parkedPath: string | undefined;
-      let parkedIdentity: { dev: number; ino: number } | undefined;
-      await withPointerDependencies({
-        token: () => SUCCESSOR_TOKEN,
-        probePid: () => 'dead',
-        fs: {
-          rename: async (from, to) => {
-            await rename(from, to);
-            if (from === claimPath) {
-              parkedPath = to;
-              await rename(to, `${to}.original`);
-              await writeFile(to, foreignMarker, 'utf-8');
-              const stat = await lstat(to);
-              parkedIdentity = { dev: stat.dev, ino: stat.ino };
-            }
-          },
-        },
-      }, async () => {
-        const recovered = await recoverSessionPointerLock(cwd);
-        assert.equal(recovered.recovered, false);
-        assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /parked pathname no longer holds the validated identity/i);
-        assert.equal(recovered.quarantinePath, quarantinePath);
-      });
-      assert.ok(parkedPath);
-      assert.ok(parkedIdentity);
-      const parkedStat = await lstat(parkedPath);
-      assert.deepEqual({ dev: parkedStat.dev, ino: parkedStat.ino }, parkedIdentity);
-      assert.equal(await readFile(parkedPath, 'utf-8'), foreignMarker);
-      assert.equal(await readFile(quarantinePath, 'utf-8'), staleOwner);
-    } finally {
-      await rm(cwd, { recursive: true, force: true });
-    }
+      const context = resolveSessionPointerContext(cwd); const ownerPath = join(context.lockPath, 'owner.json'); const lockPark = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`; const claim = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`); const quarantine = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`; const checkpoint = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
+      await writeLockOwner(cwd, validLockOwner()); const owner = await lstat(ownerPath); const lock = await lstat(context.lockPath); await link(ownerPath, claim); await link(ownerPath, quarantine); await rm(claim); await writeFile(claim, 'foreign parked claim'); await rename(context.lockPath, lockPark);
+      await writeFile(checkpoint, JSON.stringify({ version: 2, sourcePath: ownerPath, identity: { dev: owner.dev, ino: owner.ino }, lockIdentity: { dev: lock.dev, ino: lock.ino }, lockParkPath: lockPark, phase: 'evidence-quarantined' }));
+      await withPointerDependencies({ token: () => { throw new Error('resume must not mint'); }, probePid: () => 'dead', atomicRenameNoReplace: async (from, to) => { if (from === checkpoint) { await rename(from, to); return 'moved'; } throw new Error('directory move must not occur'); } }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, true));
+      assert.equal(await readFile(join(lockPark, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`), 'utf8'), 'foreign parked claim'); assert.equal(await readFile(quarantine, 'utf8'), JSON.stringify(validLockOwner())); assert.equal(existsSync(lockPark), true);
+    } finally { await rm(cwd, { recursive: true, force: true }); }
   });
 
   it('fails closed without mutation when evidence lstat fails non-ENOENT before the claim', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-lstat-preclaim-'));
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-evidence-eacces-'));
     try {
       const context = resolveSessionPointerContext(cwd);
-      const staleOwner = JSON.stringify(validLockOwner());
-      await writeLockOwner(cwd, validLockOwner());
       const ownerPath = join(context.lockPath, 'owner.json');
-      const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
+      const quarantine = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
       let armed = false;
+      let moved = false;
+      await writeLockOwner(cwd, validLockOwner());
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
         fs: {
+          link: async (from, to) => {
+            await link(from, to);
+            if (to === quarantine) armed = true;
+          },
           lstat: async (path) => {
-            if (path === claimPath) armed = true;
             if (armed && path === ownerPath) throw codedError('EACCES');
             return await lstat(path);
           },
         },
+        atomicRenameNoReplace: withProbeFallback(context.lockPath, async () => {
+          moved = true;
+          return 'moved';
+        }),
       }, async () => {
         const recovered = await recoverSessionPointerLock(cwd);
-        assert.equal(recovered.recovered, false);
-        assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /changed before recovery claim/i);
+        assert.equal(recovered.recovered, false, recovered.reason);
       });
-      assert.deepEqual(await readdir(context.lockPath), ['owner.json']);
-      assert.equal(await readFile(ownerPath, 'utf-8'), staleOwner);
+      assert.equal(moved, false);
+      assert.equal(await readFile(ownerPath, 'utf8'), JSON.stringify(validLockOwner()));
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
   it('restores evidence and keeps the exact quarantine inspect diagnostic when quarantine lstat fails non-ENOENT', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-lstat-quarantine-'));
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-quarantine-eacces-'));
+    try {
+      const context = resolveSessionPointerContext(cwd); const ownerPath = join(context.lockPath, 'owner.json'); const quarantine = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`; const checkpoint = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`; let armed = false;
+      await writeLockOwner(cwd, validLockOwner());
+      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', fs: { link: async (from, to) => { await link(from, to); if (to === quarantine) armed = true; }, lstat: async (path) => { if (armed && path === quarantine) throw codedError('EACCES'); return await lstat(path); } } }, async () => { const result = await recoverSessionPointerLock(cwd); assert.equal(result.recovered, false); assert.match(result.reason, /EACCES/); });
+      assert.equal(await readFile(ownerPath, 'utf8'), JSON.stringify(validLockOwner())); assert.equal(await readFile(quarantine, 'utf8'), JSON.stringify(validLockOwner())); assert.equal(existsSync(checkpoint), true);
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it('preserves a swapped parked lock directory rather than removing it', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-directory-swap-'));
     try {
       const context = resolveSessionPointerContext(cwd);
-      const staleOwner = JSON.stringify(validLockOwner());
+      const parked = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`;
+      const original = `${parked}.original`;
       await writeLockOwner(cwd, validLockOwner());
-      const ownerPath = join(context.lockPath, 'owner.json');
-      const quarantinePath = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
-      let armed = false;
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
-        fs: {
-          rename: async (from, to) => {
+        atomicRenameNoReplace: withProbeFallback(context.lockPath, async (from, to) => {
+          if (from === context.lockPath && to === parked) {
+            await rename(from, original);
+            await mkdir(from);
+            await writeFile(join(from, 'foreign'), 'foreign');
             await rename(from, to);
-            if (from === ownerPath) armed = true;
-          },
-          lstat: async (path) => {
-            if (armed && path === quarantinePath) throw codedError('EACCES');
-            return await lstat(path);
-          },
-        },
+            return 'moved';
+          }
+          return await defaultTestAtomicRenameNoReplace(from, to);
+        }),
       }, async () => {
-        const recovered = await recoverSessionPointerLock(cwd);
-        assert.equal(recovered.recovered, false);
-        assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /Unable to inspect recovery quarantine path/);
-        assert.match(recovered.reason, /rolled back/i);
+        assert.equal((await recoverSessionPointerLock(cwd)).recovered, false);
       });
-      assert.deepEqual(await readdir(context.lockPath), ['owner.json']);
-      assert.equal(await readFile(ownerPath, 'utf-8'), staleOwner);
+      assert.equal(await readFile(join(parked, 'foreign'), 'utf8'), 'foreign');
+      assert.equal(existsSync(join(original, 'owner.json')), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it('preserves a swapped parked lock directory rather than removing it', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-empty-replace-'));
+  for (const [label, checkpoint] of [
+    ['wrong version', { version: 99, phase: 'evidence-pending', sourcePath: 'x', identity: { dev: 0, ino: 0 } }],
+    ['wrong phase', { version: 1, phase: 'claim-pending', sourcePath: 'x', identity: { dev: 0, ino: 0 } }],
+    ['out-of-root path', { version: 1, phase: 'evidence-pending', sourcePath: '/foreign/owner.json', identity: { dev: 0, ino: 0 } }],
+  ]) it(`fails closed for ${label} checkpoint`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-invalid-checkpoint-'));
+    try { const context = resolveSessionPointerContext(cwd); const path = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`; await writeLockOwner(cwd, validLockOwner()); await writeFile(path, JSON.stringify(checkpoint)); await withPointerDependencies({ token: () => { throw new Error('must not mint'); }, probePid: () => 'dead' }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, false)); assert.equal(await readFile(path, 'utf8'), JSON.stringify(checkpoint)); assert.equal(await readFile(join(context.lockPath, 'owner.json'), 'utf8'), JSON.stringify(validLockOwner())); } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  for (const fault of ['EBUSY', 'ENOTEMPTY'] as const) it(`completes a checkpoint resume retry after one-shot atomic directory move failure ${fault}`, async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-atomic-retry-'));
+    try { const context = resolveSessionPointerContext(cwd); const checkpoint = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`; let fail = true; await writeLockOwner(cwd, validLockOwner()); await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', atomicRenameNoReplace: async (from, to) => { if (from === context.lockPath && fail) { fail = false; throw codedError(fault); } if (existsSync(to)) return 'not-moved'; await rename(from, to); return 'moved'; } }, async () => { assert.equal((await recoverSessionPointerLock(cwd)).recovered, false); assert.equal(existsSync(checkpoint), true); assert.equal(existsSync(context.lockPath), true); assert.equal((await recoverSessionPointerLock(cwd)).recovered, true); }); } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it('keeps a foreign atomic destination and the source lock when no directory move occurs', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-recovery-atomic-destination-'));
     try {
       const context = resolveSessionPointerContext(cwd);
-      const staleOwner = JSON.stringify(validLockOwner());
       await writeLockOwner(cwd, validLockOwner());
-      const claimPath = join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`);
-      const quarantinePath = `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`;
-      const foreignMarker = 'foreign parked lock directory';
-      let parkedPath: string | undefined;
-      let parkedIdentity: { dev: number; ino: number } | undefined;
+      const parked = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`;
+      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', atomicRenameNoReplace: async (_from, to) => {
+        await mkdir(to); await writeFile(join(to, 'foreign'), 'foreign'); return 'not-moved';
+      } }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, false));
+      assert.equal(await readFile(join(parked, 'foreign'), 'utf8'), 'foreign');
+      assert.equal(existsSync(context.lockPath), true);
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it('preserves a foreign directory swapped into the atomic move and rollback residue', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-recovery-atomic-source-swap-'));
+    try {
+      const context = resolveSessionPointerContext(cwd);
+      const original = `${context.lockPath}.original`;
+      const parked = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`;
+      await writeLockOwner(cwd, validLockOwner());
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
-        fs: {
-          rename: async (from, to) => {
+        atomicRenameNoReplace: withProbeFallback(context.lockPath, async (from, to) => {
+          if (from === context.lockPath && to === parked) {
+            await rename(from, original);
+            await mkdir(from);
+            await writeFile(join(from, 'foreign'), 'foreign');
             await rename(from, to);
-            if (from === context.lockPath) {
-              parkedPath = to;
-              await rename(to, `${to}.original`);
-              await mkdir(to);
-              await writeFile(join(to, 'marker'), foreignMarker, 'utf-8');
-              const stat = await lstat(to);
-              parkedIdentity = { dev: stat.dev, ino: stat.ino };
-            }
-          },
+            return 'moved';
+          }
+          if (from === parked && to === context.lockPath) return 'not-moved';
+          return await defaultTestAtomicRenameNoReplace(from, to);
+        }),
+      }, async () => {
+        assert.equal((await recoverSessionPointerLock(cwd)).recovered, false);
+      });
+      assert.equal(existsSync(join(original, 'owner.json')), true);
+      assert.equal(await readFile(join(parked, 'foreign'), 'utf8'), 'foreign');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not overwrite a rollback destination that appears before the no-clobber rollback link', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-recovery-rollback-destination-race-'));
+    try {
+      const context = resolveSessionPointerContext(cwd);
+      const parked = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`;
+      const foreign = 'foreign rollback destination';
+      let rollback = false;
+      await writeLockOwner(cwd, validLockOwner());
+      await withPointerDependencies({
+        token: () => SUCCESSOR_TOKEN,
+        probePid: () => 'dead',
+        atomicRenameNoReplace: async (from, to) => {
+          if (from === context.lockPath) {
+            await rename(from, to);
+            await mkdir(context.lockPath);
+            await writeFile(join(context.lockPath, 'foreign'), foreign);
+            return 'moved';
+          }
+          if (from === parked && to === context.lockPath) {
+            rollback = true;
+            return 'not-moved';
+          }
+          if (existsSync(to)) return 'not-moved';
+          await rename(from, to);
+          return 'moved';
         },
       }, async () => {
         const recovered = await recoverSessionPointerLock(cwd);
         assert.equal(recovered.recovered, false);
         assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /canonical lock directory was replaced before removal/i);
-        assert.equal(recovered.quarantinePath, quarantinePath);
+        assert.match(recovered.reason, /captured object|token-bound|source pathname/i);
       });
-      assert.ok(parkedPath);
-      assert.ok(parkedIdentity);
-      const parkedStat = await lstat(parkedPath);
-      assert.deepEqual({ dev: parkedStat.dev, ino: parkedStat.ino }, parkedIdentity);
-      assert.equal(await readFile(join(parkedPath, 'marker'), 'utf-8'), foreignMarker);
-      assert.equal(await readFile(quarantinePath, 'utf-8'), staleOwner);
+      assert.equal(rollback, true);
+      assert.equal(await readFile(join(context.lockPath, 'foreign'), 'utf-8'), foreign);
+      assert.equal(existsSync(join(parked, 'owner.json')), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
+
+  it('preserves a checkpoint replacement and foreign completed receipt collision', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-recovery-completion-collision-'));
+    try {
+      const context = resolveSessionPointerContext(cwd); await writeLockOwner(cwd, validLockOwner());
+      const checkpoint = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`;
+      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', atomicRenameNoReplace: async (from, to) => {
+        if (from === checkpoint) { await writeFile(to, 'foreign receipt'); return 'not-moved'; }
+        await rename(from, to); return 'moved';
+      } }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, false));
+      assert.equal(existsSync(checkpoint), true);
+      assert.equal(await readFile(checkpoint.replace(/\.json$/, '.completed'), 'utf8'), 'foreign receipt');
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it('fails closed before moving a lock directory with a foreign extra entry', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-recovery-foreign-entry-'));
+    try {
+      const context = resolveSessionPointerContext(cwd); await writeLockOwner(cwd, validLockOwner()); await writeFile(join(context.lockPath, 'foreign'), 'foreign');
+      let moved = false;
+      await withPointerDependencies({ token: () => SUCCESSOR_TOKEN, probePid: () => 'dead', atomicRenameNoReplace: async () => { moved = true; return 'moved'; } }, async () => assert.equal((await recoverSessionPointerLock(cwd)).recovered, false));
+      assert.equal(moved, false); assert.equal(await readFile(join(context.lockPath, 'foreign'), 'utf8'), 'foreign');
+    } finally { await rm(cwd, { recursive: true, force: true }); }
+  });
+
+  it('resumes legacy base-v1 recovery and v2 source and parked partial recovery', async () => {
+    for (const state of ['v1-source', 'v2-source', 'v2-parked'] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-session-recovery-legacy-${state}-`));
+      try {
+        const context = resolveSessionPointerContext(cwd); const ownerPath = join(context.lockPath, 'owner.json'); const checkpoint = `${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`; const lockPark = `${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`;
+        await writeLockOwner(cwd, validLockOwner()); const owner = await lstat(ownerPath); const lock = await lstat(context.lockPath);
+        const base = { version: state === 'v1-source' ? 1 : 2, sourcePath: ownerPath, identity: { dev: owner.dev, ino: owner.ino }, phase: 'evidence-pending' };
+        if (state === 'v2-parked') { await link(ownerPath, join(context.lockPath, `owner.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.recovery`)); await link(ownerPath, `${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`); await rename(context.lockPath, lockPark); }
+        await writeFile(checkpoint, JSON.stringify(state === 'v1-source' ? base : { ...base, lockIdentity: { dev: lock.dev, ino: lock.ino }, lockParkPath: lockPark, phase: state === 'v2-parked' ? 'evidence-quarantined' : 'evidence-pending' }));
+        await withPointerDependencies({ token: () => { throw new Error('legacy resume must not mint'); }, probePid: () => 'dead', atomicRenameNoReplace: async (from, to) => { if (existsSync(to)) return 'not-moved'; await rename(from, to); return 'moved'; } }, async () => {
+          const recovered = await recoverSessionPointerLock(cwd); assert.equal(recovered.recovered, true, recovered.reason);
+        });
+        assert.equal(existsSync(checkpoint.replace(/\.json$/, '.completed')), true); assert.equal(existsSync(lockPark), true);
+      } finally { await rm(cwd, { recursive: true, force: true }); }
+    }
+  });
+
+  it('preserves recovery evidence when atomic directory quarantine is unsupported', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-recovery-unsupported-'));
+    try {
+      const context = resolveSessionPointerContext(cwd);
+      await writeLockOwner(cwd, validLockOwner());
+      await withPointerDependencies({
+        token: () => SUCCESSOR_TOKEN,
+        probePid: () => 'dead',
+        atomicRenameNoReplace: async () => 'unsupported',
+      }, async () => {
+        const recovered = await recoverSessionPointerLock(cwd);
+        assert.equal(recovered.recovered, false);
+        assert.match(recovered.reason, /unsupported/i);
+      });
+      // Capability is probed before checkpoint/quarantine mutations.
+      assert.equal(existsSync(context.lockPath), true);
+      assert.equal(await readFile(join(context.lockPath, 'owner.json'), 'utf8'), JSON.stringify(validLockOwner()));
+      assert.equal(existsSync(`${context.lockPath}.quarantine.${TEST_TOKEN}.${SUCCESSOR_TOKEN}`), false);
+      assert.equal(existsSync(`${context.lockPath}.recovery.${TEST_TOKEN}.${SUCCESSOR_TOKEN}.json`), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('distinguishes a paused live pre-rename owner from the same owner after SIGKILL', async (t) => {
     if (process.platform !== 'linux') {
       t.skip('Linux process start identity is required for deterministic PID reuse protection.');
@@ -1611,7 +1872,13 @@ describe('session pointer transaction', () => {
       assert.equal(exitCode, null);
       assert.equal(signal, 'SIGKILL');
 
-      const orphaned = await recoverSessionPointerLock(cwd);
+      let orphaned!: Awaited<ReturnType<typeof recoverSessionPointerLock>>;
+      await withPointerDependencies({
+        atomicRenameNoReplace: async (from, to) => {
+          await rename(from, to);
+          return 'moved';
+        },
+      }, async () => { orphaned = await recoverSessionPointerLock(cwd); });
       assert.equal(orphaned.status, 'dead');
       assert.equal(orphaned.recovered, true);
       assert.equal(orphaned.action, 'quarantined');
@@ -1660,7 +1927,6 @@ describe('session pointer transaction', () => {
       await mkdir(context.lockPath, { recursive: true });
       await writeFile(join(context.lockPath, `owner.${TEST_TOKEN}.tmp`), JSON.stringify(validLockOwner()), 'utf-8');
       const links: Array<[string, string]> = [];
-      const renames: Array<[string, string]> = [];
       let successorBlocked = false;
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
@@ -1669,28 +1935,26 @@ describe('session pointer transaction', () => {
           link: async (from, to) => {
             links.push([from, to]);
             await link(from, to);
-            if (from.endsWith(`owner.${TEST_TOKEN}.tmp`) && to.endsWith('.recovery')) {
-              await assert.rejects(mkdir(context.lockPath), { code: 'EEXIST' });
-              successorBlocked = true;
-            }
           },
-          rename: async (from, to) => {
-            renames.push([from, to]);
-            await rename(from, to);
-          },
+        },
+        atomicRenameNoReplace: async (from, to) => {
+          if (from === context.lockPath) {
+            await assert.rejects(mkdir(context.lockPath), { code: 'EEXIST' });
+            successorBlocked = true;
+          }
+          if (existsSync(to)) return 'not-moved';
+          await rename(from, to);
+          return 'moved';
         },
       }, async () => {
         const recovered = await recoverSessionPointerLock(cwd);
         assert.equal(recovered.recovered, true);
       });
       assert.equal(successorBlocked, true);
+      assert.equal(links.length, 1);
       assert.match(links[0]![0], /owner\.transaction_token_123456\.tmp$/);
-      assert.match(links[0]![1], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
-      assert.match(links[1]![0], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
-      assert.equal(links[1]![1].includes('.quarantine.'), true);
-      assert.match(renames[0]![0], /owner\.transaction_token_123456\.tmp$/);
-      assert.match(renames[1]![0], new RegExp(`owner\\.${TEST_TOKEN}\\.${SUCCESSOR_TOKEN}\\.recovery$`));
-      assert.equal(renames[2]![0], context.lockPath);
+      assert.equal(links[0]![1].includes('.quarantine.'), true);
+      assert.equal(existsSync(`${context.lockPath}.parked-lock-${SUCCESSOR_TOKEN}`), true);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -1724,7 +1988,7 @@ describe('session pointer transaction', () => {
         const recovered = await recoverSessionPointerLock(cwd);
         assert.equal(recovered.recovered, false);
         assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /Unable to create exact recovery claim \(ENOENT\)/);
+        assert.match(recovered.reason, /Recovery checkpoint.*ENOENT/i);
       });
       assert.equal(displaced, true);
       assert.deepEqual(await readdir(context.lockPath), [`owner.${SUCCESSOR_TOKEN}.tmp`]);
@@ -1746,22 +2010,21 @@ describe('session pointer transaction', () => {
       await withPointerDependencies({
         token: () => SUCCESSOR_TOKEN,
         probePid: () => 'dead',
-        fs: {
-          rename: async (from, to) => {
-            await rename(from, to);
-            if (!displaced && from === context.lockPath) {
-              displaced = true;
-              await mkdir(context.lockPath);
-              await writeFile(successorTemp, JSON.stringify(validLockOwner({ token: SUCCESSOR_TOKEN })), 'utf-8');
-            }
-          },
+        atomicRenameNoReplace: async (from, to) => {
+          if (existsSync(to)) return 'not-moved';
+          await rename(from, to);
+          if (!displaced && from === context.lockPath) {
+            displaced = true;
+            await mkdir(context.lockPath);
+            await writeFile(successorTemp, JSON.stringify(validLockOwner({ token: SUCCESSOR_TOKEN })), 'utf-8');
+          }
+          return 'moved';
         },
       }, async () => {
         const recovered = await recoverSessionPointerLock(cwd);
         assert.equal(recovered.recovered, false);
         assert.equal(recovered.action, 'none');
-        assert.match(recovered.reason, /canonical lock directory was replaced before removal/i);
-        assert.ok(recovered.quarantinePath);
+        assert.match(recovered.reason, /did not leave the captured object/i);
       });
       assert.equal(displaced, true);
       assert.deepEqual(await readdir(context.lockPath), [`owner.${SUCCESSOR_TOKEN}.tmp`]);
