@@ -152,10 +152,17 @@ fn run_fs_rename_no_replace(args: &[String]) -> Result<(), String> {
     let outcome = fs_rename_no_replace(&from, &to)?;
     let json = match outcome {
         FsRenameOutcome::Moved => serde_json::json!({ "outcome": "moved" }),
-        FsRenameOutcome::NotMoved => serde_json::json!({ "outcome": "not-moved", "code": "EEXIST" }),
-        FsRenameOutcome::Unsupported(code) => serde_json::json!({ "outcome": "unsupported", "code": code }),
+        FsRenameOutcome::NotMoved => {
+            serde_json::json!({ "outcome": "not-moved", "code": "EEXIST" })
+        }
+        FsRenameOutcome::Unsupported(code) => {
+            serde_json::json!({ "outcome": "unsupported", "code": code })
+        }
     };
-    println!("{}", serde_json::to_string(&json).map_err(|error| error.to_string())?);
+    println!(
+        "{}",
+        serde_json::to_string(&json).map_err(|error| error.to_string())?
+    );
     Ok(())
 }
 
@@ -171,7 +178,10 @@ fn validate_absolute_path(raw: &str, name: &str) -> Result<std::ffi::CString, St
 }
 
 #[cfg(target_os = "linux")]
-fn fs_rename_no_replace(from: &std::ffi::CString, to: &std::ffi::CString) -> Result<FsRenameOutcome, String> {
+fn fs_rename_no_replace(
+    from: &std::ffi::CString,
+    to: &std::ffi::CString,
+) -> Result<FsRenameOutcome, String> {
     let result = unsafe {
         libc::renameat2(
             libc::AT_FDCWD,
@@ -197,7 +207,10 @@ fn fs_rename_no_replace(from: &std::ffi::CString, to: &std::ffi::CString) -> Res
 }
 
 #[cfg(target_os = "macos")]
-fn fs_rename_no_replace(from: &std::ffi::CString, to: &std::ffi::CString) -> Result<FsRenameOutcome, String> {
+fn fs_rename_no_replace(
+    from: &std::ffi::CString,
+    to: &std::ffi::CString,
+) -> Result<FsRenameOutcome, String> {
     let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
     if result == 0 {
         return Ok(FsRenameOutcome::Moved);
@@ -214,7 +227,10 @@ fn fs_rename_no_replace(from: &std::ffi::CString, to: &std::ffi::CString) -> Res
 }
 
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn fs_rename_no_replace(_from: &std::ffi::CString, _to: &std::ffi::CString) -> Result<FsRenameOutcome, String> {
+fn fs_rename_no_replace(
+    _from: &std::ffi::CString,
+    _to: &std::ffi::CString,
+) -> Result<FsRenameOutcome, String> {
     Ok(FsRenameOutcome::Unsupported("platform"))
 }
 
