@@ -5138,7 +5138,7 @@ function commandHasDeepInterviewWriteIntent(command: string, depth = 0, cwd = pr
     ));
 }
 
-type PreToolUseMutationTransport = "read-only" | "bash" | "path" | "state" | "orchestration" | "unknown";
+type PreToolUseMutationTransport = "read-only" | "bash" | "path" | "state" | "orchestration" | "goal-lifecycle" | "unknown";
 
 const READ_ONLY_PRETOOLUSE_TOOL_NAMES = new Set([
   "Read",
@@ -5215,6 +5215,37 @@ const CONDUCTOR_ORCHESTRATION_TOOL_NAMES = new Set([
   "multi_agent_v1.close_agent",
 ]);
 
+// Finite native Codex goal-tool identities for Ultragoal reconciliation.
+// Canonicalize ONLY exact known host-emitted forms (bare, functions.*, and known
+// flattened forms). Unknown/near-miss names stay fail-closed as "unknown".
+// Callers keep the original received name for diagnostics.
+const NATIVE_CODEX_GOAL_READ_TOOL_NAMES = new Set([
+  "get_goal",
+  "functions.get_goal",
+  "functionsget_goal",
+]);
+const NATIVE_CODEX_GOAL_LIFECYCLE_TOOL_NAMES = new Set([
+  "create_goal",
+  "update_goal",
+  "functions.create_goal",
+  "functions.update_goal",
+  "functionscreate_goal",
+  "functionsupdate_goal",
+]);
+
+function canonicalizeNativeCodexGoalToolName(name: string): string {
+  switch (name) {
+    case "functionsget_goal":
+      return "functions.get_goal";
+    case "functionscreate_goal":
+      return "functions.create_goal";
+    case "functionsupdate_goal":
+      return "functions.update_goal";
+    default:
+      return name;
+  }
+}
+
 function classifyPreToolUseMutationTransport(
   payload: CodexHookPayload,
   toolName: string,
@@ -5230,6 +5261,14 @@ function classifyPreToolUseMutationTransport(
   if (PLANNING_MODE_IMPLEMENTATION_TOOL_NAMES.has(toolName)) return "path";
   if (READ_ONLY_PRETOOLUSE_TOOL_NAMES.has(toolName) || READ_ONLY_PRETOOLUSE_MCP_TOOL_NAMES.has(toolName)) {
     return "read-only";
+  }
+  // Finite Codex goal tools: exact names only (bare, functions.*, known flattened).
+  // Preserve the original toolName for deny diagnostics; classify on the canonical form.
+  if (NATIVE_CODEX_GOAL_READ_TOOL_NAMES.has(toolName) || NATIVE_CODEX_GOAL_READ_TOOL_NAMES.has(canonicalizeNativeCodexGoalToolName(toolName))) {
+    return "read-only";
+  }
+  if (NATIVE_CODEX_GOAL_LIFECYCLE_TOOL_NAMES.has(toolName) || NATIVE_CODEX_GOAL_LIFECYCLE_TOOL_NAMES.has(canonicalizeNativeCodexGoalToolName(toolName))) {
+    return "goal-lifecycle";
   }
   const canonicalToolName = canonicalizeNativeCollaborationToolName(toolName);
 
@@ -9674,7 +9713,7 @@ function teamWorkerMutationTargetsProtectedWorkflowState(
   };
   const mutationTransport = classifyPreToolUseMutationTransport(payload, toolName, cwd);
   if (toolName === "mcp__omx_state__state_clear" || toolName === "mcp__omx_state__state_write") return true;
-  if (mutationTransport === "unknown" || mutationTransport === "state") return true;
+  if (mutationTransport === "unknown" || mutationTransport === "state" || mutationTransport === "goal-lifecycle") return true;
   if (toolName === "Bash") {
     if (collectOmxStateCommandOperations(command, "write").length > 0
       || findUnquotedOmxStateCommandIndexes(command, "clear").length > 0) return true;
@@ -9820,7 +9859,7 @@ async function buildRalplanPreToolUseBoundaryOutput(
         blockedDetail = describeImplementationToolBlock(toolName, blockedPath, toolPathCandidates.length);
       }
     }
-  } else if (mutationTransport === "unknown") {
+  } else if (mutationTransport === "unknown" || mutationTransport === "goal-lifecycle") {
     blocked = true;
     blockedDetail = `${toolName || "unknown tool"} is not a recognized read-only or explicitly authorized planning mutation transport`;
   }
@@ -9939,7 +9978,7 @@ async function buildDeepInterviewPreToolUseBoundaryOutput(
       const blockedPath = candidates.find((candidate) => !isAllowedDeepInterviewArtifactPath(cwd, candidate, sessionId));
       blockedDetail = describeImplementationToolBlock(toolName, blockedPath, candidates.length);
     }
-  } else if (mutationTransport === "unknown") {
+  } else if (mutationTransport === "unknown" || mutationTransport === "goal-lifecycle") {
     blocked = true;
     blockedDetail = `${toolName || "unknown tool"} is not a recognized read-only or explicitly authorized deep-interview mutation transport`;
   }
@@ -9964,7 +10003,7 @@ function blocksDeepInterviewImplementationWrite(payload: CodexHookPayload, cwd: 
     return !isAllowedDeepInterviewBashWrite(cwd, readPreToolUseCommand(payload), undefined, authoritativeSessionId);
   }
   const mutationTransport = classifyPreToolUseMutationTransport(payload, toolName);
-  if (mutationTransport === "unknown") return true;
+  if (mutationTransport === "unknown" || mutationTransport === "goal-lifecycle") return true;
   if (mutationTransport !== "path") return false;
   const candidates = collectImplementationToolPathCandidates(
     payload,
@@ -10082,7 +10121,7 @@ async function buildPlanningRootPointerConflictPreToolUseOutput(
     );
     blocked = toolPathCandidates.length === 0
       || toolPathCandidates.some((candidate) => !isAllowedRalplanArtifactPath(cwd, candidate, rootSessionId));
-  } else if (mutationTransport === "unknown") {
+  } else if (mutationTransport === "unknown" || mutationTransport === "goal-lifecycle") {
     blocked = true;
   }
 
@@ -18966,7 +19005,7 @@ export async function buildConductorPreToolUseWriteGuardOutput(
       blocked = true;
       blockedDetail = "Structured state writes must preserve the canonical active Conductor guard";
     }
-  } else if (mutationTransport === "orchestration") {
+  } else if (mutationTransport === "orchestration" || mutationTransport === "goal-lifecycle") {
     nativeChildMutationAttempt = true;
   } else if (mutationTransport === "path") {
     nativeChildMutationAttempt = true;
