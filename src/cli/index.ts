@@ -132,7 +132,10 @@ import {
 import {
   closeLaunchSessionBindingOnce,
   establishLaunchSessionBinding,
+  readNativeSessionOwnerEvidence,
+  readSessionPointer,
   readSessionState,
+  resolveSessionPointerContext,
   updateDetachedSessionMetadata,
   finalizeBoundOnce,
   isSessionPointerLaunchAbort,
@@ -141,6 +144,7 @@ import {
   type LaunchSessionBinding,
   type EstablishmentCleanupEvidence,
 } from "../hooks/session.js";
+
 import { probeActualTmuxInstanceEvidence, tmuxEvidenceBindsCandidate } from "../scripts/notify-hook/managed-tmux.js";
 import {
   buildClientAttachedReconcileHookName,
@@ -7737,9 +7741,105 @@ function assertCancellationOwnerMetadata(
   }
 }
 
-async function cancelModes(args: string[] = []): Promise<void> {
+interface ExactSessionCancellationAuthority {
+  readonly sessionId: string;
+  readonly nativeSessionId: string;
+  readonly authorityCwd: string;
+}
 
-  const cwd = process.cwd();
+async function resolveExactSessionCancellationAuthority(
+  cwd: string,
+  baseStateDir: string,
+  sessionId: string | undefined,
+): Promise<ExactSessionCancellationAuthority | undefined> {
+  if (!sessionId) return undefined;
+  let pointer: Awaited<ReturnType<typeof readSessionPointer>>;
+  let authorityCwd = cwd;
+  try {
+    const rawPointer = JSON.parse(await readFile(join(baseStateDir, "session.json"), "utf-8")) as Record<string, unknown>;
+    if (typeof rawPointer.cwd === "string" && rawPointer.cwd.trim()) authorityCwd = rawPointer.cwd.trim();
+    pointer = await readSessionPointer(resolveSessionPointerContext(authorityCwd));
+  } catch {
+    return undefined;
+  }
+  const nativeSessionId = normalizeSessionId(pointer.state?.native_session_id);
+  if (pointer.status !== "usable" || pointer.state?.session_id !== sessionId || !nativeSessionId) return undefined;
+  try {
+    const ownerEvidence = await readNativeSessionOwnerEvidence(authorityCwd, nativeSessionId);
+    if (ownerEvidence.status !== "usable") return undefined;
+  } catch {
+    return undefined;
+  }
+  return { sessionId, nativeSessionId, authorityCwd };
+}
+
+function assertExactSkillOwner(
+  value: Record<string, unknown>,
+  authority: ExactSessionCancellationAuthority,
+  path: string,
+  allowStaleTopCodexOwner: boolean = false,
+): void {
+  for (const field of ["session_id", "owner_omx_session_id"] as const) {
+    if (!Object.prototype.hasOwnProperty.call(value, field)) continue;
+    if (normalizeSessionId(value[field]) !== authority.sessionId) {
+      throw new Error(`Refusing contradictory ${field} in ${path}.`);
+    }
+  }
+  if (Object.prototype.hasOwnProperty.call(value, "owner_codex_session_id")) {
+    const owner = normalizeSessionId(value.owner_codex_session_id);
+    if (!owner || (!allowStaleTopCodexOwner && owner !== authority.nativeSessionId)) {
+      throw new Error(`Refusing contradictory owner_codex_session_id in ${path}.`);
+    }
+  }
+}
+
+
+function assertCompatibleNestedSkillOwners(
+  value: Record<string, unknown>,
+  authority: ExactSessionCancellationAuthority,
+  path: string,
+): void {
+  if (!Object.prototype.hasOwnProperty.call(value, "active_skills")) return;
+  if (!Array.isArray(value.active_skills)) {
+    throw new Error(`Refusing malformed active_skills in ${path}.`);
+  }
+  for (const [index, skill] of value.active_skills.entries()) {
+    const entryPath = `${path} active_skills[${index}]`;
+    if (!skill || typeof skill !== "object" || Array.isArray(skill)) {
+      throw new Error(`Refusing malformed active_skills entry ${index} in ${path}.`);
+    }
+    const entry = skill as Record<string, unknown>;
+    if (typeof entry.skill !== "string" || entry.skill.trim() === "") {
+      throw new Error(`Refusing malformed skill in ${entryPath}.`);
+    }
+    for (const field of ["active"] as const) {
+      if (Object.prototype.hasOwnProperty.call(entry, field) && typeof entry[field] !== "boolean") {
+        throw new Error(`Refusing malformed ${field} in ${entryPath}.`);
+      }
+    }
+    if (Object.prototype.hasOwnProperty.call(entry, "phase") && typeof entry.phase !== "string") {
+      throw new Error(`Refusing malformed phase in ${entryPath}.`);
+    }
+    for (const [field, fieldValue] of Object.entries(entry)) {
+      if (field.endsWith("_at") && typeof fieldValue !== "string") {
+        throw new Error(`Refusing malformed ${field} in ${entryPath}.`);
+      }
+    }
+    assertExactSkillOwner(entry, authority, entryPath);
+  }
+}
+
+interface CancellationTestFaults {
+  writeFailureMode?: string;
+  rollbackFailureMode?: string;
+}
+
+async function cancelModes(
+  args: string[] = [],
+  options: { cwd?: string; testFaults?: CancellationTestFaults } = {},
+): Promise<void> {
+
+  const cwd = options.cwd ?? process.cwd();
   const nowIso = new Date().toISOString();
   if (args.length > 1 || args.some((arg) => arg !== "--force")) {
     const unsupported = args.find((arg) => arg !== "--force") ?? args[1] ?? "";
@@ -7751,7 +7851,12 @@ async function cancelModes(args: string[] = []): Promise<void> {
   try {
     const writableScope = await resolveWritableStateScope(cwd);
     const baseStateDir = getBaseStateDir(cwd);
+    const exactAuthority = writableScope.source === "session"
+      ? await resolveExactSessionCancellationAuthority(cwd, baseStateDir, writableScope.sessionId)
+      : undefined;
     const expectedOwnerIds = collectCancellationOwnerIds(baseStateDir, writableScope.sessionId);
+
+
     const loadStates = async (
       refs: ModeStateFileRef[],
       authorityRoot: string,
@@ -7799,11 +7904,39 @@ async function cancelModes(args: string[] = []): Promise<void> {
         if (typeof parsedState.mode === "string" && parsedState.mode !== ref.mode) {
           throw new Error(`Refusing contradictory mode state in ${ref.path}.`);
         }
-        assertCancellationOwnerMetadata(parsedState, ownerIds, ref.path);
-        if (Array.isArray(parsedState.active_skills)) {
-          for (const skill of parsedState.active_skills) {
-            if (skill && typeof skill === "object" && !Array.isArray(skill)) {
-              assertCancellationOwnerMetadata(skill as Record<string, unknown>, ownerIds, `${ref.path} active_skills`);
+        if (ref.mode === SKILL_ACTIVE_STATE_MODE && exactAuthority) {
+          const hasTopCodexOwner = Object.prototype.hasOwnProperty.call(parsedState, "owner_codex_session_id");
+          const displacedOwnerId = hasTopCodexOwner
+            ? normalizeSessionId(parsedState.owner_codex_session_id)
+            : undefined;
+          if (hasTopCodexOwner && !displacedOwnerId) {
+            throw new Error(`Refusing contradictory owner_codex_session_id in ${ref.path}.`);
+          }
+          assertExactSkillOwner(parsedState, exactAuthority, ref.path, hasTopCodexOwner);
+          assertCompatibleNestedSkillOwners(parsedState, exactAuthority, ref.path);
+          if (displacedOwnerId && displacedOwnerId !== exactAuthority.nativeSessionId) {
+            let displacedEvidence: Awaited<ReturnType<typeof readNativeSessionOwnerEvidence>>;
+            try {
+              displacedEvidence = await readNativeSessionOwnerEvidence(exactAuthority.authorityCwd, displacedOwnerId);
+            } catch (error) {
+              throw new Error(`Refusing ambiguous displaced owner evidence for ${ref.path}.`, { cause: error });
+            }
+            if (displacedEvidence.status !== "absent" && displacedEvidence.status !== "stale-dead") {
+              throw new Error(`Refusing non-stale displaced owner evidence for ${ref.path}.`);
+            }
+            parsedState.owner_codex_session_id = exactAuthority.nativeSessionId;
+          }
+        } else {
+          assertCancellationOwnerMetadata(parsedState, ownerIds, ref.path);
+          if (Object.prototype.hasOwnProperty.call(parsedState, "active_skills")) {
+            if (!Array.isArray(parsedState.active_skills)) {
+              throw new Error(`Refusing malformed active_skills in ${ref.path}.`);
+            }
+            for (const [index, skill] of parsedState.active_skills.entries()) {
+              if (!skill || typeof skill !== "object" || Array.isArray(skill)) {
+                throw new Error(`Refusing malformed active_skills entry ${index} in ${ref.path}.`);
+              }
+              assertCancellationOwnerMetadata(skill as Record<string, unknown>, ownerIds, `${ref.path} active_skills[${index}]`);
             }
           }
         }
@@ -7901,12 +8034,63 @@ async function cancelModes(args: string[] = []): Promise<void> {
       return undefined;
     };
 
+    const cancelRalphSkillEntries = (linkedMode: "ultrawork" | "ecomode" | undefined): void => {
+      const entry = states.get(SKILL_ACTIVE_STATE_MODE);
+      if (!entry) return;
+      const matchingSkills = new Set(["ralph", ...(linkedMode ? [linkedMode] : [])]);
+      const activeSkills = Array.isArray(entry.state.active_skills)
+        ? entry.state.active_skills
+        : [];
+      let changedSkillEntries = false;
+      const nextSkills = activeSkills.map((skill) => {
+        if (!skill || typeof skill !== "object" || Array.isArray(skill)) return skill;
+        const skillEntry = skill as Record<string, unknown>;
+        if (skillEntry.active === false || typeof skillEntry.skill !== "string" || !matchingSkills.has(skillEntry.skill)) {
+          return skill;
+        }
+        changedSkillEntries = true;
+        return { ...skillEntry, active: false, phase: "cancelled" };
+      });
+      const remainingActiveSkills = nextSkills.filter((skill): skill is Record<string, unknown> => (
+        !!skill && typeof skill === "object" && !Array.isArray(skill)
+          && (skill as Record<string, unknown>).active !== false
+      ));
+      if (!changedSkillEntries) {
+        if (entry.state.active !== true) return;
+        if (typeof entry.state.skill !== "string" || !matchingSkills.has(entry.state.skill)) return;
+      }
+      entry.state.active_skills = nextSkills;
+      entry.state.updated_at = nowIso;
+      entry.state.last_turn_at = nowIso;
+      if (remainingActiveSkills.length > 0) {
+        const primary = remainingActiveSkills[0];
+        entry.state.active = true;
+        entry.state.skill = primary.skill;
+        if (typeof primary.phase === "string") {
+          entry.state.phase = primary.phase;
+          entry.state.current_phase = primary.phase;
+        } else {
+          delete entry.state.phase;
+          delete entry.state.current_phase;
+        }
+        delete entry.state.completed_at;
+      } else {
+        entry.state.active = false;
+        entry.state.skill = "";
+        entry.state.phase = "cancelled";
+        entry.state.current_phase = "cancelled";
+        entry.state.completed_at = nowIso;
+      }
+      changed.add(SKILL_ACTIVE_STATE_MODE);
+    };
+
     const ralph = states.get("ralph");
     const hadActiveRalph = !!(ralph && ralph.state.active === true);
     if (ralph && ralph.state.active === true) {
       const linkedMode = linkedRalphMode(ralph.state);
       if (linkedMode) cancelMode(linkedMode, "cancelled", true);
       cancelMode("ralph", "cancelled", true);
+      cancelRalphSkillEntries(linkedMode);
     }
 
     if (!hadActiveRalph) {
@@ -7964,21 +8148,41 @@ async function cancelModes(args: string[] = []): Promise<void> {
       }
 
       const committed: typeof opened = [];
+      const cancellationTestWriteFailureMode = options.testFaults?.writeFailureMode;
+      const cancellationTestRollbackFailureMode = options.testFaults?.rollbackFailureMode;
       try {
         for (const openedEntry of opened) {
           assertRunAuthority();
           committed.push(openedEntry);
+          if (cancellationTestWriteFailureMode === openedEntry.mode) {
+            throw new Error(`Injected cancellation write failure for ${openedEntry.mode}.`);
+          }
           await openedEntry.handle.truncate(0);
           await openedEntry.handle.write(openedEntry.nextContent, 0, "utf-8");
           await openedEntry.handle.sync();
         }
       } catch (writeError) {
+        let rollbackFailureCount = 0;
+        const rollbackFailureSample: string[] = [];
         for (const committedEntry of committed.reverse()) {
           try {
+            if (cancellationTestRollbackFailureMode === committedEntry.mode) {
+              throw new Error(`Injected cancellation rollback failure for ${committedEntry.mode}.`);
+            }
             await committedEntry.handle.truncate(0);
             await committedEntry.handle.write(committedEntry.entry.originalContent, 0, "utf-8");
             await committedEntry.handle.sync();
-          } catch {}
+          } catch {
+            rollbackFailureCount += 1;
+            if (rollbackFailureSample.length < 3) {
+              rollbackFailureSample.push(committedEntry.mode.replace(/[^A-Za-z0-9_-]/g, "_"));
+            }
+          }
+        }
+        if (rollbackFailureCount > 0) {
+          const primaryMessage = writeError instanceof Error ? writeError.message : String(writeError);
+          const sample = rollbackFailureSample.length > 0 ? `:${rollbackFailureSample.join(",")}` : "";
+          throw new Error(`${primaryMessage} (cancellation_rollback_failed:${rollbackFailureCount}${sample}).`, { cause: writeError });
         }
         throw writeError;
       }
@@ -7997,4 +8201,13 @@ async function cancelModes(args: string[] = []): Promise<void> {
     logCliOperationFailure(err);
     process.exitCode = 1;
   }
+}
+
+/** Test-only entrypoint for deterministic transaction fault injection without runtime environment controls. */
+export async function cancelModesForTest(
+  cwd: string,
+  args: string[],
+  testFaults: CancellationTestFaults,
+): Promise<void> {
+  await cancelModes(args, { cwd, testFaults });
 }

@@ -22,6 +22,7 @@ import {
   readSessionState,
   readUsableSessionState,
   readNativeSessionOwner,
+  readNativeSessionOwnerEvidence,
   reconcileNativeSessionStart,
   recoverSessionPointerLock,
   resetSessionMetrics,
@@ -2495,6 +2496,85 @@ describe('session pointer transaction', () => {
     }
   });
 
+  it('rejects a symlinked native owner state root', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-owner-root-symlink-'));
+    try {
+      const externalState = join(cwd, 'external-state');
+      const ownerDir = join(externalState, 'sessions', 'native-owner-root-link');
+      await mkdir(ownerDir, { recursive: true });
+      await writeFile(join(ownerDir, 'session-owner.json'), JSON.stringify({
+        session_id: 'native-owner-root-link',
+        native_session_id: 'native-owner-root-link',
+        cwd,
+        platform: process.platform,
+      }));
+      await mkdir(join(cwd, '.omx'), { recursive: true });
+      await symlink(externalState, join(cwd, '.omx', 'state'));
+      assert.equal((await readNativeSessionOwnerEvidence(cwd, 'native-owner-root-link')).status, 'malformed');
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it('rejects symlinked native owner directories and sidecars', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-owner-symlink-'));
+    try {
+      const stateDir = join(cwd, '.omx', 'state');
+      const sessionsDir = join(stateDir, 'sessions');
+      const externalDir = join(cwd, 'external-owner');
+      await mkdir(sessionsDir, { recursive: true });
+      await mkdir(externalDir, { recursive: true });
+      await writeFile(join(externalDir, 'session-owner.json'), JSON.stringify({
+        session_id: 'native-owner-dir-link',
+        native_session_id: 'native-owner-dir-link',
+        cwd,
+        platform: process.platform,
+      }));
+      await symlink(externalDir, join(sessionsDir, 'native-owner-dir-link'));
+      assert.equal((await readNativeSessionOwnerEvidence(cwd, 'native-owner-dir-link')).status, 'malformed');
+
+      const fileLinkDir = join(sessionsDir, 'native-owner-file-link');
+      await mkdir(fileLinkDir, { recursive: true });
+      const externalFile = join(cwd, 'external-session-owner.json');
+      await writeFile(externalFile, JSON.stringify({
+        session_id: 'native-owner-file-link',
+        native_session_id: 'native-owner-file-link',
+        cwd,
+        platform: process.platform,
+      }));
+      await symlink(externalFile, join(fileLinkDir, 'session-owner.json'));
+      assert.equal((await readNativeSessionOwnerEvidence(cwd, 'native-owner-file-link')).status, 'malformed');
+
+      const swappedOwnerId = 'native-owner-swapped-dir';
+      const swappedOwnerDir = join(sessionsDir, swappedOwnerId);
+      await mkdir(swappedOwnerDir, { recursive: true });
+      await writeFile(join(swappedOwnerDir, 'session-owner.json'), JSON.stringify({
+        session_id: swappedOwnerId,
+        native_session_id: swappedOwnerId,
+        cwd,
+        platform: process.platform,
+      }));
+      let swappedOwnerLstatCalls = 0;
+      await withPointerDependencies({
+        fs: {
+          lstat: async (path) => {
+            const stat = await lstat(path);
+            const simulateSwap = path === swappedOwnerDir && ++swappedOwnerLstatCalls === 2;
+            return {
+              dev: Number(stat.dev) + (simulateSwap ? 1 : 0),
+              ino: Number(stat.ino),
+              isDirectory: () => stat.isDirectory(),
+              isFile: () => stat.isFile(),
+              isSymbolicLink: () => stat.isSymbolicLink(),
+            };
+          },
+        },
+      }, async () => {
+        assert.equal((await readNativeSessionOwnerEvidence(cwd, swappedOwnerId)).status, 'malformed');
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
   it('rejects owner sidecars recorded for another platform', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-owner-platform-'));
     try {
@@ -2520,6 +2600,7 @@ describe('session pointer transaction', () => {
       }), 'utf-8');
       const before = await readFile(ownerPath, 'utf-8');
 
+      assert.equal((await readNativeSessionOwnerEvidence(cwd, 'native-owner-platform')).status, 'malformed');
       assert.equal(await readNativeSessionOwner(cwd, 'native-owner-platform'), null);
       await assert.rejects(
         writeNativeSessionOwner(cwd, 'native-owner-platform', {
@@ -2537,6 +2618,7 @@ describe('session pointer transaction', () => {
   it('replaces only stale-dead owner evidence and preserves malformed evidence', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-owner-recovery-'));
     try {
+      assert.equal((await readNativeSessionOwnerEvidence(cwd, 'native-owner-absent')).status, 'absent');
       await withPointerDependencies({
         probePid: (pid) => pid === 11 ? 'dead' : 'alive',
       }, async () => {
@@ -2545,6 +2627,7 @@ describe('session pointer transaction', () => {
           'native-owner-recovery',
           { pid: 11, platform: 'win32' },
         );
+        assert.equal((await readNativeSessionOwnerEvidence(cwd, 'native-owner-recovery')).status, 'malformed');
         const recovered = await writeNativeSessionOwner(
           cwd,
           'native-owner-recovery',
@@ -2563,6 +2646,7 @@ describe('session pointer transaction', () => {
         const malformedPath = join(malformedDir, 'session-owner.json');
         await writeFile(malformedPath, '{ malformed', 'utf-8');
         assert.equal(await readNativeSessionOwner(cwd, 'native-owner-malformed'), null);
+        assert.equal((await readNativeSessionOwnerEvidence(cwd, 'native-owner-malformed')).status, 'malformed');
         await assert.rejects(
           writeNativeSessionOwner(
             cwd,

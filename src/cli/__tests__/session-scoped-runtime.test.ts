@@ -10,6 +10,7 @@ import { fileURLToPath } from 'url';
 import { readModeState } from '../../modes/base.js';
 import { readSkillActiveState } from '../../state/skill-active.js';
 import { recordSkillActivation } from '../../hooks/keyword-detector.js';
+import { cancelModesForTest } from '../index.js';
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testDir, '..', '..', '..');
@@ -428,6 +429,323 @@ describe('CLI session-scoped state parity', () => {
       assert.equal(await readFile(teamPath, 'utf-8'), rootTeamState);
       assert.equal(await readFile(skillActivePath, 'utf-8'), rootSkillActiveState);
       assert.equal(await readFile(nativeStopPath, 'utf-8'), rootNativeStopState);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('replaces only a stale top-level skill owner under complete current native authority', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-cancel-stale-skill-owner-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'current-session';
+      const nativeSessionId = 'current-native-owner';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const pointer = JSON.stringify({
+        session_id: sessionId,
+        native_session_id: nativeSessionId,
+        cwd: wd,
+        platform: process.platform,
+      }, null, 2);
+      const skillPath = join(sessionDir, 'skill-active-state.json');
+      const ralplanPath = join(sessionDir, 'ralplan-state.json');
+      const rootSkillPath = join(stateDir, 'skill-active-state.json');
+      const rootSkill = JSON.stringify({ active: true, skill: 'team' }, null, 2);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), pointer);
+      await mkdir(join(stateDir, 'sessions', nativeSessionId), { recursive: true });
+      await writeFile(join(stateDir, 'sessions', nativeSessionId, 'session-owner.json'), JSON.stringify({
+        session_id: nativeSessionId,
+        native_session_id: nativeSessionId,
+        cwd: wd,
+        platform: process.platform,
+      }, null, 2));
+      await writeFile(skillPath, JSON.stringify({
+        active: true,
+        skill: 'ralplan',
+        owner_codex_session_id: 'stale-native-owner',
+        active_skills: [{ skill: 'ralplan', active: true, owner_codex_session_id: nativeSessionId }],
+      }, null, 2));
+      await writeFile(ralplanPath, JSON.stringify({ active: true, mode: 'ralplan' }, null, 2));
+      await writeFile(rootSkillPath, rootSkill);
+
+      const descendantCwd = join(wd, 'packages', 'app');
+      await mkdir(descendantCwd, { recursive: true });
+      const result = runOmxWithEnv(descendantCwd, { OMX_ROOT: wd }, 'cancel');
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const skill = JSON.parse(await readFile(skillPath, 'utf-8'));
+      assert.equal(skill.owner_codex_session_id, nativeSessionId);
+      assert.equal(skill.active_skills[0].owner_codex_session_id, nativeSessionId);
+      assert.equal(skill.active, false);
+      assert.equal(await readFile(rootSkillPath, 'utf-8'), rootSkill);
+
+      const repeat = runOmx(wd, 'cancel');
+      assert.equal(repeat.status, 0, repeat.stderr || repeat.stdout);
+      assert.equal(JSON.parse(await readFile(skillPath, 'utf-8')).owner_codex_session_id, nativeSessionId);
+
+      const malformedNestedSkill = JSON.stringify({
+        active: true,
+        skill: 'ralplan',
+        owner_codex_session_id: nativeSessionId,
+        active_skills: [{ skill: 'ralplan', active: 'true', owner_codex_session_id: nativeSessionId }],
+      }, null, 2);
+      await writeFile(skillPath, malformedNestedSkill);
+      const malformedNestedResult = runOmx(wd, 'cancel');
+      assert.notEqual(malformedNestedResult.status, 0);
+      assert.match(malformedNestedResult.stderr, /malformed active/);
+      assert.equal(await readFile(skillPath, 'utf-8'), malformedNestedSkill);
+
+      const fieldSwappedSkill = JSON.stringify({
+        active: true,
+        skill: 'ralplan',
+        session_id: nativeSessionId,
+        owner_codex_session_id: nativeSessionId,
+        active_skills: [{ skill: 'ralplan', active: true, session_id: nativeSessionId, owner_codex_session_id: nativeSessionId }],
+      }, null, 2);
+      await writeFile(skillPath, fieldSwappedSkill);
+      const fieldSwappedResult = runOmx(wd, 'cancel');
+      assert.notEqual(fieldSwappedResult.status, 0);
+      assert.match(fieldSwappedResult.stderr, /contradictory session_id/);
+      assert.equal(await readFile(skillPath, 'utf-8'), fieldSwappedSkill);
+
+      const inactiveStaleSkill = JSON.stringify({
+        active: false,
+        skill: 'ralplan',
+        owner_codex_session_id: 'stale-native-owner',
+        active_skills: [{ skill: 'ralplan', active: false, owner_codex_session_id: nativeSessionId }],
+      }, null, 2);
+      await writeFile(skillPath, inactiveStaleSkill);
+      const noActiveResult = runOmx(wd, 'cancel');
+      assert.equal(noActiveResult.status, 0, noActiveResult.stderr || noActiveResult.stdout);
+      assert.match(noActiveResult.stdout, /No active modes to cancel/);
+      assert.equal(await readFile(skillPath, 'utf-8'), inactiveStaleSkill);
+
+      const displacedDir = join(stateDir, 'sessions', 'stale-native-owner');
+      await mkdir(displacedDir, { recursive: true });
+      await writeFile(join(displacedDir, 'session-owner.json'), JSON.stringify({
+        session_id: 'stale-native-owner',
+        native_session_id: 'stale-native-owner',
+        cwd: wd,
+        platform: process.platform,
+      }, null, 2));
+      const liveDisplacedSkill = JSON.stringify({
+        active: true,
+        skill: 'ralplan',
+        owner_codex_session_id: 'stale-native-owner',
+        active_skills: [{ skill: 'ralplan', active: true, owner_codex_session_id: nativeSessionId }],
+      }, null, 2);
+      const activeRalplan = JSON.stringify({ active: true, mode: 'ralplan' }, null, 2);
+      await writeFile(skillPath, liveDisplacedSkill);
+      await writeFile(ralplanPath, activeRalplan);
+      const liveDisplaced = runOmx(wd, 'cancel');
+      assert.notEqual(liveDisplaced.status, 0);
+      assert.match(liveDisplaced.stderr, /non-stale displaced owner evidence/);
+      assert.equal(await readFile(skillPath, 'utf-8'), liveDisplacedSkill);
+      assert.equal(await readFile(ralplanPath, 'utf-8'), activeRalplan);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves active Team skill entries while cancelling Ralph', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-cancel-ralph-team-peer-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'canonical-session';
+      const nativeSessionId = 'native-session';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const skillPath = join(sessionDir, 'skill-active-state.json');
+      const ralphPath = join(sessionDir, 'ralph-state.json');
+      const teamPath = join(sessionDir, 'team-state.json');
+      const teamState = JSON.stringify({ active: true, mode: 'team', current_phase: 'team-exec' }, null, 2);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+        session_id: sessionId,
+        native_session_id: nativeSessionId,
+        cwd: wd,
+      }, null, 2));
+      await mkdir(join(stateDir, 'sessions', nativeSessionId), { recursive: true });
+      await writeFile(join(stateDir, 'sessions', nativeSessionId, 'session-owner.json'), JSON.stringify({
+        session_id: nativeSessionId,
+        native_session_id: nativeSessionId,
+        cwd: wd,
+      }, null, 2));
+      await writeFile(skillPath, JSON.stringify({
+        active: true,
+        skill: 'ralph',
+        phase: 'executing',
+        session_id: sessionId,
+        owner_codex_session_id: nativeSessionId,
+        active_skills: [
+          { skill: 'ralph', phase: 'executing', session_id: sessionId, owner_codex_session_id: nativeSessionId },
+          { skill: 'team', phase: 'team-exec', session_id: sessionId, owner_codex_session_id: nativeSessionId },
+        ],
+      }, null, 2));
+      await writeFile(ralphPath, JSON.stringify({ active: true, mode: 'ralph' }, null, 2));
+      await writeFile(teamPath, teamState);
+
+      const result = runOmx(wd, 'cancel');
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const skill = JSON.parse(await readFile(skillPath, 'utf-8'));
+      assert.equal(skill.active, true);
+      assert.equal(skill.skill, 'team');
+      assert.equal(skill.phase, 'team-exec');
+      assert.equal(skill.current_phase, 'team-exec');
+      assert.deepEqual(skill.active_skills.map((entry: { skill: string; active: boolean }) => [entry.skill, entry.active]), [
+        ['ralph', false],
+        ['team', undefined],
+      ]);
+      assert.equal(JSON.parse(await readFile(ralphPath, 'utf-8')).active, false);
+      assert.equal(await readFile(teamPath, 'utf-8'), teamState);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves a legacy top-level Team marker while cancelling Ralph', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-cancel-legacy-team-ralph-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'legacy-team-ralph-session';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: stateDir }));
+      const skillPath = join(sessionDir, 'skill-active-state.json');
+      const teamPath = join(sessionDir, 'team-state.json');
+      const ralphPath = join(sessionDir, 'ralph-state.json');
+      const legacyTeamSkill = JSON.stringify({ active: true, skill: 'team', phase: 'team-exec', session_id: sessionId, active_skills: [{ skill: 'code-review', active: false }] }, null, 2);
+      const activeTeam = JSON.stringify({ active: true, mode: 'team', session_id: sessionId }, null, 2);
+      await writeFile(skillPath, legacyTeamSkill);
+      await writeFile(teamPath, activeTeam);
+      await writeFile(ralphPath, JSON.stringify({ active: true, mode: 'ralph', session_id: sessionId }, null, 2));
+
+      const result = runOmx(wd, 'cancel');
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.equal(await readFile(skillPath, 'utf-8'), legacyTeamSkill);
+      assert.equal(await readFile(teamPath, 'utf-8'), activeTeam);
+      assert.equal(JSON.parse(await readFile(ralphPath, 'utf-8')).active, false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('cancels valid skill-active-only workflow names without a duplicate allowlist', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-cancel-skill-only-name-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'skill-only-name-session';
+      const nativeSessionId = 'skill-only-name-native';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, native_session_id: nativeSessionId, cwd: wd, state_root: stateDir }));
+      const nativeOwnerDir = join(stateDir, 'sessions', nativeSessionId);
+      await mkdir(nativeOwnerDir, { recursive: true });
+      await writeFile(join(nativeOwnerDir, 'session-owner.json'), JSON.stringify({
+        session_id: nativeSessionId,
+        native_session_id: nativeSessionId,
+        cwd: wd,
+        platform: process.platform,
+      }));
+      const skillPath = join(sessionDir, 'skill-active-state.json');
+      await writeFile(skillPath, JSON.stringify({
+        active: true,
+        skill: 'code-review',
+        session_id: sessionId,
+        active_skills: [{ skill: 'code-review', active: true, session_id: sessionId, owner_codex_session_id: nativeSessionId }],
+      }, null, 2));
+
+      const result = runOmx(wd, 'cancel');
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      const skill = JSON.parse(await readFile(skillPath, 'utf-8'));
+      assert.equal(skill.active, false);
+      assert.equal(skill.active_skills[0].active, false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('preserves mode-only cancellation without creating a skill marker', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-cancel-mode-only-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'mode-only-session';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const skillPath = join(sessionDir, 'skill-active-state.json');
+      const modePath = join(sessionDir, 'ralplan-state.json');
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: stateDir }));
+      await writeFile(modePath, JSON.stringify({ active: true, mode: 'ralplan', session_id: sessionId }, null, 2));
+
+      const result = runOmx(wd, 'cancel');
+      assert.equal(result.status, 0, result.stderr || result.stdout);
+      assert.match(result.stdout, /Cancelled: ralplan/);
+      assert.equal(existsSync(skillPath), false);
+      assert.equal(JSON.parse(await readFile(modePath, 'utf-8')).active, false);
+
+      const repeat = runOmx(wd, 'cancel');
+      assert.equal(repeat.status, 0, repeat.stderr || repeat.stdout);
+      assert.equal(existsSync(skillPath), false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('reports rollback restoration failures without false cancellation success', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-cli-cancel-rollback-failure-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'rollback-session';
+      const nativeSessionId = 'rollback-native';
+      const sessionDir = join(stateDir, 'sessions', sessionId);
+      const modePath = join(sessionDir, 'ralplan-state.json');
+      const skillPath = join(sessionDir, 'skill-active-state.json');
+      const modeState = JSON.stringify({ active: true, mode: 'ralplan', session_id: sessionId }, null, 2);
+      const skillState = JSON.stringify({
+        active: true,
+        skill: 'ralplan',
+        session_id: sessionId,
+        owner_codex_session_id: nativeSessionId,
+        active_skills: [{ skill: 'ralplan', active: true, session_id: sessionId, owner_codex_session_id: nativeSessionId }],
+      }, null, 2);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, native_session_id: nativeSessionId, cwd: wd }));
+      await mkdir(join(stateDir, 'sessions', nativeSessionId), { recursive: true });
+      await writeFile(join(stateDir, 'sessions', nativeSessionId, 'session-owner.json'), JSON.stringify({
+        session_id: nativeSessionId,
+        native_session_id: nativeSessionId,
+        cwd: wd,
+      }));
+      await writeFile(modePath, modeState);
+      await writeFile(skillPath, skillState);
+
+      const errors: string[] = [];
+      const logs: string[] = [];
+      const previousError = console.error;
+      const previousLog = console.log;
+      const previousExitCode = process.exitCode;
+      const previousStderrWrite = process.stderr.write;
+      console.error = (...args: unknown[]) => { errors.push(args.map(String).join(' ')); };
+      console.log = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
+      process.stderr.write = ((chunk: string | Uint8Array) => {
+        errors.push(String(chunk));
+        return true;
+      }) as typeof process.stderr.write;
+      try {
+        await cancelModesForTest(wd, [], {
+          writeFailureMode: 'skill-active',
+          rollbackFailureMode: 'ralplan',
+        });
+        assert.equal(process.exitCode, 1);
+      } finally {
+        console.error = previousError;
+        console.log = previousLog;
+        process.stderr.write = previousStderrWrite;
+        process.exitCode = previousExitCode;
+      }
+      assert.match(errors.join('\n'), /cancellation_rollback_failed:1:ralplan/);
+      assert.doesNotMatch(logs.join('\n'), /Cancelled:/);
+      assert.equal(await readFile(skillPath, 'utf-8'), skillState);
+      assert.equal(JSON.parse(await readFile(modePath, 'utf-8')).active, false);
     } finally {
       await rm(wd, { recursive: true, force: true });
     }

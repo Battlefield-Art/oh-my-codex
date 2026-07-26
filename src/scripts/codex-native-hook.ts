@@ -9344,7 +9344,6 @@ function isAllowedDeepInterviewCommandSpecificBash(
 // only; those other workflows still execute their existing trusted command.
 const DIRECT_OMX_CANCEL_UNSAFE_INHERITED_ENV_NAMES = [
   "NODE_OPTIONS",
-  "NODE_EXTRA_CA_CERTS",
   "OPENSSL_CONF",
 ];
 
