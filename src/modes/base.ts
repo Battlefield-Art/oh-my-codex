@@ -167,9 +167,10 @@ export async function startMode(
   mode: ModeName,
   taskDescription: string,
   maxIterations: number = 50,
-  projectRoot?: string
+  projectRoot?: string,
+  explicitSessionId?: string,
 ): Promise<ModeState> {
-  const scope = await resolveWritableStateScope(projectRoot);
+  const scope = await resolveWritableStateScope(projectRoot, explicitSessionId);
   const dir = stateDir(projectRoot);
   await mkdir(dir, { recursive: true });
 
@@ -177,7 +178,7 @@ export async function startMode(
   const beforeCommit = createWritableCommitRevalidator({
     operation: 'startMode',
     cwd: projectRoot ?? process.cwd(),
-    explicitSessionId: undefined,
+    explicitSessionId,
     capturedScope: scope,
     baseStateDir,
   });
@@ -270,6 +271,16 @@ export async function readModeStateForSession(
   return readModeStateFromPaths(paths);
 }
 
+export async function readModeStateForExplicitSession(
+  mode: string,
+  sessionId: string,
+  projectRoot?: string,
+): Promise<ModeState | null> {
+  const scope = await resolveWritableStateScope(projectRoot, sessionId);
+  if (!scope.sessionId) return null;
+  return readModeStateFromPaths([join(scope.stateDir, getStateFilename(mode))]);
+}
+
 export async function readModeStateForActiveDecision(
   mode: string,
   sessionId: string | undefined,
@@ -341,7 +352,7 @@ async function updateModeStateInternal(
   const current = mode === 'ralph' && scope.sessionId
     ? await readModeStateForActiveDecision(mode, scope.sessionId, projectRoot)
     : explicitSessionId
-      ? await readModeStateForSession(mode, explicitSessionId, projectRoot)
+      ? await readModeStateForExplicitSession(mode, explicitSessionId, projectRoot)
       : await readModeState(mode, projectRoot);
   if (!current) throw new Error(`Mode ${mode} not found`);
   await mkdir(scope.stateDir, { recursive: true });

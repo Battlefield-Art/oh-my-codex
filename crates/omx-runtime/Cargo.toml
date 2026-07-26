@@ -7,6 +7,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+libc = "0.2"
 omx-mux = { path = "../omx-mux" }
 omx-runtime-core = { path = "../omx-runtime-core" }
 fs2 = "0.4"

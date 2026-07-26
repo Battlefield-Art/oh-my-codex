@@ -2383,7 +2383,7 @@ exit 0
     });
   });
 
-  it('allows a later autopilot prompt after completed autopilot state', async () => {
+  it('fails a later fresh autopilot prompt after completed autopilot state when receipt verification is unavailable', async () => {
     await withTempWorkingDir(async (cwd) => {
       const omxDir = join(cwd, '.omx');
       const stateDir = join(omxDir, 'state');
@@ -2425,13 +2425,24 @@ exit 0
       const autopilotState = JSON.parse(await readFile(join(sessionStateDir, 'autopilot-state.json'), 'utf-8')) as {
         active: boolean;
         current_phase: string;
-        completed_at?: string;
+        error?: string;
         turn_id?: string;
       };
-      assert.equal(autopilotState.active, true);
-      assert.equal(autopilotState.current_phase, 'deep-interview');
-      assert.equal(autopilotState.completed_at, undefined);
-      assert.equal(autopilotState.turn_id, 'turn-later-autopilot-start');
+      assert.equal(autopilotState.active, false);
+      assert.equal(autopilotState.current_phase, 'failed');
+      assert.equal(autopilotState.error, 'documented_host_consensus_receipt_unavailable');
+      const skillState = JSON.parse(await readFile(join(sessionStateDir, 'skill-active-state.json'), 'utf-8')) as {
+        active: boolean;
+        phase: string;
+        error?: string;
+        active_skills?: unknown[];
+      };
+      assert.equal(skillState.active, false);
+      assert.equal(skillState.phase, 'failed');
+      assert.equal(skillState.error, 'documented_host_consensus_receipt_unavailable');
+      assert.deepEqual(skillState.active_skills, []);
+      assert.equal(existsSync(join(sessionStateDir, 'deep-interview-state.json')), false);
+      assert.equal(existsSync(join(sessionStateDir, 'ultragoal-state.json')), false);
     });
   });
 
@@ -2700,14 +2711,31 @@ exit 0
       assert.strictEqual(writerClassification, restartClassification, 'writer must receive the classifier object by identity');
       assert.strictEqual(restartResult, writerResult, 'notify must return the writer result unchanged');
       assert.deepEqual(Buffer.from(writerText, 'utf8'), restartBytes, 'writer must receive the original input bytes');
+      assert.equal(restartResult?.active, false);
+      assert.equal(restartResult?.phase, 'failed');
+      assert.equal(restartResult?.error, 'documented_host_consensus_receipt_unavailable');
+      assert.deepEqual(restartResult?.active_skills, []);
       const reactivatedAutopilot = JSON.parse(await readFile(join(sessionStateDir, 'autopilot-state.json'), 'utf-8')) as {
         active: boolean;
         current_phase: string;
+        error?: string;
         turn_id?: string;
       };
-      assert.equal(reactivatedAutopilot.active, true);
-      assert.equal(reactivatedAutopilot.current_phase, 'deep-interview');
-      assert.equal(reactivatedAutopilot.turn_id, 'turn-autopilot-restart');
+      assert.equal(reactivatedAutopilot.active, false);
+      assert.equal(reactivatedAutopilot.current_phase, 'failed');
+      assert.equal(reactivatedAutopilot.error, 'documented_host_consensus_receipt_unavailable');
+      const restartedSkillState = JSON.parse(await readFile(join(sessionStateDir, 'skill-active-state.json'), 'utf-8')) as {
+        active: boolean;
+        phase: string;
+        error?: string;
+        active_skills?: unknown[];
+      };
+      assert.equal(restartedSkillState.active, false);
+      assert.equal(restartedSkillState.phase, 'failed');
+      assert.equal(restartedSkillState.error, 'documented_host_consensus_receipt_unavailable');
+      assert.deepEqual(restartedSkillState.active_skills, []);
+      assert.equal(existsSync(join(sessionStateDir, 'deep-interview-state.json')), false);
+      assert.equal(existsSync(join(sessionStateDir, 'ultragoal-state.json')), false);
 
       const sessionSkillStatePath = join(sessionStateDir, 'skill-active-state.json');
       const autopilotStatePath = join(sessionStateDir, 'autopilot-state.json');
@@ -2812,7 +2840,7 @@ exit 0
     });
   });
 
-  it('G1c-N deduplicates exact canonical and alias Autopilot invocations across classifier, writer, canonical state, and detail state', async () => {
+  it('G1c-N deduplicates exact canonical and alias Autopilot invocations before terminal receipt-preflight denial', async () => {
     await withTempWorkingDir(async (cwd) => {
       const stateDir = join(cwd, '.omx', 'state');
       const sessionId = 'sess-g1c-notify-duplicate';
@@ -2848,11 +2876,31 @@ exit 0
       assert.strictEqual(writerClassification, classification, 'writer must receive the deduplicated classifier output');
       assert.deepEqual(classification?.matches.map((match) => match.skill), ['autopilot']);
       assert.equal(result?.skill, 'autopilot');
+      assert.equal(result?.active, false);
+      assert.equal(result?.phase, 'failed');
+      assert.equal(result?.error, 'documented_host_consensus_receipt_unavailable');
       assert.deepEqual(result?.deferred_skills ?? [], []);
-      assert.deepEqual(result?.active_skills?.map((entry) => entry.skill), ['autopilot']);
-      const canonical = JSON.parse(await readFile(join(sessionDir, 'skill-active-state.json'), 'utf8')) as { active_skills?: Array<{ skill: string }> };
-      assert.deepEqual(canonical.active_skills?.map((entry) => entry.skill), ['autopilot']);
-      assert.equal(existsSync(join(sessionDir, 'autopilot-state.json')), true);
+      assert.deepEqual(result?.active_skills, []);
+      const canonical = JSON.parse(await readFile(join(sessionDir, 'skill-active-state.json'), 'utf8')) as {
+        active: boolean;
+        phase: string;
+        error?: string;
+        active_skills?: Array<{ skill: string }>;
+      };
+      assert.equal(canonical.active, false);
+      assert.equal(canonical.phase, 'failed');
+      assert.equal(canonical.error, 'documented_host_consensus_receipt_unavailable');
+      assert.deepEqual(canonical.active_skills, []);
+      const autopilot = JSON.parse(await readFile(join(sessionDir, 'autopilot-state.json'), 'utf8')) as {
+        active: boolean;
+        current_phase: string;
+        error?: string;
+      };
+      assert.equal(autopilot.active, false);
+      assert.equal(autopilot.current_phase, 'failed');
+      assert.equal(autopilot.error, 'documented_host_consensus_receipt_unavailable');
+      assert.equal(existsSync(join(sessionDir, 'deep-interview-state.json')), false);
+      assert.equal(existsSync(join(sessionDir, 'ultragoal-state.json')), false);
     });
   });
 
@@ -3115,18 +3163,25 @@ exit 0
     });
   });
 
-  it('writes skill-active-state.json when keyword activation is detected', async () => {
+  it('writes failed inactive skill state when fresh Autopilot preflight is unavailable', async () => {
     await withTempWorkingDir(async (cwd) => {
       const omxDir = join(cwd, '.omx');
       const stateDir = join(omxDir, 'state');
       const logsDir = join(omxDir, 'logs');
       const codexHome = join(cwd, 'codex-home');
       const fakeBinDir = join(cwd, 'fake-bin');
+      const hookEventsPath = join(cwd, 'hook-events.jsonl');
+      const tmuxLogPath = join(cwd, 'tmux.log');
 
       await mkdir(logsDir, { recursive: true });
       await mkdir(stateDir, { recursive: true });
       await mkdir(codexHome, { recursive: true });
       await mkdir(fakeBinDir, { recursive: true });
+      await mkdir(join(omxDir, 'hooks'), { recursive: true });
+      await writeFile(join(omxDir, 'hooks', 'capture.mjs'), [
+        "import { appendFileSync } from 'node:fs';",
+        `export function onHookEvent(event) { appendFileSync(${JSON.stringify(hookEventsPath)}, JSON.stringify(event) + '\\n'); }`,
+      ].join('\n'));
 
       await writeJson(join(codexHome, '.omx-config.json'), {
         autoNudge: { enabled: true, delaySec: 0, stallMs: 0 },
@@ -3134,12 +3189,12 @@ exit 0
       await writeManagedSessionState(stateDir, cwd);
       const sessionStateDir = join(stateDir, 'sessions', 'sess-managed');
 
-      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(join(cwd, 'tmux.log')));
+      await writeFile(join(fakeBinDir, 'tmux'), buildFakeTmux(tmuxLogPath));
       await chmod(join(fakeBinDir, 'tmux'), 0o755);
 
       const result = runNotifyHook(cwd, fakeBinDir, codexHome, {
         'input-messages': ['$autopilot handle this task'],
-        'last-assistant-message': 'Here is the plan I will follow.',
+        'last-assistant-message': 'A handoff is required.',
       });
       assert.equal(result.status, 0, `hook failed: ${result.stderr || result.stdout}`);
 
@@ -3151,10 +3206,28 @@ exit 0
         skill: string;
         phase: string;
         active: boolean;
+        error?: string;
+        active_skills?: unknown[];
       };
       assert.equal(skillState.skill, 'autopilot');
-      assert.equal(skillState.phase, 'planning');
-      assert.equal(skillState.active, true);
+      assert.equal(skillState.phase, 'failed');
+      assert.equal(skillState.active, false);
+      assert.equal(skillState.error, 'documented_host_consensus_receipt_unavailable');
+      assert.deepEqual(skillState.active_skills, []);
+      const hookEvents = (await readFile(hookEventsPath, 'utf-8')).trim().split('\n')
+        .map((line) => JSON.parse(line) as { event: string; source: string });
+      assert.deepEqual(
+        hookEvents.map(({ event, source }) => ({ event, source })),
+        [
+          { event: 'turn-complete', source: 'native' },
+          { event: 'handoff-needed', source: 'derived' },
+        ],
+        'denied fresh Autopilot must dispatch each required terminal lifecycle event exactly once',
+      );
+      assert.doesNotMatch(await readFile(tmuxLogPath, 'utf-8').catch(() => ''), /(?:send-keys|capture-pane|set-buffer|paste-buffer)/, 'denied fresh Autopilot must not inject or continue');
+      assert.equal(existsSync(join(sessionStateDir, 'ralplan-state.json')), false);
+      assert.equal(existsSync(join(sessionStateDir, 'deep-interview-state.json')), false);
+      assert.equal(existsSync(join(sessionStateDir, 'ultragoal-state.json')), false);
     });
   });
 

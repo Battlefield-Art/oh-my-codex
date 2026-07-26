@@ -6,6 +6,7 @@ All notable changes to this project are documented in this file.
 
 ### Fixed
 
+- **Autopilot host-receipt preflight** — fresh default Autopilot now fails before deep-interview and Architect/Critic review work when the official host consensus receipt verifier is deterministically unavailable, while preserving the exact fail-closed blocker, direct/manual Ralplan diagnostics, active-session resumability, and ADR 3194/3212 authority boundaries (#3270).
 - **Native cache integrity boundary** — managed cache binaries without their `.sha256` sidecar are rejected; checksum verification establishes integrity, not a signature. On a retained hydration lock, confirm that no OMX hydration process is active for that cache key, remove only that named lock manually, then retry. SparkShell warns and falls back to raw command execution without summary support when its native sidecar is unavailable or GLIBC-incompatible. Binary and checksum sidecars are published as two files and are not an atomic pair; the lock protocol provides process-crash-safe, fail-closed publication, with manual retained-lock remediation, rather than recovery from a process crash.
 
 ## [0.20.3] - 2026-07-19
