@@ -610,6 +610,7 @@ function unresolvedReviewBlockedGoals(plan: UltragoalPlan): UltragoalItem[] {
 
 function isDesignatedReviewBlockerResolver(goal: UltragoalItem, parent: UltragoalItem | undefined): boolean {
   return parent?.status === 'review_blocked'
+    && parent.id !== goal.id
     && goal.resolvesReviewBlockedGoalId === parent.id
     && parent.reviewBlockerResolution?.resolverGoalId === goal.id;
 }
@@ -625,6 +626,32 @@ function canUseCleanFinalResolverPathForReviewBlockedParent(
   return finalRunCheckpoint
     && !allowActiveFinalCodexGoal
     && isDesignatedReviewBlockerResolver(goal, unresolvedReviewBlocked[0]);
+}
+
+function hasReciprocalReviewBlockerResolver(goal: UltragoalItem, plan: UltragoalPlan): boolean {
+  const resolverId = goal.reviewBlockerResolution?.resolverGoalId;
+  if (!resolverId) return false;
+  const resolvers = plan.goals.filter((candidate) => candidate.id === resolverId);
+  if (resolvers.length !== 1) return false;
+  return resolvers[0]!.resolvesReviewBlockedGoalId === goal.id;
+}
+
+function hasUniqueGoalIds(plan: UltragoalPlan): boolean {
+  return new Set(plan.goals.map((candidate) => candidate.id)).size === plan.goals.length;
+}
+
+function canPersistNormalFinalAggregateCompletion(
+  plan: UltragoalPlan,
+  goal: UltragoalItem,
+  finalRunCheckpoint: boolean,
+  allowActiveFinalCodexGoal: boolean | undefined,
+): boolean {
+  if (!finalRunCheckpoint || allowActiveFinalCodexGoal) return false;
+  if (!hasUniqueGoalIds(plan)) return false;
+  if (!isScheduleEligible(goal)) return false;
+  if (goal.status !== 'in_progress' || plan.activeGoalId !== goal.id) return false;
+  if (unresolvedReviewBlockedGoals(plan).length === 0) return true;
+  return canUseCleanFinalResolverPathForReviewBlockedParent(plan, goal, finalRunCheckpoint, allowActiveFinalCodexGoal);
 }
 
 async function canReconcileCompletedTaskScopedAggregateSnapshot(
@@ -740,6 +767,7 @@ function isReviewBlockedResolved(goal: UltragoalItem, plan: UltragoalPlan): bool
   if (goal.status !== 'review_blocked') return false;
   const resolverId = goal.reviewBlockerResolution?.resolverGoalId;
   if (!resolverId || goal.reviewBlockerResolution?.status !== 'complete') return false;
+  if (!hasReciprocalReviewBlockerResolver(goal, plan)) return false;
   const resolver = plan.goals.find((candidate) => candidate.id === resolverId);
   return resolver?.status === 'complete';
 }
@@ -1122,6 +1150,9 @@ function appendGoalToPlan(plan: UltragoalPlan, options: AddUltragoalGoalOptions 
 export async function addUltragoalGoal(cwd: string, options: AddUltragoalGoalOptions): Promise<{ plan: UltragoalPlan; goal: UltragoalItem }> {
   return withUltragoalMutationLock(cwd, async () => {
   const plan = await readUltragoalPlanUnderLock(cwd);
+  if (plan.aggregateCompletion?.status === 'complete') {
+    throw new UltragoalError('Cannot add a goal to an already completed aggregate ultragoal plan; start a new plan for post-terminal work.');
+  }
   const now = iso(options.now);
   const goal = appendGoalToPlan(plan, options);
   await writePlan(cwd, plan);
@@ -1714,6 +1745,9 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
   const plan = await readUltragoalPlanUnderLock(cwd);
   const goal = plan.goals.find((candidate) => candidate.id === options.goalId);
   if (!goal) throw new UltragoalError(`Unknown ultragoal id: ${options.goalId}`);
+  if (plan.aggregateCompletion?.status === 'complete' && options.status !== 'complete') {
+    throw new UltragoalError(`Cannot record a ${options.status} checkpoint for ${goal.id} after the aggregate ultragoal plan is complete; the terminal aggregate receipt is immutable.`);
+  }
   const now = iso(options.now);
   if (options.status === 'blocked') {
     if (goal.status !== 'in_progress') {
@@ -1829,13 +1863,15 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
         throw new UltragoalError(`${formatCodexGoalReconciliation(reconciliation)}${taskScopedRequirement}${remediation}`);
       }
     }
-    const designatedReviewBlockerResolver = goal.resolvesReviewBlockedGoalId
-      ? isDesignatedReviewBlockerResolver(
+    if (
+      aggregateMode
+      && canPersistNormalFinalAggregateCompletion(
+        plan,
         goal,
-        plan.goals.find((candidate) => candidate.id === goal.resolvesReviewBlockedGoalId),
+        finalRunCheckpoint,
+        options.allowActiveFinalCodexGoal,
       )
-      : false;
-    if (aggregateMode && finalRunCheckpoint && !options.allowActiveFinalCodexGoal && designatedReviewBlockerResolver) {
+    ) {
       normalFinalAggregateCompletion = {
         status: 'complete',
         completedAt: now,

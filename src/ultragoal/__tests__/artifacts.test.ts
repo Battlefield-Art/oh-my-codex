@@ -66,6 +66,37 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function aggregateFixtureGoal(id: string, status: string, extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id,
+    title: id,
+    objective: `${id} work.`,
+    status,
+    attempt: 1,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    ...extra,
+  };
+}
+
+async function writeAggregateFixturePlan(cwd: string, activeGoalId: string | undefined, goals: Array<Record<string, unknown>>): Promise<void> {
+  await mkdir(join(cwd, '.omx/ultragoal'), { recursive: true });
+  await writeFile(join(cwd, '.omx/ultragoal/brief.md'), 'aggregate terminalization fixture\n');
+  await writeFile(join(cwd, '.omx/ultragoal/goals.json'), `${JSON.stringify({
+    version: 1,
+    createdAt: '2026-01-01T00:00:00.000Z',
+    updatedAt: '2026-01-01T00:00:00.000Z',
+    briefPath: '.omx/ultragoal/brief.md',
+    goalsPath: '.omx/ultragoal/goals.json',
+    ledgerPath: '.omx/ultragoal/ledger.jsonl',
+    codexGoalMode: 'aggregate',
+    codexObjective: ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE,
+    activeGoalId,
+    goals,
+  }, null, 2)}\n`);
+  await writeFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), '');
+}
+
 async function writeFixturePlan(cwd: string, plan: UltragoalPlan): Promise<void> {
   await mkdir(join(cwd, '.omx/ultragoal'), { recursive: true });
   await writeFile(join(cwd, '.omx/ultragoal/brief.md'), 'G001-core-steering-model fixture for .omx/ultragoal steering behavior.\n');
@@ -606,6 +637,12 @@ describe('ultragoal artifacts', () => {
         codexGoal: { goal: { objective: aggregateObjective, status: 'active' } },
       });
 
+      const midRunPlan = await readUltragoalPlan(cwd);
+      assert.equal(midRunPlan.goals.find((goal) => goal.id === 'G001-first')?.status, 'complete');
+      assert.equal(midRunPlan.goals.find((goal) => goal.id === 'G002-second')?.status, 'pending');
+      assert.equal(midRunPlan.aggregateCompletion, undefined);
+      assert.equal(summarizeUltragoalPlan(midRunPlan).aggregateComplete, false);
+
       const second = await startNextUltragoal(cwd);
       await checkpointUltragoal(cwd, {
         goalId: second.goal!.id,
@@ -616,8 +653,16 @@ describe('ultragoal artifacts', () => {
       });
 
       const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.find((goal) => goal.id === second.goal!.id)?.status, 'complete');
       assert.equal(plan.goals.every((goal) => goal.status === 'complete'), true);
       assert.equal(plan.activeGoalId, undefined);
+      assert.equal(plan.aggregateCompletion?.status, 'complete');
+      const summary = summarizeUltragoalPlan(plan);
+      assert.equal(summary.aggregateComplete, true);
+      assert.equal(summary.artifactComplete, true);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"goal_completed"/g) ?? []).length, 2);
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 1);
     });
   });
 
@@ -885,6 +930,497 @@ describe('ultragoal artifacts', () => {
       assert.match(ledger, /code-reviewer REQUEST CHANGES before resolver/);
       assert.match(ledger, /Review-blocked final story resolved by/);
       assert.match(ledger, /"event":"aggregate_completed"/);
+    });
+  });
+
+  it('does not terminalize through a one-way designated resolver pointer', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+      const blocked = await recordFinalReviewBlockers(cwd, {
+        goalId: started.goal!.id,
+        title: 'Resolve final code-review blockers',
+        objective: 'Fix final code-review blockers and rerun final gates.',
+        evidence: 'code-reviewer REQUEST CHANGES before resolver',
+        codexGoal: { goal: { objective, status: 'active' } },
+      });
+      const resolver = await startNextUltragoal(cwd);
+      assert.equal(resolver.goal?.id, blocked.addedGoal.id);
+
+      const planPath = join(cwd, '.omx/ultragoal/goals.json');
+      const tampered = JSON.parse(await readFile(planPath, 'utf-8')) as UltragoalPlan;
+      const resolverGoal = tampered.goals.find((goal) => goal.id === resolver.goal!.id)!;
+      delete resolverGoal.resolvesReviewBlockedGoalId;
+      await writeFile(planPath, `${JSON.stringify(tampered, null, 2)}\n`);
+
+      const parentBeforeCheckpoint = tampered.goals.find((goal) => goal.id === blocked.blockedGoal.id);
+      assert.equal(isFinalRunCompletionCandidate(tampered, resolverGoal), true);
+      assert.equal(parentBeforeCheckpoint?.reviewBlockerResolution?.resolverGoalId, resolverGoal.id);
+
+      const completed = await checkpointUltragoal(cwd, {
+        goalId: resolverGoal.id,
+        status: 'complete',
+        evidence: `${resolverGoal.id} fixed blockers; final gate passed for .omx/ultragoal/goals.json`,
+        codexGoal: { goal: { objective, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+      });
+      const parent = completed.goals.find((goal) => goal.id === blocked.blockedGoal.id);
+      const completedResolver = completed.goals.find((goal) => goal.id === resolverGoal.id);
+      const summary = summarizeUltragoalPlan(completed);
+
+      assert.equal(completedResolver?.status, 'complete');
+      assert.equal(parent?.status, 'review_blocked');
+      assert.equal(parent?.reviewBlockerResolution?.resolverGoalId, resolverGoal.id);
+      assert.equal(completed.aggregateCompletion, undefined);
+      assert.equal(summary.reviewBlocked, 1);
+      assert.equal(summary.aggregateComplete, false);
+      assert.equal(summary.artifactComplete, false);
+      assert.equal(isUltragoalDone(completed), false);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 0);
+    });
+  });
+
+  it('does not terminalize when two unresolved review-blocked parents point at one resolver', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'Final', objective: 'Complete final milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const objective = started.plan.codexObjective!;
+      const blocked = await recordFinalReviewBlockers(cwd, {
+        goalId: started.goal!.id,
+        title: 'Resolve final code-review blockers',
+        objective: 'Fix final code-review blockers and rerun final gates.',
+        evidence: 'code-reviewer REQUEST CHANGES before resolver',
+        codexGoal: { goal: { objective, status: 'active' } },
+      });
+      const resolver = await startNextUltragoal(cwd);
+      assert.equal(resolver.goal?.id, blocked.addedGoal.id);
+
+      const planPath = join(cwd, '.omx/ultragoal/goals.json');
+      const tampered = JSON.parse(await readFile(planPath, 'utf-8')) as UltragoalPlan;
+      const resolverGoal = tampered.goals.find((goal) => goal.id === resolver.goal!.id)!;
+      const originalParent = tampered.goals.find((goal) => goal.id === blocked.blockedGoal.id)!;
+      tampered.goals.push({
+        ...originalParent,
+        id: 'G999-forged-second-parent',
+        title: 'Forged second review-blocked parent',
+        objective: 'Forge a second unresolved review-blocked parent.',
+        status: 'review_blocked',
+        reviewBlockerResolution: {
+          resolverGoalId: resolverGoal.id,
+          status: 'pending',
+          evidence: 'forged second parent',
+        },
+      });
+      await writeFile(planPath, `${JSON.stringify(tampered, null, 2)}\n`);
+
+      assert.equal(tampered.goals.filter((goal) => goal.status === 'review_blocked').length, 2);
+      assert.equal(isFinalRunCompletionCandidate(tampered, resolverGoal), true);
+
+      const completed = await checkpointUltragoal(cwd, {
+        goalId: resolverGoal.id,
+        status: 'complete',
+        evidence: `${resolverGoal.id} fixed blockers; final gate passed for .omx/ultragoal/goals.json`,
+        codexGoal: { goal: { objective, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+      });
+      const originalParentAfter = completed.goals.find((goal) => goal.id === originalParent.id);
+      const secondParentAfter = completed.goals.find((goal) => goal.id === 'G999-forged-second-parent');
+      const completedResolver = completed.goals.find((goal) => goal.id === resolverGoal.id);
+      const summary = summarizeUltragoalPlan(completed);
+
+      assert.equal(completedResolver?.status, 'complete');
+      assert.equal(originalParentAfter?.status, 'complete');
+      assert.equal(originalParentAfter?.reviewBlockerResolution?.status, 'complete');
+      assert.equal(secondParentAfter?.status, 'review_blocked');
+      assert.equal(secondParentAfter?.reviewBlockerResolution?.status, 'pending');
+      assert.equal(completed.aggregateCompletion, undefined);
+      assert.equal(summary.reviewBlocked, 1);
+      assert.equal(summary.aggregateComplete, false);
+      assert.equal(summary.artifactComplete, false);
+      assert.equal(isUltragoalDone(completed), false);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 0);
+    });
+  });
+
+  it('does not terminalize when a review-blocked parent names a resolver whose back-pointer targets another parent', async () => {
+    await withTempRepo(async (cwd) => {
+      const objective = ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE;
+      await writeAggregateFixturePlan(cwd, 'G004-final', [
+        aggregateFixtureGoal('G001-parent', 'review_blocked', {
+          reviewBlockerResolution: {
+            resolverGoalId: 'G002-resolver',
+            status: 'complete',
+            resolvedAt: '2026-01-01T00:00:00.000Z',
+            evidence: 'forged resolution metadata',
+          },
+        }),
+        aggregateFixtureGoal('G002-resolver', 'complete', {
+          completedAt: '2026-01-01T00:00:00.000Z',
+          evidence: 'resolver done',
+          resolvesReviewBlockedGoalId: 'G003-other',
+        }),
+        aggregateFixtureGoal('G003-other', 'complete', { completedAt: '2026-01-01T00:00:00.000Z', evidence: 'other done' }),
+        aggregateFixtureGoal('G004-final', 'in_progress', { startedAt: '2026-01-01T00:00:00.000Z' }),
+      ]);
+
+      const tampered = await readUltragoalPlan(cwd);
+      assert.equal(isFinalRunCompletionCandidate(tampered, tampered.goals.find((goal) => goal.id === 'G004-final')!), false);
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: 'G004-final',
+          status: 'complete',
+          evidence: 'G004-final completed planned work for .omx/ultragoal/goals.json; validation complete; reviews clean.',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: cleanQualityGate(),
+        }),
+        /not complete|objective mismatch|Completed task-scoped aggregate reconciliation/,
+      );
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.find((goal) => goal.id === 'G001-parent')?.status, 'review_blocked');
+      assert.equal(plan.aggregateCompletion, undefined);
+      assert.equal(summarizeUltragoalPlan(plan).aggregateComplete, false);
+      assert.equal(isUltragoalDone(plan), false);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 0);
+    });
+  });
+
+  it('does not terminalize when a falsely-resolved parent coexists with a legitimate designated resolver', async () => {
+    await withTempRepo(async (cwd) => {
+      const objective = ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE;
+      await writeAggregateFixturePlan(cwd, 'G004-resolver-b', [
+        aggregateFixtureGoal('G001-parent-a', 'review_blocked', {
+          reviewBlockerResolution: {
+            resolverGoalId: 'G002-resolver-a',
+            status: 'complete',
+            resolvedAt: '2026-01-01T00:00:00.000Z',
+            evidence: 'forged resolution metadata for parent A',
+          },
+        }),
+        aggregateFixtureGoal('G002-resolver-a', 'complete', {
+          completedAt: '2026-01-01T00:00:00.000Z',
+          evidence: 'resolver A done',
+          resolvesReviewBlockedGoalId: 'G009-elsewhere',
+        }),
+        aggregateFixtureGoal('G003-parent-b', 'review_blocked', {
+          reviewBlockerResolution: {
+            resolverGoalId: 'G004-resolver-b',
+            status: 'pending',
+            evidence: 'legitimate blocker for parent B',
+          },
+        }),
+        aggregateFixtureGoal('G004-resolver-b', 'in_progress', {
+          startedAt: '2026-01-01T00:00:00.000Z',
+          resolvesReviewBlockedGoalId: 'G003-parent-b',
+        }),
+      ]);
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: 'G004-resolver-b',
+          status: 'complete',
+          evidence: 'G004-resolver-b completed planned work for .omx/ultragoal/goals.json; validation complete; reviews clean.',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: cleanQualityGate(),
+        }),
+        /not complete|objective mismatch|Completed task-scoped aggregate reconciliation/,
+      );
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.find((goal) => goal.id === 'G001-parent-a')?.status, 'review_blocked');
+      assert.equal(plan.aggregateCompletion, undefined);
+      assert.equal(summarizeUltragoalPlan(plan).aggregateComplete, false);
+      assert.equal(isUltragoalDone(plan), false);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 0);
+    });
+  });
+
+  it('does not treat a self-referential review-blocker resolver as a designated resolver', async () => {
+    await withTempRepo(async (cwd) => {
+      const objective = ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE;
+      await writeAggregateFixturePlan(cwd, 'G001-self', [
+        aggregateFixtureGoal('G001-self', 'review_blocked', {
+          reviewBlockerResolution: {
+            resolverGoalId: 'G001-self',
+            status: 'pending',
+            evidence: 'self-referential resolver metadata',
+          },
+          resolvesReviewBlockedGoalId: 'G001-self',
+        }),
+      ]);
+
+      const completed = await checkpointUltragoal(cwd, {
+        goalId: 'G001-self',
+        status: 'complete',
+        evidence: 'G001-self completed planned work for .omx/ultragoal/goals.json; validation complete; reviews clean.',
+        codexGoal: { goal: { objective, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+      });
+
+      assert.equal(completed.aggregateCompletion, undefined);
+      assert.equal(summarizeUltragoalPlan(completed).aggregateComplete, false);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 0);
+    });
+  });
+
+  it('does not terminalize when the final aggregate candidate is steering-blocked', async () => {
+    await withTempRepo(async (cwd) => {
+      const objective = ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE;
+      await writeAggregateFixturePlan(cwd, 'G002-target', [
+        aggregateFixtureGoal('G001-first', 'complete', { completedAt: '2026-01-01T00:00:00.000Z', evidence: 'first done' }),
+        aggregateFixtureGoal('G002-target', 'in_progress', { startedAt: '2026-01-01T00:00:00.000Z', steeringStatus: 'blocked' }),
+      ]);
+
+      const tampered = await readUltragoalPlan(cwd);
+      assert.equal(isFinalRunCompletionCandidate(tampered, tampered.goals.find((goal) => goal.id === 'G002-target')!), true);
+
+      const completed = await checkpointUltragoal(cwd, {
+        goalId: 'G002-target',
+        status: 'complete',
+        evidence: 'G002-target completed planned work for .omx/ultragoal/goals.json; validation complete; reviews clean.',
+        codexGoal: { goal: { objective, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+      });
+
+      assert.equal(completed.goals.find((goal) => goal.id === 'G002-target')?.steeringStatus, 'blocked');
+      assert.equal(completed.aggregateCompletion, undefined);
+      assert.equal(summarizeUltragoalPlan(completed).aggregateComplete, false);
+      assert.equal(isUltragoalDone(completed), false);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 0);
+    });
+  });
+
+  it('does not terminalize when duplicate goal ids hide an unresolved row', async () => {
+    await withTempRepo(async (cwd) => {
+      const objective = ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE;
+      await writeAggregateFixturePlan(cwd, 'G002-dup', [
+        aggregateFixtureGoal('G001-first', 'complete', { completedAt: '2026-01-01T00:00:00.000Z', evidence: 'first done' }),
+        aggregateFixtureGoal('G002-dup', 'in_progress', { startedAt: '2026-01-01T00:00:00.000Z' }),
+        aggregateFixtureGoal('G002-dup', 'pending'),
+      ]);
+
+      const tampered = await readUltragoalPlan(cwd);
+      assert.equal(isFinalRunCompletionCandidate(tampered, tampered.goals.find((goal) => goal.id === 'G002-dup')!), true);
+
+      const completed = await checkpointUltragoal(cwd, {
+        goalId: 'G002-dup',
+        status: 'complete',
+        evidence: 'G002-dup completed planned work for .omx/ultragoal/goals.json; validation complete; reviews clean.',
+        codexGoal: { goal: { objective, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+      });
+
+      assert.equal(completed.goals.filter((goal) => goal.id === 'G002-dup' && goal.status === 'pending').length, 1);
+      assert.equal(completed.aggregateCompletion, undefined);
+      assert.equal(summarizeUltragoalPlan(completed).aggregateComplete, false);
+      assert.equal(isUltragoalDone(completed), false);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 0);
+    });
+  });
+
+  it('does not terminalize a final aggregate candidate that is not the active in-progress goal', async () => {
+    const objective = ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE;
+    for (const unowned of ['pending', 'failed', 'needs_user_decision'] as const) {
+      await withTempRepo(async (cwd) => {
+        await writeAggregateFixturePlan(cwd, 'G002-target', [
+          aggregateFixtureGoal('G001-first', 'complete', { completedAt: '2026-01-01T00:00:00.000Z', evidence: 'first done' }),
+          aggregateFixtureGoal('G002-target', unowned),
+        ]);
+
+        const tampered = await readUltragoalPlan(cwd);
+        assert.equal(isFinalRunCompletionCandidate(tampered, tampered.goals.find((goal) => goal.id === 'G002-target')!), true);
+
+        const completed = await checkpointUltragoal(cwd, {
+          goalId: 'G002-target',
+          status: 'complete',
+          evidence: 'G002-target completed planned work for .omx/ultragoal/goals.json; validation complete; reviews clean.',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: cleanQualityGate(),
+        });
+
+        assert.equal(completed.aggregateCompletion, undefined, unowned);
+        assert.equal(summarizeUltragoalPlan(completed).aggregateComplete, false, unowned);
+        const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+        assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 0, unowned);
+      });
+    }
+  });
+
+  it('keeps terminal aggregate completion idempotent under repeated and concurrent final checkpoints', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'First', objective: 'Complete first milestone.' },
+          { title: 'Second', objective: 'Complete second milestone.' },
+        ],
+      });
+      const first = await startNextUltragoal(cwd);
+      const aggregateObjective = first.plan.codexObjective!;
+      await checkpointUltragoal(cwd, {
+        goalId: first.goal!.id,
+        status: 'complete',
+        evidence: 'first audit passed',
+        codexGoal: { goal: { objective: aggregateObjective, status: 'active' } },
+      });
+
+      const second = await startNextUltragoal(cwd);
+      const terminal = await checkpointUltragoal(cwd, {
+        goalId: second.goal!.id,
+        status: 'complete',
+        evidence: 'final audit passed',
+        codexGoal: { goal: { objective: aggregateObjective, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+      });
+      const firstCompletedAt = terminal.aggregateCompletion?.completedAt;
+      assert.equal(terminal.aggregateCompletion?.status, 'complete');
+      assert.ok(firstCompletedAt);
+
+      for (let attempt = 0; attempt < 3; attempt += 1) {
+        await checkpointUltragoal(cwd, {
+          goalId: second.goal!.id,
+          status: 'complete',
+          evidence: `repeated terminal checkpoint ${attempt}`,
+          codexGoal: { goal: { objective: aggregateObjective, status: 'complete' } },
+          qualityGate: cleanQualityGate(),
+        }).catch(() => undefined);
+      }
+
+      await Promise.allSettled(Array.from({ length: 5 }, (_, index) => checkpointUltragoal(cwd, {
+        goalId: second.goal!.id,
+        status: 'complete',
+        evidence: `concurrent terminal checkpoint ${index}`,
+        codexGoal: { goal: { objective: aggregateObjective, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+      })));
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.aggregateCompletion?.status, 'complete');
+      assert.equal(plan.aggregateCompletion?.completedAt, firstCompletedAt);
+      assert.equal(summarizeUltragoalPlan(plan).aggregateComplete, true);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 1);
+    });
+  });
+
+  it('pins allowActiveFinalCodexGoal as a required negative condition for terminal aggregate completion', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'First', objective: 'Complete first milestone.' },
+          { title: 'Second', objective: 'Complete second milestone.' },
+        ],
+      });
+      const first = await startNextUltragoal(cwd);
+      const aggregateObjective = first.plan.codexObjective!;
+      await checkpointUltragoal(cwd, {
+        goalId: first.goal!.id,
+        status: 'complete',
+        evidence: 'first audit passed',
+        codexGoal: { goal: { objective: aggregateObjective, status: 'active' } },
+      });
+
+      const second = await startNextUltragoal(cwd);
+      const completed = await checkpointUltragoal(cwd, {
+        goalId: second.goal!.id,
+        status: 'complete',
+        evidence: 'final story completed while the aggregate Codex goal stays active',
+        codexGoal: { goal: { objective: aggregateObjective, status: 'active' } },
+        allowActiveFinalCodexGoal: true,
+      });
+
+      assert.equal(completed.goals.find((goal) => goal.id === second.goal!.id)?.status, 'complete');
+      assert.equal(completed.aggregateCompletion, undefined);
+      assert.equal(summarizeUltragoalPlan(completed).aggregateComplete, false);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 0);
+    });
+  });
+
+  it('does not terminalize an in-progress final candidate whose activeGoalId pointer does not match', async () => {
+    const objective = ULTRAGOAL_AGGREGATE_CODEX_OBJECTIVE;
+    for (const activePointer of ['G001-first', undefined] as const) {
+      await withTempRepo(async (cwd) => {
+        await writeAggregateFixturePlan(cwd, activePointer, [
+          aggregateFixtureGoal('G001-first', 'complete', { completedAt: '2026-01-01T00:00:00.000Z', evidence: 'first done' }),
+          aggregateFixtureGoal('G002-target', 'in_progress', { startedAt: '2026-01-01T00:00:00.000Z' }),
+        ]);
+
+        const tampered = await readUltragoalPlan(cwd);
+        const target = tampered.goals.find((goal) => goal.id === 'G002-target')!;
+        assert.equal(target.status, 'in_progress');
+        assert.equal(isFinalRunCompletionCandidate(tampered, target), true);
+
+        const completed = await checkpointUltragoal(cwd, {
+          goalId: 'G002-target',
+          status: 'complete',
+          evidence: 'G002-target completed planned work for .omx/ultragoal/goals.json; validation complete; reviews clean.',
+          codexGoal: { goal: { objective, status: 'complete' } },
+          qualityGate: cleanQualityGate(),
+        });
+
+        assert.equal(completed.aggregateCompletion, undefined, String(activePointer));
+        assert.equal(summarizeUltragoalPlan(completed).aggregateComplete, false, String(activePointer));
+        const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+        assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 0, String(activePointer));
+      });
+    }
+  });
+
+  it('freezes a completed aggregate plan against post-terminal failure checkpoints and goal additions', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [{ title: 'Only', objective: 'Complete the only milestone.' }],
+      });
+      const started = await startNextUltragoal(cwd);
+      const terminal = await checkpointUltragoal(cwd, {
+        goalId: started.goal!.id,
+        status: 'complete',
+        evidence: 'terminal aggregate checkpoint',
+        codexGoal: { goal: { objective: started.plan.codexObjective!, status: 'complete' } },
+        qualityGate: cleanQualityGate(),
+      });
+      assert.equal(terminal.aggregateCompletion?.status, 'complete');
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: started.goal!.id,
+          status: 'failed',
+          evidence: 'post-terminal failure attempt',
+        }),
+        /after the aggregate ultragoal plan is complete/,
+      );
+
+      await assert.rejects(
+        () => addUltragoalGoal(cwd, { title: 'Post terminal', objective: 'Added after completion.' }),
+        /already completed aggregate ultragoal plan/,
+      );
+
+      const plan = await readUltragoalPlan(cwd);
+      assert.equal(plan.goals.length, 1);
+      assert.equal(plan.goals[0]?.status, 'complete');
+      assert.equal(plan.aggregateCompletion?.status, 'complete');
+      assert.equal(summarizeUltragoalPlan(plan).aggregateComplete, true);
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.equal((ledger.match(/"event":"aggregate_completed"/g) ?? []).length, 1);
+      assert.equal((ledger.match(/"event":"goal_failed"/g) ?? []).length, 0);
     });
   });
 
