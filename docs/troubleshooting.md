@@ -85,6 +85,33 @@ omx doctor --team
 
 Do not force-shutdown a team that may still have useful live panes or worker state. Prefer `omx team status <team-name>` and `tmux ls` first when unsure.
 
+
+## Stale session pointer blocks state writes (`session.json is present but unusable`)
+
+State writes fail closed with `Cannot resolve writable state scope: session.json is present but unusable.` when a stale-dead selected pointer lacks a valid `OMX_SESSION_ID` binding, or when the pointer is malformed, belongs to a different working directory, or has indeterminate identity. Malformed, foreign-working-directory, and identity-indeterminate pointers always fail closed. Durable Ultragoal mutations (`goals.json` story/goal transitions) perform point-in-time writable-authority checks at mutation entry and after lock acquisition; a later SessionStart publication can still interleave before filesystem writes.
+
+### Exact-session reconciliation (stale-dead pointer)
+
+When the pointer's recorded PID is definitively dead, bind the exact current session explicitly and retry the same command — no manual file surgery:
+
+```bash
+export OMX_SESSION_ID=<current-session-id>
+omx state write --input '{"mode":"ultragoal","active":true,"current_phase":"reviewing"}' --json
+```
+
+A stale-dead pointer holds no owner authority, so the validated `OMX_SESSION_ID` binding becomes the writable session scope (state lands under `.omx/state/sessions/<current-session-id>/`). The binding is operator-asserted: the code proves the pointer is definitively dead and authoritative, not that the env value names your live session — set it to the exact current session id. Recovery additionally requires the dead pointer itself to be authoritative for this project: its recorded `cwd` must contain the working directory, and its recorded `state_root` — when present — must canonical-match the selected state root (legacy pointers without `state_root` are accepted only when the cwd-derived `.omx/state` root matches exactly). A pointer with missing or foreign authority metadata stays fail-closed even with an env binding. Scope resolution never rewrites `session.json` itself; only a SessionStart hook reconciles the pointer through the normal pointer-lock protocol. Note that a plain OMX relaunch with a stale-dead pointer aborts with `session_pointer_unusable`/`stale-dead` and preserves the pointer, so setting `OMX_SESSION_ID` explicitly is the reliable recovery path.
+
+### Known limitation
+
+Pre-commit scope revalidation is a point-in-time check: it reduces but does not eliminate the window between validation and the filesystem commit. A completion that touches several files is not atomic, so a concurrent SessionStart publication can still interleave. Fully addressing this is separate follow-up work: `state: serialize writable commits with SessionStart pointer publication`.
+
+### Still fail-closed
+
+- A malformed, foreign-working-directory, or identity-indeterminate pointer always requires operator inspection; `OMX_SESSION_ID` does not override it.
+- Without an env binding, a stale-dead pointer still blocks writes — set `OMX_SESSION_ID` (a plain relaunch aborts instead of reconciling; only a SessionStart hook reconciles the pointer).
+- A live pointer with an unmatched `OMX_SESSION_ID` fails closed as `OMX_SESSION_ID does not match the live session recorded in session.json`.
+- Durable Ultragoal mutations (including the legacy aggregate-objective migration that used to run on plain reads) require successful writable-scope resolution: with no selected pointer they keep prior root/unbound behavior, but allowlist violations, conflicting roots, and live-owner mismatches now propagate instead of being ignored.
+
 ## Shift+Enter submits instead of inserting a newline in tmux-backed OMX sessions
 
 This is usually **not** a net-new OMX feature gap.
