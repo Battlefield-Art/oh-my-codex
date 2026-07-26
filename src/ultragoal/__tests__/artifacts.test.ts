@@ -2587,6 +2587,51 @@ describe('ultragoal artifacts', () => {
       );
     });
   });
+  it('records matching native blocked Codex goal checkpoints as non-terminal', async () => {
+    await withTempRepo(async (cwd) => {
+      await createUltragoalPlan(cwd, {
+        brief: 'brief',
+        goals: [
+          { title: 'First', objective: 'Complete first milestone.' },
+        ],
+      });
+
+      const first = await startNextUltragoal(cwd);
+      const objective = first.plan.codexObjective ?? first.goal!.objective;
+      const plan = await checkpointUltragoal(cwd, {
+        goalId: first.goal!.id,
+        status: 'blocked',
+        evidence: 'native matching blocked needs attention',
+        codexGoal: { goal: { objective, status: 'blocked' } },
+      });
+      const goal = plan.goals.find((item) => item.id === first.goal!.id);
+      assert.equal(goal?.status, 'in_progress');
+      assert.equal(plan.activeGoalId, first.goal!.id);
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"goal_blocked"/);
+      assert.match(ledger, /Native Codex goal status is blocked/);
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: first.goal!.id,
+          status: 'blocked',
+          codexGoal: { goal: { objective, status: 'blocked' } },
+        }),
+        /--evidence/,
+      );
+
+      await assert.rejects(
+        () => checkpointUltragoal(cwd, {
+          goalId: first.goal!.id,
+          status: 'blocked',
+          evidence: 'foreign blocked goal',
+          codexGoal: { goal: { objective: 'Different blocked work', status: 'blocked' } },
+        }),
+        /objective mismatch/,
+      );
+    });
+  });
 
   it('steers a split pending goal through superseded lifecycle without weakening completion gates', async () => {
     await withTempRepo(async (cwd) => {

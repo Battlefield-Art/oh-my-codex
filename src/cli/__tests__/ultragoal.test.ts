@@ -725,6 +725,60 @@ describe('cli/ultragoal', () => {
       assert.match(ledger, /"event":"goal_blocked"/);
     });
   });
+  it('records matching native blocked Codex goal checkpoints as non-terminal and exposes status diagnostics', async () => {
+    await withCwd(async (cwd) => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
+      await capture(() => ultragoalCommand(['complete-goals']));
+      const statusOut = await capture(() => ultragoalCommand(['status', '--json']));
+      const status = JSON.parse(statusOut.stdout.join('\n')) as { plan?: { codexObjective?: string }; goals?: Array<{ objective?: string }> };
+      // fall back to known aggregate objective text if needed
+      const objective = status.plan?.codexObjective
+        ?? 'Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.';
+
+      const blockedJson = JSON.stringify({ goal: { objective, status: 'blocked' } });
+      const blocked = await capture(() => ultragoalCommand([
+        'checkpoint',
+        '--goal-id', 'G001-first-milestone',
+        '--status', 'blocked',
+        '--evidence', 'native matching blocked needs attention',
+        '--codex-goal-json', blockedJson,
+        '--json',
+      ]));
+      assert.equal(blocked.exitCode, undefined, blocked.stderr.join('\n'));
+      const parsed = JSON.parse(blocked.stdout.join('\n')) as { summary: { inProgress: number }; plan: { activeGoalId?: string } };
+      assert.equal(parsed.summary.inProgress, 1);
+      assert.equal(parsed.plan.activeGoalId, 'G001-first-milestone');
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"goal_blocked"/);
+      assert.match(ledger, /"status":"blocked"/);
+
+      const recon = await capture(() => ultragoalCommand([
+        'status',
+        '--codex-goal-json', blockedJson,
+        '--json',
+      ]));
+      assert.equal(recon.exitCode, undefined, recon.stderr.join('\n'));
+      const reconParsed = JSON.parse(recon.stdout.join('\n')) as {
+        reconciliation?: { ok?: boolean; snapshot?: { status?: string; raw?: { goal?: { status?: string } } }; errors?: string[] };
+      };
+      assert.equal(reconParsed.reconciliation?.snapshot?.status, 'blocked');
+      assert.equal(reconParsed.reconciliation?.snapshot?.raw?.goal?.status, 'blocked');
+      assert.equal(reconParsed.reconciliation?.ok, false);
+      assert.match((reconParsed.reconciliation?.errors ?? []).join('\n'), /got blocked/);
+      assert.doesNotMatch((reconParsed.reconciliation?.errors ?? []).join('\n'), /got unknown/);
+
+      const mismatch = await capture(() => ultragoalCommand([
+        'checkpoint',
+        '--goal-id', 'G001-first-milestone',
+        '--status', 'blocked',
+        '--evidence', 'foreign blocked goal',
+        '--codex-goal-json', '{"goal":{"objective":"Different blocked work","status":"blocked"}}',
+      ]));
+      assert.equal(mismatch.exitCode, 1);
+      assert.match(mismatch.stderr.join('\n'), /objective mismatch/);
+    });
+  });
 
   it('circuit-breaks repeated GHCR authorization blockers and skips them on retry-failed', async () => {
     await withCwd(async (cwd) => {
