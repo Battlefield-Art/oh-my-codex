@@ -5,8 +5,10 @@
  * serialized by an adjacent lock directory and become visible only after an
  * atomic rename of a transaction-owned temporary file.
  */
+import { execFileSync as nodeExecFileSync } from 'node:child_process';
 import {
   appendFile,
+  mkdtemp as nodeMkdtemp,
   link as nodeLink,
   lstat as nodeLstat,
   mkdir as nodeMkdir,
@@ -22,9 +24,11 @@ import {
 } from 'fs/promises';
 import { readFileSync } from 'fs';
 import type { FileHandle } from 'fs/promises';
+import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'crypto';
-import { basename, dirname, join } from 'path';
+import { basename, dirname, isAbsolute, join } from 'path';
 import { omxRoot, omxLogsDir, sameFilePath } from '../utils/paths.js';
+import { resolveRuntimeBinaryPath } from '../runtime/bridge.js';
 import {
   getBaseStateDirWithSource,
   resolveWorkingDirectoryForState,
@@ -484,11 +488,29 @@ const defaultFsDependencies: SessionPointerFsDependencies = {
   },
 };
 
-async function defaultRecoveryRenameNoReplace(_from: string, _to: string): Promise<RecoveryRenameNoReplaceResult> {
-  // Node does not expose renameat2(RENAME_NOREPLACE), and OMX does not assume
-  // an external interpreter or architecture-specific syscall ABI. Recovery is
-  // therefore enabled only when a maintained host integration supplies this
-  // seam; otherwise every source and destination pathname remains untouched.
+async function defaultRecoveryRenameNoReplace(from: string, to: string): Promise<RecoveryRenameNoReplaceResult> {
+  if (!from.trim() || !to.trim() || !isAbsolute(from) || !isAbsolute(to)) return 'unsupported';
+
+  try {
+    const stdout = nodeExecFileSync(
+      resolveRuntimeBinaryPath(),
+      ['fs-rename-no-replace', from, to],
+      {
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 10_000,
+      },
+    );
+    const parsed = JSON.parse(String(stdout)) as { outcome?: unknown };
+    if (parsed.outcome === 'moved' || parsed.outcome === 'not-moved' || parsed.outcome === 'unsupported') {
+      return parsed.outcome;
+    }
+  } catch {
+    // Missing binaries, spawn failures, hard runtime errors, and malformed output
+    // all fail closed; recovery must never fall back to an overwriting rename.
+  }
   return 'unsupported';
 }
 
@@ -1040,6 +1062,25 @@ function sameRecoveryIdentity(stat: Awaited<ReturnType<SessionPointerFsDependenc
 async function lstatRecoveryPath(path: string): Promise<Awaited<ReturnType<SessionPointerFsDependencies['lstat']>> | undefined> {
   try { return await transactionDependencies.fs.lstat(path); } catch (error) { if (isNotFound(error)) return undefined; throw error; }
 }
+async function probeRecoveryRenameCapability(): Promise<RecoveryRenameNoReplaceResult> {
+  let probeDir: string | undefined;
+  try {
+    probeDir = await nodeMkdtemp(join(tmpdir(), 'omx-session-recovery-probe-'));
+    const from = join(probeDir, 'from');
+    const to = join(probeDir, 'to');
+    await nodeWriteFile(from, 'omx-recovery-capability-probe', { flag: 'wx' });
+    const outcome = await transactionDependencies.atomicRenameNoReplace(from, to);
+    return outcome === 'moved' || outcome === 'not-moved' || outcome === 'unsupported'
+      ? outcome
+      : 'unsupported';
+  } catch {
+    return 'unsupported';
+  } finally {
+    if (probeDir) {
+      try { await rm(probeDir, { recursive: true, force: true }); } catch { /* best effort */ }
+    }
+  }
+}
 
 async function moveRecoveryPathNoReplace(
   from: string,
@@ -1171,20 +1212,67 @@ export async function recoverSessionPointerLock(cwd: string): Promise<SessionPoi
 
   const inspection = await inspectSessionPointerLockAtContext(context);
   if (!inspection.safeToRecover) return { ...inspection, action: 'none', recovered: false, reason: inspection.status === 'absent' ? 'No session pointer lock exists.' : `Session pointer lock is not safe to recover (${inspection.status}).` };
-  const evidenceName = inspection.evidenceSource === 'owner.json' ? 'owner.json' : (await transactionDependencies.fs.readdir(context.lockPath)).find((entry) => /^owner\.([A-Za-z0-9_-]{16,128})\.tmp$/.test(entry));
-  if (!evidenceName) return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
-  const evidencePath = join(context.lockPath, evidenceName);
-  const evidence = await lstatRecoveryPath(evidencePath);
-  const lock = await lstatRecoveryPath(context.lockPath);
-  const ownerBytes = evidence && sameRecoveryIdentity(evidence, { dev: evidence.dev, ino: evidence.ino }, 'file') ? await transactionDependencies.fs.readFile(evidencePath, 'utf8') : undefined;
-  const owner = ownerBytes === undefined ? undefined : await inspectLockOwnerFile(evidencePath);
-  if (!lock || lock.isSymbolicLink() || !lock.isDirectory() || !evidence || !sameRecoveryIdentity(evidence, { dev: evidence.dev, ino: evidence.ino }, 'file') || owner?.status !== 'dead' || !owner.owner) return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
-  const recoveryToken = transactionDependencies.token();
-  if (!isValidToken(recoveryToken)) return { ...inspection, action: 'none', recovered: false, reason: 'Recovery claim token is invalid.' };
-  const checkpointPath = `${context.lockPath}.recovery.${owner.owner.token}.${recoveryToken}.json`;
-  const checkpoint: RecoveryCheckpoint = { version: 3, sourcePath: evidencePath, identity: { dev: evidence.dev, ino: evidence.ino }, evidenceIdentity: { dev: evidence.dev, ino: evidence.ino }, evidenceBytes: ownerBytes, lockIdentity: { dev: lock.dev, ino: lock.ino }, lockParkPath: `${context.lockPath}.parked-lock-${recoveryToken}`, phase: 'evidence-pending' };
-  try { await transactionDependencies.fs.writeFile(checkpointPath, JSON.stringify(checkpoint), { flag: 'wx' }); } catch (error) { return { ...inspection, action: 'none', recovered: false, reason: `Unable to create recovery checkpoint (${errorCode(error) ?? 'unknown'}).` }; }
-  return await resumeRecoveryCheckpoint(context, checkpointPath, basename(checkpointPath));
+  try {
+    const evidenceName = inspection.evidenceSource === 'owner.json'
+      ? 'owner.json'
+      : (await transactionDependencies.fs.readdir(context.lockPath)).find((entry) => /^owner\.([A-Za-z0-9_-]{16,128})\.tmp$/.test(entry));
+    if (!evidenceName) return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
+    const evidencePath = join(context.lockPath, evidenceName);
+    const evidence = await lstatRecoveryPath(evidencePath);
+    const lock = await lstatRecoveryPath(context.lockPath);
+    const ownerBytes = evidence && sameRecoveryIdentity(evidence, { dev: evidence.dev, ino: evidence.ino }, 'file')
+      ? await transactionDependencies.fs.readFile(evidencePath, 'utf8')
+      : undefined;
+    const owner = ownerBytes === undefined ? undefined : await inspectLockOwnerFile(evidencePath);
+    if (!lock || lock.isSymbolicLink() || !lock.isDirectory() || !evidence
+      || !sameRecoveryIdentity(evidence, { dev: evidence.dev, ino: evidence.ino }, 'file')
+      || owner?.status !== 'dead' || !owner.owner) {
+      return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
+    }
+
+    // Fresh recovery probes before checkpoint creation; an unsupported host leaves the
+    // canonical lock and owner evidence untouched. Existing checkpoints are resumed
+    // independently and may remain as durable recovery residue.
+
+    const capability = await probeRecoveryRenameCapability();
+    if (capability === 'unsupported') {
+      return {
+        ...inspection,
+        action: 'none',
+        recovered: false,
+        reason: 'Atomic no-replace recovery rename is unsupported on this platform.',
+      };
+    }
+
+    const recoveryToken = transactionDependencies.token();
+    if (!isValidToken(recoveryToken)) return { ...inspection, action: 'none', recovered: false, reason: 'Recovery claim token is invalid.' };
+    const checkpointPath = `${context.lockPath}.recovery.${owner.owner.token}.${recoveryToken}.json`;
+    const checkpoint: RecoveryCheckpoint = {
+      version: 3,
+      sourcePath: evidencePath,
+      identity: { dev: evidence.dev, ino: evidence.ino },
+      evidenceIdentity: { dev: evidence.dev, ino: evidence.ino },
+      evidenceBytes: ownerBytes,
+      lockIdentity: { dev: lock.dev, ino: lock.ino },
+      lockParkPath: `${context.lockPath}.parked-lock-${recoveryToken}`,
+      phase: 'evidence-pending',
+    };
+    try {
+      await transactionDependencies.fs.writeFile(checkpointPath, JSON.stringify(checkpoint), { flag: 'wx' });
+    } catch (error) {
+      return { ...inspection, action: 'none', recovered: false, reason: `Unable to create recovery checkpoint (${errorCode(error) ?? 'unknown'}).` };
+    }
+    return await resumeRecoveryCheckpoint(context, checkpointPath, basename(checkpointPath));
+  } catch (error) {
+    return {
+      ...inspection,
+      status: 'io-error',
+      safeToRecover: false,
+      action: 'none',
+      recovered: false,
+      reason: `Unable to inspect session pointer lock recovery state (${errorCode(error) ?? errorMessage(error)}).`,
+    };
+  }
 }
 
 interface HeldPointerLock {
