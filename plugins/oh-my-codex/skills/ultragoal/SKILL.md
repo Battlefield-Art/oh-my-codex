@@ -64,8 +64,9 @@ Loop until `omx ultragoal status` reports all goals complete:
    `omx ultragoal checkpoint --goal-id <id> --status complete --evidence "<evidence>" --codex-goal-json <get_goal-json-or-path> [--quality-gate-json <quality-gate-json-or-path>]`
 9. If blocked or failed, checkpoint failure:
    `omx ultragoal checkpoint --goal-id <id> --status failed --evidence "<blocker/evidence>"`
-10. For legacy per-story completed-goal blockers, preserve the non-terminal blocker with:
-   `omx ultragoal checkpoint --goal-id <id> --status blocked --evidence "<completed legacy Codex goal blocks create_goal in this thread>" --codex-goal-json <get_goal-json-or-path>`
+10. For non-terminal blockers, use blocked checkpoints:
+   - legacy different completed goal: `omx ultragoal checkpoint --goal-id <id> --status blocked --evidence "<completed legacy Codex goal blocks create_goal in this thread>" --codex-goal-json <get_goal-json-or-path>`
+   - matching native Codex `blocked` status: `omx ultragoal checkpoint --goal-id <id> --status blocked --evidence "<blocker evidence>" --codex-goal-json <matching-blocked-get_goal-json-or-path>`
 11. Resume failed goals with `omx ultragoal complete-goals --retry-failed`.
 
 ## Dynamic steering

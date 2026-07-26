@@ -1772,17 +1772,39 @@ export async function checkpointUltragoal(cwd: string, options: CheckpointOption
       return plan;
     }
     if (!snapshot?.available) {
-      throw new UltragoalError('Blocked ultragoal checkpoints require either a get_goal snapshot for the completed legacy Codex goal that blocked create_goal, or an unavailable get_goal error JSON for a Codex DB/schema/context failure; pass --codex-goal-json.');
-    }
-    if (snapshot.status !== 'complete') {
-      throw new UltragoalError(`Cannot record a blocked ultragoal checkpoint while the existing Codex goal is ${snapshot.status ?? 'unknown'}; strict objective mismatch protection remains required for active or incomplete goals.`);
+      throw new UltragoalError('Blocked ultragoal checkpoints require either a get_goal snapshot for the completed legacy Codex goal that blocked create_goal, an unavailable get_goal error JSON for a Codex DB/schema/context failure, or a matching native blocked snapshot; pass --codex-goal-json.');
     }
     if (!snapshot.objective) {
       throw new UltragoalError('Blocked ultragoal checkpoint Codex snapshot is missing objective text.');
     }
-    const safeCompletedAggregateBlocker = isSafeCompletedAggregateBlockerSnapshot(plan, goal, snapshot, options.evidence);
     const blockedSnapshotMatchesExpected = [expectedCodexObjective(plan, goal), ...compatibleCodexObjectives(plan)]
       .some((objective) => normalizeObjective(objective) === normalizeObjective(snapshot.objective ?? ''));
+    if (snapshot.status === 'blocked') {
+      if (!blockedSnapshotMatchesExpected) {
+        throw new UltragoalError(
+          `Blocked ultragoal checkpoint objective mismatch: expected one of [${[expectedCodexObjective(plan, goal), ...compatibleCodexObjectives(plan)].join(' | ')}], got ${snapshot.objective}. Matching native blocked checkpoints require the expected/compatible Codex objective; finish or clear the foreign goal, or pass a matching blocked get_goal snapshot with --evidence.`,
+        );
+      }
+      const evidence = assertNonEmpty(options.evidence, '--evidence');
+      goal.updatedAt = now;
+      plan.activeGoalId = goal.id;
+      plan.updatedAt = now;
+      await writePlan(cwd, plan);
+      await appendLedger(cwd, {
+        ts: now,
+        event: 'goal_blocked',
+        goalId: goal.id,
+        status: goal.status,
+        evidence,
+        codexGoal: options.codexGoal,
+        message: 'Native Codex goal status is blocked for the matching objective; recorded a non-terminal goal_blocked checkpoint. Continue work without treating this as complete or failed; re-check get_goal when the blocker clears.',
+      });
+      return plan;
+    }
+    if (snapshot.status !== 'complete') {
+      throw new UltragoalError(`Cannot record a blocked ultragoal checkpoint while the existing Codex goal is ${snapshot.status ?? 'unknown'}; strict objective mismatch protection remains required for active or incomplete goals.`);
+    }
+    const safeCompletedAggregateBlocker = isSafeCompletedAggregateBlockerSnapshot(plan, goal, snapshot, options.evidence);
     if (!safeCompletedAggregateBlocker && blockedSnapshotMatchesExpected) {
       throw new UltragoalError('Blocked ultragoal checkpoint is only for a different completed legacy Codex goal unless an aggregate Codex goal is already complete and unreconcilable while the active repo-native microgoal remains in progress.');
     }
@@ -2156,7 +2178,7 @@ function buildPerStoryCodexGoalInstruction(goal: UltragoalItem, plan: UltragoalP
     finalStory
       ? '- After the final checkpoint command succeeds, treat `/goal clear` as the explicit terminal cleanup step before another same-thread goal.'
       : null,
-    '- If blocked or failed, checkpoint with --status failed and the failure evidence; rerun complete-goals --retry-failed to resume.',
+    '- If blocked on a matching native Codex goal status, record a non-terminal blocker with: omx ultragoal checkpoint --goal-id ' + goal.id + ' --status blocked --evidence "<blocker evidence>" --codex-goal-json "<matching blocked get_goal JSON or path>". If failed, checkpoint with --status failed and the failure evidence; rerun complete-goals --retry-failed to resume.',
     '',
     'create_goal payload:',
     JSON.stringify(createPayload, null, 2),
@@ -2209,7 +2231,7 @@ function buildAggregateCodexGoalInstruction(goal: UltragoalItem, plan: Ultragoal
     finalStory
       ? `  omx ultragoal checkpoint --goal-id ${goal.id} --status complete --evidence "<tests/files/PR evidence>" --codex-goal-json "<fresh complete get_goal JSON or path>" --quality-gate-json "<quality gate JSON or path>"`
       : `  omx ultragoal checkpoint --goal-id ${goal.id} --status complete --evidence "<tests/files/PR evidence>" --codex-goal-json "<fresh get_goal JSON or path>"`,
-    '- If blocked or failed, checkpoint with --status failed and the failure evidence; rerun complete-goals --retry-failed to resume.',
+    '- If blocked on a matching native Codex goal status, record a non-terminal blocker with: omx ultragoal checkpoint --goal-id ' + goal.id + ' --status blocked --evidence "<blocker evidence>" --codex-goal-json "<matching blocked get_goal JSON or path>". If failed, checkpoint with --status failed and the failure evidence; rerun complete-goals --retry-failed to resume.',
     '',
     'create_goal payload:',
     JSON.stringify(createPayload, null, 2),
