@@ -32129,6 +32129,88 @@ PY`,
     }
   });
 
+  it("allows finite Codex goal tools under Main-root Ultragoal checkpointing while near-misses stay unknown-denied (#3300)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3300-goal-tool-transport-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3300-goal-tool-transport";
+      const leaderThreadId = "thread-3300-goal-tool-transport";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: sessionId,
+        native_session_id: leaderThreadId,
+        cwd,
+      });
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: leaderThreadId,
+            threads: { [leaderThreadId]: { thread_id: leaderThreadId, kind: "leader" } },
+          },
+        },
+      });
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "checkpointing");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "checkpointing",
+        session_id: sessionId,
+      });
+
+      const dispatch = (tool_name: string, tool_input: Record<string, unknown> = {}) =>
+        dispatchCodexNativeHook({
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: leaderThreadId,
+          agent_id: leaderThreadId,
+          tool_name,
+          tool_input,
+        }, { cwd });
+
+      for (const [tool_name, tool_input] of [
+        ["Read", { file_path: "README.md" }],
+        ["get_goal", {}],
+        ["functions.get_goal", {}],
+        ["functionsget_goal", {}],
+        ["create_goal", { objective: "complete the ultragoal plan" }],
+        ["update_goal", { status: "complete" }],
+        ["functions.create_goal", { objective: "complete the ultragoal plan" }],
+        ["functions.update_goal", { status: "complete" }],
+        ["functionscreate_goal", { objective: "complete the ultragoal plan" }],
+        ["functionsupdate_goal", { status: "complete" }],
+      ] as const) {
+        const result = await dispatch(tool_name, tool_input);
+        assert.equal(result.outputJson, null, tool_name);
+      }
+
+      for (const tool_name of ["getgoal", "get_goals", "updateGoal", "createGoal", "functions.get_goals"]) {
+        const blocked = await dispatch(tool_name, {});
+        assert.equal(blocked.outputJson?.decision, "block", tool_name);
+        const reason = String(blocked.outputJson?.reason ?? "");
+        assert.match(reason, /Main-root Conductor mode is active \(ultragoal phase: checkpointing\)/);
+        assert.match(reason, /not a recognized read-only or explicitly authorized Conductor mutation transport/);
+        assert.match(reason, new RegExp(tool_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      }
+
+      // Stop reconciliation must be able to require a fresh get_goal without PreToolUse self-block.
+      const stop = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+      }, { cwd });
+      const stopMessage = JSON.stringify(stop.outputJson ?? {});
+      // Stop may still emit guidance, but must not claim get_goal is an unrecognized Conductor transport.
+      assert.doesNotMatch(stopMessage, /get_goal is not a recognized read-only or explicitly authorized Conductor mutation transport/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("allows session-scoped omx cancel under active ultragoal conductor while impostors stay blocked", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ultragoal-conductor-cancel-"));
     try {
