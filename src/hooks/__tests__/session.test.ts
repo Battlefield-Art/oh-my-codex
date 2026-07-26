@@ -1091,11 +1091,6 @@ describe('session pointer transaction', () => {
   });
 
 
-  it('preserves foreign claim bytes swapped in after the initial recovery link', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-preserved-'));
-    try { await assertDurableDirectoryRecovery(cwd); } finally { await rm(cwd, { recursive: true, force: true }); }
-  });
-
   it('live canonical successor survives a refused recovery claim and stays recognizable, releasable, and acquirable', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-live-successor-'));
     try {
@@ -1498,15 +1493,6 @@ describe('session pointer transaction', () => {
     } finally { await rm(cwd, { recursive: true, force: true }); }
   });
 
-  it('preserves a resumable checkpoint when checkpoint quarantine rename is busy', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-preserved-'));
-    try { await assertDurableDirectoryRecovery(cwd); } finally { await rm(cwd, { recursive: true, force: true }); }
-  });
-
-  it('rolls a checkpoint quarantine move back when claim unlink is transiently busy', async () => {
-    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-preserved-'));
-    try { await assertDurableDirectoryRecovery(cwd); } finally { await rm(cwd, { recursive: true, force: true }); }
-  });
 
   it('refuses an advanced checkpoint when a live successor replaces the bound lock directory', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-lock-recovery-checkpoint-successor-swap-'));
