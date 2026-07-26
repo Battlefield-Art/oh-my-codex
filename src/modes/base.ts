@@ -178,7 +178,7 @@ export async function startMode(
   const beforeCommit = createWritableCommitRevalidator({
     operation: 'startMode',
     cwd: projectRoot ?? process.cwd(),
-    explicitSessionId: undefined,
+    explicitSessionId,
     capturedScope: scope,
     baseStateDir,
   });
@@ -278,7 +278,7 @@ export async function readModeStateForExplicitSession(
 ): Promise<ModeState | null> {
   const scope = await resolveWritableStateScope(projectRoot, sessionId);
   if (!scope.sessionId) return null;
-  return readModeStateFromPaths([getStatePath(mode, projectRoot, scope.sessionId)]);
+  return readModeStateFromPaths([join(scope.stateDir, getStateFilename(mode))]);
 }
 
 export async function readModeStateForActiveDecision(
