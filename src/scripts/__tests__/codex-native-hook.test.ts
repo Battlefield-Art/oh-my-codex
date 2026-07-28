@@ -5075,7 +5075,7 @@ PY`,
       assert.notEqual(terminalWrite.isError, true);
       assert.equal(
         (terminalWrite.payload as { path?: string }).path,
-        join(stateDir, "sessions", canonicalSessionId, "deep-interview-state.json"),
+        join(realpathSync(stateDir), "sessions", canonicalSessionId, "deep-interview-state.json"),
       );
       assert.equal(existsSync(join(stateDir, "sessions", ownerSessionId, "deep-interview-state.json")), false);
 
