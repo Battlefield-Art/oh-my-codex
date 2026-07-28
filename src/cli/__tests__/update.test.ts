@@ -1,11 +1,11 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { tmpdir } from 'node:os';
+import { tmpdir as osTmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import {
   isInstallVersionBump,
@@ -28,6 +28,8 @@ import {
   resolvePackageManagerOwnership,
   type PackageManagerOwnership,
 } from '../package-manager-ownership.js';
+
+const tmpdir = (): string => realpathSync(osTmpdir());
 
 const PACKAGE_NAME = 'oh-my-codex';
 const frozenNpmOwnership: PackageManagerOwnership = {

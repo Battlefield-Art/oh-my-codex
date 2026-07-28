@@ -2,9 +2,12 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { chmod, mkdir, mkdtemp, readFile, realpath, rm, writeFile } from "node:fs/promises";
 import { spawnSync } from "node:child_process";
-import { tmpdir } from "node:os";
+import { realpathSync } from "node:fs";
+import { tmpdir as osTmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+
+const tmpdir = (): string => realpathSync(osTmpdir());
 
 function omxBin(): string {
   const testDir = dirname(fileURLToPath(import.meta.url));

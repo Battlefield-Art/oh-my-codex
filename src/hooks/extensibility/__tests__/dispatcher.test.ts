@@ -1,11 +1,13 @@
 import assert from 'node:assert/strict';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { tmpdir as osTmpdir } from 'node:os';
 import { delimiter, join } from 'node:path';
 import { describe, it } from 'node:test';
 import { isHookPluginFeatureEnabled, dispatchHookEvent } from '../dispatcher.js';
 import { buildHookEvent } from '../events.js';
+
+const tmpdir = (): string => realpathSync(osTmpdir());
 
 function processExists(pid: number): boolean {
   try {

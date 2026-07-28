@@ -1,9 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { lstat, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'node:fs/promises';
-import { existsSync, lstatSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { basename, dirname, join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir as osTmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import {
@@ -14,6 +14,9 @@ import {
 } from '../../config/codex-hooks.js';
 import { uninstall } from '../uninstall.js';
 import TOML from '@iarna/toml';
+
+const tmpdir = (): string => realpathSync(osTmpdir());
+const shortTmpdir = (): string => process.platform === 'win32' ? tmpdir() : realpathSync('/tmp');
 
 function runOmx(
   cwd: string,
@@ -1824,7 +1827,7 @@ describe('omx uninstall', () => {
       { name: 'finalization', stage: 'after-staged-cleanup', drift: 'config', committed: true },
     ] as const;
     for (const fixture of fixtures) {
-      const wd = await mkdtemp(join(tmpdir(), `omx-uninstall-applied-${fixture.name}-`));
+      const wd = await mkdtemp(join(shortTmpdir(), `omx-uninstall-applied-${fixture.name}-`));
       try {
         await withCwd(wd, async () => {
           const codexDir = join(wd, '.codex');
@@ -3119,7 +3122,7 @@ describe('omx uninstall', () => {
     }
   });
   it('warns once after a successful Windows EPERM-degraded uninstall transaction', async () => {
-    const wd = await mkdtemp(join(tmpdir(), 'omx-uninstall-durability-'));
+    const wd = await mkdtemp(join(shortTmpdir(), 'omx-uninstall-durability-'));
     const originalStderrWrite = process.stderr.write;
     const stderr: string[] = [];
     try {

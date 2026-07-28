@@ -1,9 +1,9 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { join } from 'node:path';
-import { tmpdir } from 'node:os';
+import { tmpdir as osTmpdir } from 'node:os';
 import {
   __resetSessionPointerTransactionDependenciesForTests,
   __setSessionPointerTransactionDependenciesForTests,
@@ -30,6 +30,8 @@ import {
 } from '../artifacts.js';
 import { LEADER_CONDUCTOR_BLOCK, buildUnsupportedNativeSubagentGuidance } from '../../leader/contract.js';
 import { steeringFixtures, type SteeringFixtureProposal } from './steering-fixtures.js';
+
+const tmpdir = (): string => realpathSync(osTmpdir());
 
 async function withTempRepo<T>(run: (cwd: string) => Promise<T>): Promise<T> {
   const cwd = await mkdtemp(join(tmpdir(), 'omx-ultragoal-'));
