@@ -3763,7 +3763,10 @@ function hookCancelSkillMatches(value: Record<string, unknown>, sessionId: strin
   return entries.some((candidate) => {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
     const entry = candidate as Record<string, unknown>;
-    return hookCancelString(entry.skill).toLowerCase() === "autopilot" && entry.active !== false && normalizeAutopilotPhase(hookCancelString(entry.phase)) === "deep-interview" && (!hookCancelString(entry.session_id) || hookCancelString(entry.session_id) === sessionId) && hookCancelCwdMatches(entry, cwd);
+    return hookCancelString(entry.skill).toLowerCase() === "autopilot"
+      && entry.active !== false
+      && (!hookCancelString(entry.session_id) || hookCancelString(entry.session_id) === sessionId)
+      && hookCancelCwdMatches(entry, cwd);
   });
 }
 async function hookCancelFsyncDirectory(path: string): Promise<void> {
@@ -3792,7 +3795,9 @@ function hookCancelPreparedSkill(value: Record<string, unknown>, sessionId: stri
   const entries = sourceEntries.map((candidate) => {
     if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate;
     const entry = candidate as Record<string, unknown>;
-    const matches = hookCancelString(entry.skill).toLowerCase() === "autopilot" && entry.active !== false && normalizeAutopilotPhase(hookCancelString(entry.phase)) === "deep-interview" && (!hookCancelString(entry.session_id) || hookCancelString(entry.session_id) === sessionId);
+    const matches = hookCancelString(entry.skill).toLowerCase() === "autopilot"
+      && entry.active !== false
+      && (!hookCancelString(entry.session_id) || hookCancelString(entry.session_id) === sessionId);
     if (!matches) return entry; cancelled = true; return { ...entry, active: false, phase: "cancelled", updated_at: nowIso };
   });
   if (!cancelled) return value;
@@ -5314,6 +5319,10 @@ function classifyPreToolUseMutationTransport(
 ): PreToolUseMutationTransport {
   if (toolName === "Bash") {
     const command = readPreToolUseCommand(payload);
+    if (
+      readPreToolUseRawCommand(payload) === command
+      && (isAllowedOmxReadOnlyCommand(command, cwd) || isAllowedGhReadOnlyCommand(command) || isAllowedVersionProbeCommand(command))
+    ) return "read-only";
     return commandHasDeepInterviewWriteIntent(command, 0, cwd) || collectOmxStateCommandOperations(command, "write").length > 0 || commandHasNestedCliMutationIntent(command) || classifyConductorExecutableRuntime(command, 0, cwd) !== null
       ? "bash"
       : "read-only";
@@ -9398,6 +9407,9 @@ function stateReadTrailingArgsAreSafe(trailing: string[]): boolean {
   if (trailing.length === 1 && (trailing[0] === "--help" || trailing[0] === "-h" || trailing[0] === "help")) return true;
   let sawMode = false;
   let sawJson = false;
+  let sawInput = false;
+  let sawInputFile = false;
+  const staticFlagValue = (value: string): boolean => Boolean(value) && !/[`$\0]/.test(value);
   for (let index = 0; index < trailing.length; index += 1) {
     const arg = trailing[index] ?? "";
     if (arg === "--json") {
@@ -9408,14 +9420,43 @@ function stateReadTrailingArgsAreSafe(trailing: string[]): boolean {
     if (arg === "--mode") {
       if (sawMode) return false;
       const value = trailing[index + 1] ?? "";
-      if (!value || value.startsWith("-")) return false;
+      if (!staticFlagValue(value) || value.startsWith("-")) return false;
       sawMode = true;
       index += 1;
       continue;
     }
     if (arg.startsWith("--mode=")) {
-      if (sawMode || !arg.slice("--mode=".length)) return false;
+      const value = arg.slice("--mode=".length);
+      if (sawMode || !staticFlagValue(value)) return false;
       sawMode = true;
+      continue;
+    }
+    if (arg === "--input") {
+      if (sawInput || sawInputFile) return false;
+      const value = trailing[index + 1] ?? "";
+      if (!staticFlagValue(value)) return false;
+      sawInput = true;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--input=")) {
+      const value = arg.slice("--input=".length);
+      if (sawInput || sawInputFile || !staticFlagValue(value)) return false;
+      sawInput = true;
+      continue;
+    }
+    if (arg === "--input-file") {
+      if (sawInput || sawInputFile) return false;
+      const value = trailing[index + 1] ?? "";
+      if (!staticFlagValue(value) || value.startsWith("-")) return false;
+      sawInputFile = true;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--input-file=")) {
+      const value = arg.slice("--input-file=".length);
+      if (sawInput || sawInputFile || !staticFlagValue(value)) return false;
+      sawInputFile = true;
       continue;
     }
     return false;
@@ -9840,16 +9881,28 @@ async function readActiveDeepInterviewStateForPreToolUse(
   if (!modeStateMatchesSkillStopContext(autopilotState, cwd, sessionId)) return null;
   const autopilotStatePhase = safeString(autopilotState.current_phase ?? autopilotState.currentPhase).trim().toLowerCase();
   const autopilotIsDeepInterview = normalizeAutopilotPhase(autopilotStatePhase) === "deep-interview";
-  const hasDeepInterviewScopedAutopilotSkill = listActiveSkills(canonicalState).some((entry) => (
-    entry.skill === "autopilot"
-    && normalizeAutopilotPhase(safeString(entry.phase).trim().toLowerCase()) === "deep-interview"
-    && matchesSkillStopContext(entry, canonicalState, sessionId, threadId)
-  ));
-  const hasActiveAutopilotSkill = listActiveSkills(canonicalState).some((entry) => (
+  const activeAutopilotEntries = listActiveSkills(canonicalState).filter((entry) => (
     entry.skill === "autopilot"
     && matchesSkillStopContext(entry, canonicalState, sessionId, threadId)
   ));
-  if (!hasActiveAutopilotSkill) return null;
+  const hasDeepInterviewScopedAutopilotSkill = activeAutopilotEntries.some((entry) => (
+    normalizeAutopilotPhase(safeString(entry.phase).trim().toLowerCase()) === "deep-interview"
+  ));
+  if (activeAutopilotEntries.length === 0) return null;
+  if (autopilotIsDeepInterview && !hasDeepInterviewScopedAutopilotSkill) {
+    const disagreeingPhase = activeAutopilotEntries
+      .map((entry) => safeString(entry.phase).trim())
+      .find((phase) => phase && normalizeAutopilotPhase(phase.toLowerCase()) !== "deep-interview");
+    if (disagreeingPhase) {
+      return {
+        ...autopilotState,
+        __omx_state_phase_mismatch: {
+          lifecycle_phase: autopilotStatePhase || "deep-interview",
+          skill_mirror_phase: disagreeingPhase,
+        },
+      };
+    }
+  }
   if (!autopilotIsDeepInterview && !hasDeepInterviewScopedAutopilotSkill) return null;
   return autopilotState;
 }
@@ -10412,6 +10465,22 @@ async function buildDeepInterviewPreToolUseBoundaryOutput(
   if (!blocked) return null;
 
   const phase = formatPhase(activeState.current_phase ?? activeState.currentPhase, "planning");
+  const phaseMismatch = activeState.__omx_state_phase_mismatch && typeof activeState.__omx_state_phase_mismatch === "object"
+    ? activeState.__omx_state_phase_mismatch as Record<string, unknown>
+    : null;
+  if (phaseMismatch) {
+    const lifecyclePhase = safeString(phaseMismatch.lifecycle_phase).trim() || phase;
+    const skillMirrorPhase = safeString(phaseMismatch.skill_mirror_phase).trim() || "<missing>";
+    return {
+      decision: "block",
+      reason: `STATE_PHASE_MISMATCH: Autopilot lifecycle phase: ${lifecyclePhase}; skill mirror phase: ${skillMirrorPhase}. The lifecycle state remains authoritative for write protection; use same-session \`omx cancel\` or a validated Autopilot deep-interview -> ralplan state transition to recover; ${blockedDetail}.`,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        additionalContext:
+          "STATE_PHASE_MISMATCH: Autopilot lifecycle and skill-active mirror disagree. Do not infer implementation authorization from the mirror phase; recover with same-session `omx cancel` or a validated lifecycle transition that updates canonical state.",
+      },
+    };
+  }
   return {
     decision: "block",
     reason: `Deep-interview is active (phase: ${phase}); implementation/write tools are blocked until an explicit handoff workflow is activated; ${blockedDetail}.`,
@@ -12218,25 +12287,27 @@ function commandMayPopulateSensitiveRuntimeEnvironment(command: string): boolean
   };
   for (const segment of splitShellCommandSegments(stripHeredocBodiesForCommandScan(command))) {
     const words = tokenizeConductorShellWords(segment);
-    for (let index = 0; index < words.length; index += 1) {
-      const commandName = commandNameFromShellWord(words[index] ?? "");
+    for (const commandStart of collectShellCommandStartIndexes(words)) {
+      const directCommandIndex = skipShellCommandPositionPrefixWords(words, commandStart);
+      const commandIndex = findWrappedCommandPositionIndex(words, commandStart) ?? directCommandIndex;
+      const commandName = commandNameFromShellWord(words[commandIndex] ?? "");
       if (commandName === "printf") {
-        const operands = collectConductorInvocationWords(words, index);
+        const operands = collectConductorInvocationWords(words, commandIndex);
         const valueIndex = operands.findIndex((operand) => shellWordLiteral(operand) === "-v");
         if (valueIndex >= 0 && isSensitiveTarget(operands[valueIndex + 1])) return true;
         if (operands.some((operand) => /^-v[^-]/.test(shellWordLiteral(operand)))) return true;
       } else if (commandName === "read") {
-        const operands = collectConductorInvocationWords(words, index);
+        const operands = collectConductorInvocationWords(words, commandIndex);
         const names = operands.filter((operand) => {
           const literal = shellWordLiteral(operand);
           return literal !== "--" && !literal.startsWith("-");
         });
         if (names.some((name) => isSensitiveTarget(name))) return true;
       } else if (commandName === "getopts") {
-        const operands = collectConductorInvocationWords(words, index);
+        const operands = collectConductorInvocationWords(words, commandIndex);
         if (isSensitiveTarget(operands[1])) return true;
       } else if (commandName === "for" || commandName === "select") {
-        if (isSensitiveTarget(words[index + 1])) return true;
+        if (isSensitiveTarget(words[commandIndex + 1])) return true;
       }
     }
   }
@@ -19547,27 +19618,29 @@ export async function buildConductorPreToolUseWriteGuardOutput(
   let nativeChildMutationAttempt = false;
 
   if (toolName === "Bash") {
-    const shellMutations = extractConductorBashMutations(command, cwd, policyCwd);
-    const bashEvaluation = evaluateConductorBashWrite(cwd, command, 0, sessionId, policyCwd, readPreToolUseRawCommand(payload));
-    blocked = !bashEvaluation.allowed;
-    const canonicalStateCommand = canonicalizeOmxStateTransportCommand(command);
-    const bashStateOperations = collectOmxStateCommandOperations(canonicalStateCommand, "write");
-    if (bashStateOperations.length > 0) {
-      const bashStatePayload = readStateWriteInputPayload(policyCwd, canonicalStateCommand, command);
-      if (
-        !isStandaloneParsedOmxStateWriteTransport(policyCwd, command, sessionId)
-        || !conductorStatePayloadPreservesActiveGuard(bashStatePayload, activeState)
-      ) {
-        blocked = true;
-        blockedDetail = "Bash state writes must preserve the canonical active Conductor guard";
+    if (mutationTransport !== "read-only") {
+      const shellMutations = extractConductorBashMutations(command, cwd, policyCwd);
+      const bashEvaluation = evaluateConductorBashWrite(cwd, command, 0, sessionId, policyCwd, readPreToolUseRawCommand(payload));
+      blocked = !bashEvaluation.allowed;
+      const canonicalStateCommand = canonicalizeOmxStateTransportCommand(command);
+      const bashStateOperations = collectOmxStateCommandOperations(canonicalStateCommand, "write");
+      if (bashStateOperations.length > 0) {
+        const bashStatePayload = readStateWriteInputPayload(policyCwd, canonicalStateCommand, command);
+        if (
+          !isStandaloneParsedOmxStateWriteTransport(policyCwd, command, sessionId)
+          || !conductorStatePayloadPreservesActiveGuard(bashStatePayload, activeState)
+        ) {
+          blocked = true;
+          blockedDetail = "Bash state writes must preserve the canonical active Conductor guard";
+        }
       }
+      const safeExportedFunctionRead = !blocked
+        && shellMutations.length === 0
+        && /\b(?:export\s+(?:-[A-Za-z]*f[A-Za-z]*|--functions?)|(?:declare|typeset)\s+-[A-Za-z]*f[A-Za-z]*)\b/.test(command);
+      nativeChildMutationAttempt = (mutationTransport === "bash" || shellMutations.length > 0)
+        && !safeExportedFunctionRead;
+      if (blocked) blockedDetail = bashEvaluation.blockedDetail ?? buildConductorBashBlockedDetail(cwd, command);
     }
-    const safeExportedFunctionRead = !blocked
-      && shellMutations.length === 0
-      && /\b(?:export\s+(?:-[A-Za-z]*f[A-Za-z]*|--functions?)|(?:declare|typeset)\s+-[A-Za-z]*f[A-Za-z]*)\b/.test(command);
-    nativeChildMutationAttempt = (mutationTransport === "bash" || shellMutations.length > 0)
-      && !safeExportedFunctionRead;
-    if (blocked) blockedDetail = bashEvaluation.blockedDetail ?? buildConductorBashBlockedDetail(cwd, command);
   } else if (mutationTransport === "state") {
     nativeChildMutationAttempt = true;
     const directStateInput = safeObject(payload.tool_input);

@@ -32376,6 +32376,162 @@ PY`,
     }
   });
 
+  it("allows trusted omx state read with structured input under ultragoal conductor planning (#3343)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3343-state-read-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3343-state-read";
+      const leaderThreadId = "thread-3343-state-read";
+      await mkdir(join(cwd, ".git"), { recursive: true });
+      await writeNativeMappedSessionState(cwd, stateDir, sessionId, leaderThreadId, leaderThreadId);
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "planning");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "planning",
+        session_id: sessionId,
+        workingDirectory: cwd,
+      });
+
+      await withCleanAmbientNodeRuntimeEnvironment(async () => {
+        await withTrustedWorkspaceOmxCli(cwd, async (_omxCommand, trustedPath) => {
+          const inheritedPath = process.env.PATH;
+          process.env.PATH = trustedPath;
+          try {
+            const payload = JSON.stringify({ mode: "ultragoal", session_id: sessionId, workingDirectory: cwd });
+            const result = await dispatchCodexNativeHook(
+              {
+                hook_event_name: "PreToolUse",
+                cwd,
+                session_id: sessionId,
+                thread_id: leaderThreadId,
+                agent_id: leaderThreadId,
+                tool_name: "Bash",
+                tool_use_id: "tool-3343-omx-state-read-input",
+                tool_input: {
+                  command: `omx state read --input '${payload}' --json`,
+                },
+              },
+              { cwd },
+            );
+
+            assert.equal(result.outputJson, null);
+          } finally {
+            if (inheritedPath === undefined) delete process.env.PATH;
+            else process.env.PATH = inheritedPath;
+          }
+        });
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("diagnoses Autopilot lifecycle and skill-mirror phase mismatches (#3344)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3344-phase-mismatch-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3344-phase-mismatch";
+      const leaderThreadId = "thread-3344-phase-mismatch";
+      await writeNativeMappedSessionState(cwd, stateDir, sessionId, leaderThreadId, leaderThreadId);
+      await writeJson(join(stateDir, "sessions", sessionId, "skill-active-state.json"), {
+        active: true,
+        skill: "autopilot",
+        phase: "planning",
+        session_id: sessionId,
+        active_skills: [{ skill: "autopilot", phase: "planning", active: true, session_id: sessionId }],
+      });
+      await writeJson(join(stateDir, "sessions", sessionId, "autopilot-state.json"), {
+        active: true,
+        mode: "autopilot",
+        current_phase: "deep-interview",
+        session_id: sessionId,
+        workingDirectory: cwd,
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: leaderThreadId,
+          agent_id: leaderThreadId,
+          tool_name: "Write",
+          tool_use_id: "tool-3344-phase-mismatch-write",
+          tool_input: { file_path: "src/runtime.ts", content: "export {};\n" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.match(String(result.outputJson?.reason ?? ""), /STATE_PHASE_MISMATCH/);
+      assert.match(String(result.outputJson?.reason ?? ""), /lifecycle phase: deep-interview/);
+      assert.match(String(result.outputJson?.reason ?? ""), /skill mirror phase: planning/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("lets omx cancel terminalize Autopilot deep-interview even when the skill mirror advanced (#3344)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3344-cancel-mismatch-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3344-cancel-mismatch";
+      const leaderThreadId = "thread-3344-cancel-mismatch";
+      await writeNativeMappedSessionState(cwd, stateDir, sessionId, leaderThreadId, leaderThreadId);
+      await writeJson(join(stateDir, "sessions", sessionId, "skill-active-state.json"), {
+        active: true,
+        skill: "autopilot",
+        phase: "planning",
+        session_id: sessionId,
+        active_skills: [{ skill: "autopilot", phase: "planning", active: true, session_id: sessionId }],
+      });
+      await writeJson(join(stateDir, "sessions", sessionId, "autopilot-state.json"), {
+        active: true,
+        mode: "autopilot",
+        current_phase: "deep-interview",
+        session_id: sessionId,
+        workingDirectory: cwd,
+      });
+
+      await withCleanAmbientNodeRuntimeEnvironment(async () => {
+        await withTrustedWorkspaceOmxCli(cwd, async (_omxCommand, trustedPath) => {
+          const inheritedPath = process.env.PATH;
+          process.env.PATH = trustedPath;
+          try {
+            const result = await dispatchCodexNativeHook(
+              {
+                hook_event_name: "PreToolUse",
+                cwd,
+                session_id: sessionId,
+                thread_id: leaderThreadId,
+                agent_id: leaderThreadId,
+                tool_name: "Bash",
+                tool_use_id: "tool-3344-cancel-mismatch",
+                tool_input: { command: "omx cancel" },
+              },
+              { cwd },
+            );
+            assert.equal(result.outputJson?.decision, "block");
+            assert.match(JSON.stringify(result.outputJson), /cancelled_exact_session/);
+          } finally {
+            if (inheritedPath === undefined) delete process.env.PATH;
+            else process.env.PATH = inheritedPath;
+          }
+        });
+      });
+
+      const nextAutopilot = JSON.parse(await readFile(join(stateDir, "sessions", sessionId, "autopilot-state.json"), "utf-8"));
+      const nextSkill = JSON.parse(await readFile(join(stateDir, "sessions", sessionId, "skill-active-state.json"), "utf-8"));
+      assert.equal(nextAutopilot.active, false);
+      assert.equal(nextAutopilot.current_phase, "cancelled");
+      assert.equal(nextSkill.active, false);
+      assert.equal(nextSkill.phase, "cancelled");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("blocks mapped implementation writes when explicit ultragoal conductor handoff is active", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralplan-native-map-handoff-"));
     try {
