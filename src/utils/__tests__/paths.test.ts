@@ -25,12 +25,34 @@ import {
   omxLogsDir,
   packageRoot,
   canonicalizeComparablePath,
+  sameFilePath,
   OMX_ENTRY_PATH_ENV,
   OMX_STARTUP_CWD_ENV,
   rememberOmxLaunchContext,
   resolveOmxCliEntryPath,
   resolveOmxEntryPath,
 } from "../paths.js";
+
+describe("comparable paths", () => {
+  it("leaves ordinary paths under a canonical root unchanged", async () => {
+    const root = await realpath(await mkdtemp(join(tmpdir(), "omx-comparable-path-")));
+    try {
+      const missingChild = join(root, "missing", "child.json");
+      assert.equal(canonicalizeComparablePath(missingChild), missingChild);
+      assert.equal(sameFilePath(missingChild, missingChild), true);
+    } finally {
+      await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("treats the macOS /var alias as the same path for missing descendants", {
+    skip: process.platform !== "darwin",
+  }, () => {
+    const aliasPath = join("/var", "tmp", "omx-comparable-missing", "state.json");
+    const canonicalPath = join("/private", "var", "tmp", "omx-comparable-missing", "state.json");
+    assert.equal(sameFilePath(aliasPath, canonicalPath), true);
+  });
+});
 
 describe("codexHome", () => {
   let originalCodexHome: string | undefined;
