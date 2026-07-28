@@ -2,15 +2,17 @@ import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { chmod, mkdir, mkdtemp, rm, symlink, writeFile, readFile } from 'fs/promises';
 
-import { existsSync } from 'fs';
+import { existsSync, realpathSync } from 'fs';
 import { dirname, join } from 'path';
-import { tmpdir } from 'os';
+import { tmpdir as osTmpdir } from 'os';
 import { spawnSync } from 'child_process';
 import { fileURLToPath } from 'url';
 import { readModeState } from '../../modes/base.js';
 import { readSkillActiveState } from '../../state/skill-active.js';
 import { recordSkillActivation } from '../../hooks/keyword-detector.js';
 import { cancelModesForTest } from '../index.js';
+
+const tmpdir = (): string => realpathSync(osTmpdir());
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testDir, '..', '..', '..');

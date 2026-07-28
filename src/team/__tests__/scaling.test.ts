@@ -4,8 +4,8 @@ import { createHash } from 'node:crypto';
 import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm, readFile, writeFile, mkdir, chmod, readdir, symlink } from 'fs/promises';
 import { join, posix, relative, win32 } from 'path';
-import { tmpdir } from 'os';
-import { existsSync, readFileSync } from 'fs';
+import { tmpdir as osTmpdir } from 'os';
+import { existsSync, readFileSync, realpathSync } from 'fs';
 import {
   initTeamState,
   createTask,
@@ -32,6 +32,7 @@ import {
 import { TEAM_WORKER_INHERITED_MODEL_ENV } from '../model-contract.js';
 import { buildWorkerProcessLaunchSpec } from '../tmux-session.js';
 
+const tmpdir = (): string => realpathSync(osTmpdir());
 
 delete process.env.OMX_TEAM_STATE_ROOT;
 process.env.OMX_RUNTIME_BRIDGE = '0';
