@@ -9680,6 +9680,29 @@ function isAllowedOmxReadOnlyCommand(command: string, cwd: string): boolean {
   return isAllowedOmxCleanupDryRunCommand(command);
 }
 
+function isAllowedTrustedAbsoluteOmxReadOnlyCommand(command: string, cwd: string): boolean {
+  if (!isSingleLiteralShellInvocation(command)) return false;
+  if (commandHasUnsafeDynamicLoaderEnvironment(command) || commandHasUnsafeLeadingRuntimeEnvironment(command)) return false;
+  const unsafeInheritedNames = [...OMX_GJC_TRUSTED_CONTEXT_UNSAFE_INHERITED_ENV_NAMES, ...CONDUCTOR_NODE_OUTPUT_ENVIRONMENT_NAMES];
+  if (unsafeInheritedNames.some((name) => safeString(process.env[name]).trim() !== "")) return false;
+  const words = tokenizeConductorShellWords(command);
+  const index = skipShellCommandPositionPrefixWords(words, 0);
+  const commandWord = shellWordLiteral(words[index] ?? "");
+  if (!isAbsolute(commandWord) || !commandWord.includes("/") || /[$`]/.test(commandWord)) return false;
+  const commandName = commandNameFromShellWord(commandWord);
+  if (commandName !== "omx" && commandName !== "gjc") return false;
+  const state = resolveConductorCommandPathState(words, 0, index, createConductorRuntimeShellState(cwd));
+  if (!conductorSlashCommandIsTrusted(commandWord, state, cwd)) return false;
+  const args = collectConductorInvocationWords(words, index).map(shellWordLiteral).filter(Boolean);
+  if (args.length === 1 && (args[0] === "--help" || args[0] === "-h" || args[0] === "--version" || args[0] === "-v")) return true;
+  if (args.length === 1 && (args[0] === "help" || args[0] === "status" || args[0] === "version")) return true;
+  if (isAllowedOmxNestedHelpForm(args)) return true;
+  return args.length === 3
+    && args[0] === "ultragoal"
+    && args[1] === "status"
+    && args[2] === "--json";
+}
+
 function isAllowedVersionProbeCommand(command: string): boolean {
   if (!isSingleLiteralShellInvocation(command)) return false;
   const words = literalInvocationWords(command);
@@ -11462,6 +11485,7 @@ function commandHasUnsafeConductorShellState(command: string, cwd = process.cwd(
   let unresolvedNameref = false;
 
   if (!inheritedConductorShellOptions().known) return true;
+  if (isAllowedTrustedAbsoluteOmxReadOnlyCommand(command, cwd)) return false;
   for (const commandStart of collectShellCommandStartIndexes(words)) {
     const directCommandIndex = skipShellCommandPositionPrefixWords(words, commandStart);
     const directCommandWord = shellWordLiteral(words[directCommandIndex] ?? "");
@@ -15958,6 +15982,26 @@ function isStaticallyRecognizedConductorOrchestrationMutation(
   return hasExactConductorOrchestrationOptionSchema(commandName, words, commandIndex);
 }
 
+function isDirectTrustedAbsoluteUltragoalCheckpoint(command: string, rootCwd: string): boolean {
+  const words = tokenizeConductorShellWords(command);
+  const commandStarts = collectShellCommandStartIndexes(words);
+  if (commandStarts.length !== 1 || commandStarts[0] !== 0) return false;
+  const commandIndex = skipShellCommandPositionPrefixWords(words, 0);
+  if (words.slice(0, commandIndex).some((word) => parseShellAssignmentWord(word) === null)) return false;
+  const commandWord = shellWordLiteral(words[commandIndex] ?? "");
+  if (!isAbsolute(commandWord) || !commandWord.includes("/") || /[$`]/.test(commandWord)) return false;
+  const commandName = commandNameFromShellWord(commandWord);
+  if (commandName !== "omx" && commandName !== "gjc") return false;
+  const invocation = collectConductorInvocationWords(words, commandIndex).map(shellWordLiteral);
+  if (invocation[0] !== "ultragoal" || invocation[1] !== "checkpoint") return false;
+  const state = resolveConductorCommandPathState(words, 0, commandIndex, createConductorRuntimeShellState(rootCwd));
+  return conductorSlashCommandIsTrusted(commandWord, state, rootCwd)
+    && hasCanonicalInheritedConductorOrchestrationRoots(words, 0, commandIndex, rootCwd)
+    && !commandHasUnsafeConductorOrchestrationPrefixEnvironment(command, rootCwd)
+    && hasSafeConductorOrchestrationRuntimeEnvironment(words, 0, commandIndex, rootCwd, state)
+    && isStaticallyRecognizedConductorOrchestrationMutation(commandName, words, commandIndex, false);
+}
+
 
 function findConductorIsolatedInvocationBoundary(words: string[], commandStartIndex: number): number {
   const groupingOpens: number[] = [];
@@ -16863,6 +16907,28 @@ function conductorExecutableHasTrustedCurrentNodeRuntimeIdentity(commandName: st
   }
 }
 
+function conductorExecutableHasTrustedPackageCliIdentity(
+  commandName: string,
+  commandPath: string,
+  rootCwd: string,
+  state: ShellPosixState,
+): boolean {
+  if (commandName !== "omx" && commandName !== "gjc") return false;
+  try {
+    const lexical = resolve(commandPath);
+    const root = realpathSync(resolve(rootCwd));
+    if (lexical === root || lexical.startsWith(`${root}/`)) return false;
+    const knownCli = conductorKnownPackageCliPath(commandName);
+    const canonicalCommand = realpathSync(commandPath);
+    const interpreterTrusted = conductorPackageCliHasTrustedNodeInterpreter(commandPath, state, rootCwd);
+    return knownCli !== null
+      && canonicalCommand === knownCli
+      && interpreterTrusted;
+  } catch {
+    return false;
+  }
+}
+
 function conductorExecutableHasTrustedIdentity(
   commandName: string,
   commandPath: string,
@@ -16872,6 +16938,7 @@ function conductorExecutableHasTrustedIdentity(
   seen = new Set<string>(),
 ): boolean {
   if (conductorExecutableHasTrustedCurrentNodeRuntimeIdentity(commandName, commandPath)) return true;
+  if (conductorExecutableHasTrustedPackageCliIdentity(commandName, commandPath, rootCwd, state)) return true;
   if (!conductorExecutableHasTrustedSystemIdentity(commandPath, rootCwd)) return false;
   if (depth >= CONDUCTOR_BASH_MAX_NESTING_DEPTH) return false;
   let canonical: string;
@@ -18170,10 +18237,11 @@ function scanConductorShellSegment(
       && (!CONDUCTOR_PATH_INDEPENDENT_BUILTINS.has(commandName) || invocation.childDispatch)
       && conductorCommandPathMayResolveRepositoryExecutable(words, commandStartIndex, commandIndex, activeState, rootCwd);
     const trustedOmxGjcPackageCliPath = isOmxGjcCommand
-      && commandIsBare
-      && conductorCommandResolvesTrustedPackageCli(words, commandStartIndex, commandIndex, activeState, rootCwd);
+      && (commandIsBare
+        ? conductorCommandResolvesTrustedPackageCli(words, commandStartIndex, commandIndex, activeState, rootCwd)
+        : conductorSlashCommandIsTrusted(commandWord, activeState, rootCwd));
     const bareCommandPathIsSafe = commandIsBare && !commandPathMayResolveRepositoryExecutable;
-    if (isOmxGjcCommand && (!commandIsBare || !trustedOmxGjcPackageCliPath)) {
+    if (isOmxGjcCommand && !trustedOmxGjcPackageCliPath) {
       mutations.push({ command: "PATH", targets: [] });
       continue;
     }
@@ -19385,6 +19453,10 @@ function evaluateConductorBashWrite(
       blockedDetail: "Bash arithmetic expansion is not statically numeric and cannot be validated for Main-root Conductor writes",
     };
   }
+  if (
+    rawCommand === command
+    && isDirectTrustedAbsoluteUltragoalCheckpoint(normalizedCommand, cwd)
+  ) return { allowed: true };
   if (commandHasUnsafeConductorShellState(normalizedCommand, cwd)) {
     return {
       allowed: false,
@@ -19403,6 +19475,10 @@ function evaluateConductorBashWrite(
       blockedDetail: "Bash unquoted heredoc expansion is not workflow state/ledger/mailbox/handoff metadata",
     };
   }
+  if (
+    rawCommand === command
+    && isAllowedTrustedAbsoluteOmxReadOnlyCommand(normalizedCommand, cwd)
+  ) return { allowed: true };
   const redirectTargets = extractDeepInterviewCommandRedirectTargets(commandWithHeredocBodies);
   if (!conductorMetadataRedirectsHaveBoundedProducers(commandWithHeredocBodies)) {
     return {
