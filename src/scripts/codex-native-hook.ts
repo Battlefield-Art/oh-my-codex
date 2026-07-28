@@ -74,7 +74,12 @@ import {
   writeTeamPhase,
 } from "../team/state.js";
 import { parseTeamNoticeLedgerPrompt, reconcileTeamNoticeLedger } from "../team/notice-ledger.js";
-import { omxNotepadPath, resolveProjectMemoryPath } from "../utils/paths.js";
+import {
+  canonicalizeComparablePath,
+  omxNotepadPath,
+  resolveProjectMemoryPath,
+  sameFilePath,
+} from "../utils/paths.js";
 import { findGitLayout } from "../utils/git-layout.js";
 import {
   getAuthoritativeActiveStatePaths,
@@ -2804,14 +2809,14 @@ async function hasAuthoritativeTeamWorkerContext(cwd: string): Promise<boolean> 
   const config = await readJsonIfExists(join(teamRoot, "config.json"));
   if (!identity || !manifest || !config) return false;
 
-  const canonicalStateRoot = resolve(stateRoot);
-  const canonicalCwd = resolve(cwd);
-  const canonicalLeaderCwd = resolve(safeString(process.env.OMX_TEAM_LEADER_CWD).trim() || cwd);
+  const canonicalStateRoot = canonicalizeComparablePath(stateRoot);
+  const canonicalCwd = canonicalizeComparablePath(cwd);
+  const canonicalLeaderCwd = canonicalizeComparablePath(safeString(process.env.OMX_TEAM_LEADER_CWD).trim() || cwd);
   const pathMatches = (value: unknown, expected: string): boolean => {
     const candidate = safeString(value).trim();
     if (!candidate) return false;
     try {
-      return resolve(candidate) === expected;
+      return sameFilePath(candidate, expected);
     } catch {
       return false;
     }
@@ -3748,7 +3753,7 @@ function hookCancelObject(bytes: Buffer): Record<string, unknown> | null {
 function hookCancelString(value: unknown): string { return typeof value === "string" ? value.trim() : ""; }
 function hookCancelCwdMatches(value: Record<string, unknown>, canonicalCwd: string): boolean {
   const recorded = hookCancelString(value.cwd) || hookCancelString(value.workingDirectory);
-  try { return !recorded || resolve(recorded) === canonicalCwd; } catch { return false; }
+  try { return !recorded || sameFilePath(recorded, canonicalCwd); } catch { return false; }
 }
 function hookCancelSessionMatches(value: Record<string, unknown>, sessionId: string, cwd: string): boolean {
   const recorded = hookCancelString(value.session_id);
@@ -4099,7 +4104,7 @@ function isFreshNativeSubagentCapacityBlocker(
   const blockerCwd = safeString(blocker.cwd).trim();
   if (blockerCwd) {
     try {
-      if (resolve(blockerCwd) !== resolve(cwd)) return false;
+      if (!sameFilePath(blockerCwd, cwd)) return false;
     } catch {
       return false;
     }
@@ -4341,10 +4346,7 @@ function normalizePlanningArtifactRelativePath(cwd: string, rawPath: string): st
   const trimmed = rawPath.trim();
   if (!trimmed || trimmed.includes("\0")) return null;
   try {
-    const absolute = resolve(cwd, trimmed);
-    const relativePath = relative(cwd, absolute).replace(/\\/g, "/");
-    if (!relativePath || relativePath.startsWith("..") || relativePath.startsWith("/")) return null;
-    return relativePath;
+    return normalizePolicyRelativePath(cwd, resolve(cwd, trimmed));
   } catch {
     return null;
   }
@@ -8906,7 +8908,7 @@ function isStandaloneParsedOmxStateWriteTransport(cwd: string, command: string, 
     || safeString(payload.session_id).trim() !== authoritativeSessionId
     || !suppliedSessionAliasesMatch(payload, authoritativeSessionId)
     || safeString(payload.workingDirectory).trim() === ""
-    || resolve(safeString(payload.workingDirectory)) !== resolve(cwd)) return false;
+    || !sameFilePath(safeString(payload.workingDirectory), cwd)) return false;
   const usesInputFile = readStateWriteFlagValue(stateWriteOperation.args, "--input-file") !== undefined;
   if (usesInputFile && splitStateScanSegments(canonicalCommand).length !== 1) return false;
   if (extractDeepInterviewCommandRedirectTargets(command).length > 0) return false;
@@ -9055,7 +9057,7 @@ export function evaluateDeepInterviewRalplanHandoffCommand(
   if (!suppliedSessionAliasesMatch(payload, authoritativeSessionId)) return rejectDeepInterviewRalplanHandoff("session_alias_conflict");
   const workingDirectory = safeString(payload.workingDirectory).trim();
   if (!workingDirectory) return rejectDeepInterviewRalplanHandoff("working_directory_missing");
-  if (resolve(workingDirectory) !== resolve(cwd)) return rejectDeepInterviewRalplanHandoff("working_directory_mismatch");
+  if (!sameFilePath(workingDirectory, cwd)) return rejectDeepInterviewRalplanHandoff("working_directory_mismatch");
   const targets = extractDeepInterviewCommandWriteTargets(command);
   if (targets.length === 0) {
     if (hasPriorExecutableCommand(stateWriteOperation.prefix)) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
@@ -9108,7 +9110,7 @@ function isCompleteRalplanTerminalWritePayload(
   ).trim();
   if (payloadSessionId !== sessionId) return false;
   if (!suppliedSessionAliasesMatch(payload, sessionId)) return false;
-  if (safeString(payload.workingDirectory).trim() === "" || resolve(safeString(payload.workingDirectory)) !== resolve(cwd)) return false;
+  if (safeString(payload.workingDirectory).trim() === "" || !sameFilePath(safeString(payload.workingDirectory), cwd)) return false;
   if (activeSessionId && payloadSessionId !== activeSessionId) return false;
   return true;
 }
@@ -9176,7 +9178,7 @@ function isCompleteDeepInterviewTerminalWritePayload(
   const phase = safeString(payload.current_phase ?? payload.currentPhase).trim().toLowerCase();
   const payloadSessionId = safeString(payload.session_id).trim();
   if (!hasOnlyFinishedExplicitOutcomes(payload)) return false;
-  if (safeString(payload.workingDirectory).trim() === "" || resolve(safeString(payload.workingDirectory)) !== resolve(cwd)) return false;
+  if (safeString(payload.workingDirectory).trim() === "" || !sameFilePath(safeString(payload.workingDirectory), cwd)) return false;
   return mode === "deep-interview"
     && payload.active === false
     && phase === "complete"
@@ -9835,7 +9837,7 @@ function isAllowedDeepInterviewBashWrite(
       || safeString(payload.session_id).trim() !== sessionId
       || !suppliedSessionAliasesMatch(payload, sessionId)
       || safeString(payload.workingDirectory).trim() === ""
-      || resolve(safeString(payload.workingDirectory)) !== resolve(cwd)) return false;
+      || !sameFilePath(safeString(payload.workingDirectory), cwd)) return false;
   }
   if (commandHasUntargetedPlanningForbiddenIntent(command)) return false;
   if (firstPlanningTmpScriptExecutionTarget(cwd, command)) return false;
@@ -10846,12 +10848,45 @@ function normalizeRepoRelativePath(cwd: string, rawPath: string): string | null 
   const candidate = rawPath.trim();
   if (!candidate || isUnresolvedVariableTarget(candidate)) return null;
   const absolute = isAbsolute(candidate) ? resolve(candidate) : resolve(cwd, candidate);
-  let relativePath = relative(cwd, absolute).replace(/\\/g, "/");
-  if (!relativePath || relativePath === ".") return null;
-  if (relativePath.startsWith("../") || relativePath === "..") {
-    relativePath = candidate.replace(/\\/g, "/");
+  const canonicalRelative = normalizePolicyRelativePath(cwd, absolute);
+  if (canonicalRelative) return canonicalRelative;
+
+  let lexicalRelative = relative(cwd, absolute).replace(/\\/g, "/");
+  if (!lexicalRelative || lexicalRelative === ".") return null;
+  if (lexicalRelative.startsWith("../") || lexicalRelative === "..") {
+    lexicalRelative = candidate.replace(/\\/g, "/");
   }
-  return relativePath.replace(/^\.\//, "");
+  return lexicalRelative.replace(/^\.\//, "");
+}
+
+function normalizePolicyRelativePath(policyRoot: string, candidatePath: string): string | null {
+  const lexicalRoot = resolve(policyRoot);
+  const lexicalCandidate = resolve(candidatePath);
+  const lexicalRelative = relative(lexicalRoot, lexicalCandidate).replace(/\\/g, "/");
+  if (
+    lexicalRelative
+    && lexicalRelative !== "."
+    && !lexicalRelative.startsWith("../")
+    && lexicalRelative !== ".."
+    && conductorPathTraversesLink(lexicalRoot, lexicalRelative)
+  ) {
+    return null;
+  }
+
+  const canonicalRoot = canonicalizeComparablePath(lexicalRoot);
+  const canonicalCandidate = canonicalizeComparablePath(lexicalCandidate);
+  const canonicalRelative = relative(canonicalRoot, canonicalCandidate).replace(/\\/g, "/");
+  if (
+    !canonicalRelative
+    || canonicalRelative === "."
+    || canonicalRelative.startsWith("../")
+    || canonicalRelative === ".."
+    || canonicalRelative.startsWith("/")
+  ) {
+    return null;
+  }
+  if (conductorPathTraversesLink(canonicalRoot, canonicalRelative)) return null;
+  return canonicalRelative.replace(/^\.\//, "");
 }
 
 function conductorPathTraversesLink(cwd: string, relativePath: string): boolean {
@@ -18144,7 +18179,7 @@ function scanConductorShellSegment(
     }
     const omxGjcPathIsSafeForStaticOrchestration = trustedOmxGjcPackageCliPath;
     const omxGjcStateWriteDestinationIsCanonical = activeState.effectiveCwd !== null
-      && resolve(activeState.effectiveCwd) === resolve(rootCwd)
+      && sameFilePath(activeState.effectiveCwd, rootCwd)
       && !conductorInvocationUsesEnvCwdChangingWrapper(words, commandStartIndex, commandIndex);
     const mainRootStructuredStateWrite = omxGjcInheritedRootsAreCanonical
       && omxGjcPrefixEnvironmentIsSafe
@@ -19251,7 +19286,7 @@ function conductorStateWriteTransportIsBoundToActiveSession(
     || safeString(statePayload.session_id).trim() !== authoritativeSessionId
     || !suppliedSessionAliasesMatch(statePayload, authoritativeSessionId)
     || safeString(statePayload.workingDirectory).trim() === ""
-    || resolve(safeString(statePayload.workingDirectory)) !== resolve(cwd)
+    || !sameFilePath(safeString(statePayload.workingDirectory), cwd)
   ) return false;
   // Inherited hook environment is process-authenticated; model-controlled shell
   // assignments must match the session resolved for this PreToolUse payload.
@@ -19544,12 +19579,12 @@ async function directConductorStateWritePayloadHasExactSchema(
   while (nestedState) {
     if (!suppliedSessionAliasesMatch(nestedState, canonicalSessionId)) return false;
     const nestedWorkingDirectory = safeString(nestedState.workingDirectory).trim();
-    if (nestedWorkingDirectory && resolve(nestedWorkingDirectory) !== resolve(policyCwd)) return false;
+    if (nestedWorkingDirectory && !sameFilePath(nestedWorkingDirectory, policyCwd)) return false;
     const nestedMode = safeString(nestedState.mode).trim();
     if (nestedMode && nestedMode !== safeString(input.mode).trim()) return false;
     nestedState = nestedState.state === undefined ? null : safeObject(nestedState.state);
   }
-  if (safeString(input.workingDirectory).trim() === "" || resolve(safeString(input.workingDirectory)) !== resolve(policyCwd)) return false;
+  if (safeString(input.workingDirectory).trim() === "" || !sameFilePath(safeString(input.workingDirectory), policyCwd)) return false;
   return true;
 }
 
@@ -19850,7 +19885,7 @@ function modeStateMatchesSkillStopContext(
   ).trim();
   if (stateCwd) {
     try {
-      if (resolve(stateCwd) !== resolve(cwd)) return false;
+      if (!sameFilePath(stateCwd, cwd)) return false;
     } catch {
       return false;
     }
@@ -19869,7 +19904,7 @@ function modeStateHasExplicitMatchingCwd(state: Record<string, unknown>, cwd: st
   if (!stateCwd) return false;
 
   try {
-    return resolve(stateCwd) === resolve(cwd);
+    return sameFilePath(stateCwd, cwd);
   } catch {
     return false;
   }
