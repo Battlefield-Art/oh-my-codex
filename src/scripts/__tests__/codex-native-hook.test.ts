@@ -157,6 +157,31 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 	await writeFile(path, JSON.stringify(value, null, 2));
 }
 
+const AMBIENT_UNSAFE_NODE_RUNTIME_ENV_NAMES = [
+	"NODE_OPTIONS",
+	"OPENSSL_CONF",
+	"NODE_V8_COVERAGE",
+	"NODE_COMPILE_CACHE",
+	"NODE_REDIRECT_WARNINGS",
+	"NODE_REPORT_DIRECTORY",
+	"NODE_REPORT_FILENAME",
+] as const;
+
+async function withCleanAmbientNodeRuntimeEnvironment<T>(run: () => Promise<T>): Promise<T> {
+	const previousRuntimeEnv = Object.fromEntries(
+		AMBIENT_UNSAFE_NODE_RUNTIME_ENV_NAMES.map((name) => [name, process.env[name]]),
+	);
+	for (const name of AMBIENT_UNSAFE_NODE_RUNTIME_ENV_NAMES) delete process.env[name];
+	try {
+		return await run();
+	} finally {
+		for (const name of AMBIENT_UNSAFE_NODE_RUNTIME_ENV_NAMES) {
+			if (previousRuntimeEnv[name] === undefined) delete process.env[name];
+			else process.env[name] = previousRuntimeEnv[name];
+		}
+	}
+}
+
 async function writeCanonicalLeaderFixture(
 	stateDir: string,
 	sessionId: string,
@@ -13426,15 +13451,50 @@ exit 0
 			})(), /Deep-interview is active|write intent|handoff|direct/);
 			await writeIssue3239ActiveAutopilotDeepInterviewState(cwd, sessionId, threadId);
 
-			for (const [label, command] of [
-				["omx-help", "omx --help"],
-				["omx-state-read", "omx state read --json"],
-				["omx-cleanup-dry-run", "omx cleanup --dry-run"],
-				["gh-issue-list", "gh issue list --repo Yeachan-Heo/oh-my-codex"],
-				["rtk-version", "rtk --version"],
-				["omx-help-benign-locale-env", "LANG=C omx --help"],
-			] as const) {
-				await assertAllowed(label, await bash(command, label));
+			{
+				// The read-only allowlist requires the same trusted-package-CLI
+				// execution-context proof the direct-cancel path uses (#3313/#3314
+				// hardening), so these assertions need `omx` to resolve to this
+				// worktree's own canonical CLI rather than relying on whatever
+				// ambient PATH the test runner happens to inherit.
+				const readOnlyTrustedBinDir = await mkdtemp(join(tmpdir(), "omx-issue-3239-readonly-trusted-bin-"));
+				const workspacePackageCliForReadOnly = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+				await symlink(workspacePackageCliForReadOnly, join(readOnlyTrustedBinDir, "omx"));
+				const inheritedReadOnlyPath = process.env.PATH;
+				const unsafeRuntimeEnvNames = [
+					"NODE_OPTIONS",
+					"OPENSSL_CONF",
+					"NODE_V8_COVERAGE",
+					"NODE_COMPILE_CACHE",
+					"NODE_REDIRECT_WARNINGS",
+					"NODE_REPORT_DIRECTORY",
+					"NODE_REPORT_FILENAME",
+				] as const;
+				const inheritedReadOnlyRuntimeEnvironment = Object.fromEntries(
+					unsafeRuntimeEnvNames.map((name) => [name, process.env[name]]),
+				);
+				process.env.PATH = `${readOnlyTrustedBinDir}:${inheritedReadOnlyPath ?? ""}`;
+				for (const name of unsafeRuntimeEnvNames) delete process.env[name];
+				try {
+					for (const [label, command] of [
+						["omx-help", "omx --help"],
+						["omx-state-read", "omx state read --json"],
+						["omx-cleanup-dry-run", "omx cleanup --dry-run"],
+						["gh-issue-list", "gh issue list --repo Yeachan-Heo/oh-my-codex"],
+						["rtk-version", "rtk --version"],
+						["omx-help-benign-locale-env", "LANG=C omx --help"],
+					] as const) {
+						await assertAllowed(label, await bash(command, label));
+					}
+				} finally {
+					if (inheritedReadOnlyPath === undefined) delete process.env.PATH;
+					else process.env.PATH = inheritedReadOnlyPath;
+					for (const name of unsafeRuntimeEnvNames) {
+						if (inheritedReadOnlyRuntimeEnvironment[name] === undefined) delete process.env[name];
+						else process.env[name] = inheritedReadOnlyRuntimeEnvironment[name];
+					}
+					await rm(readOnlyTrustedBinDir, { recursive: true, force: true });
+				}
 			}
 
 			for (const [label, command, pattern] of [
@@ -13482,7 +13542,7 @@ exit 0
 		}
 	});
 
-	it("allows only the canonical leader's authenticated standalone deep-interview complete terminal state write", async () => {
+	it("allows only the canonical leader's authenticated standalone deep-interview complete terminal state write", async () => withCleanAmbientNodeRuntimeEnvironment(async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-deep-interview-terminal-write-"));
 		try {
 			const stateDir = join(cwd, ".omx", "state");
@@ -13665,6 +13725,534 @@ exit 0
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
+	}));
+	it("issue #3313/#3314 permits standalone deep-interview lifecycle reachability and read-only discovery without relaxing write guards", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-issue-3313-3314-di-"));
+		try {
+			const stateDir = join(cwd, ".omx", "state");
+			const sessionId = "sess-issue-3313-3314-di";
+			const threadId = "thread-issue-3313-3314-di";
+			const sessionDir = join(stateDir, "sessions", sessionId);
+			await mkdir(sessionDir, { recursive: true });
+			await writeJson(join(stateDir, "session.json"), { session_id: sessionId, cwd, leader_thread_id: threadId });
+			await writeJson(join(stateDir, "subagent-tracking.json"), {
+				schemaVersion: 1,
+				sessions: {
+					[sessionId]: {
+						session_id: sessionId,
+						leader_thread_id: threadId,
+						threads: { [threadId]: { thread_id: threadId, kind: "leader" } },
+					},
+				},
+			});
+			await writeJson(join(sessionDir, "skill-active-state.json"), {
+				active: true,
+				skill: "deep-interview",
+				phase: "planning",
+				session_id: sessionId,
+				thread_id: threadId,
+				active_skills: [{
+					skill: "deep-interview",
+					phase: "planning",
+					active: true,
+					session_id: sessionId,
+					thread_id: threadId,
+				}],
+			});
+			const activeWrite = await executeStateOperation("state_write", {
+				mode: "deep-interview",
+				active: true,
+				current_phase: "intent-first",
+				session_id: sessionId,
+				thread_id: threadId,
+				workingDirectory: cwd,
+			});
+			assert.notEqual(activeWrite.isError, true);
+			await writeFile(join(cwd, "README.md"), "foo bar\n");
+
+			// Payload-realistic regression for #3314's reported live-runtime
+			// discrepancy: exercise the actual PreToolUse dispatch path against a
+			// process-wide trusted PATH (not an inline `PATH=... omx` assignment,
+			// and not a manually short-circuited fixture) so the omx CLI resolves
+			// exactly the way a live Codex session resolves it.
+			const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+			const trustedBinDir = await mkdtemp(join(tmpdir(), "omx-issue-3313-3314-trusted-bin-"));
+			await symlink(workspacePackageCli, join(trustedBinDir, "omx"));
+			const inheritedPath = process.env.PATH;
+			process.env.PATH = `${trustedBinDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
+			const unsafeRuntimeEnvironmentNames = [
+				"NODE_OPTIONS",
+				"OPENSSL_CONF",
+				"NODE_V8_COVERAGE",
+				"NODE_COMPILE_CACHE",
+				"NODE_REDIRECT_WARNINGS",
+				"NODE_REPORT_DIRECTORY",
+				"NODE_REPORT_FILENAME",
+			] as const;
+			const inheritedUnsafeRuntimeEnvironment = Object.fromEntries(
+				unsafeRuntimeEnvironmentNames.map((name) => [name, process.env[name]]),
+			);
+			for (const name of unsafeRuntimeEnvironmentNames) delete process.env[name];
+			const sparkshellImplementationEnvironmentNames = [
+				"OMX_SPARKSHELL_BIN",
+				"OMX_NATIVE_CACHE_DIR",
+				"OMX_NATIVE_MANIFEST_URL",
+				"OMX_NATIVE_RELEASE_BASE_URL",
+				"OMX_NATIVE_AUTO_FETCH",
+				"XDG_CACHE_HOME",
+				"LOCALAPPDATA",
+			] as const;
+			const inheritedSparkshellImplementationEnvironment = Object.fromEntries(
+				sparkshellImplementationEnvironmentNames.map((name) => [name, process.env[name]]),
+			);
+			for (const name of sparkshellImplementationEnvironmentNames) delete process.env[name];
+
+			const preToolUse = (command: string) => dispatchCodexNativeHook({
+				hook_event_name: "PreToolUse",
+				cwd,
+				session_id: sessionId,
+				thread_id: threadId,
+				agent_id: threadId,
+				tool_name: "Bash",
+				tool_use_id: `tool-issue-3313-3314-di-${Math.random()}`,
+				tool_input: { command },
+			}, { cwd });
+			const assertAllowed = async (label: string, command: string) => {
+				const result = await preToolUse(command);
+				assert.equal(result.outputJson, null, `${label}: ${JSON.stringify(result.outputJson)}`);
+			};
+			const assertBlocked = async (label: string, command: string, pattern?: RegExp) => {
+				const result = await preToolUse(command);
+				assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block", label);
+				if (pattern) assert.match(JSON.stringify(result.outputJson), pattern, label);
+			};
+
+			try {
+				// #3314: plain, non-omx-wrapped read-only discovery must already stay allowed.
+				// Use coreutils/git only (guaranteed present and root-owned on every CI
+				// runner); ripgrep is not part of the standard test image, so asserting
+				// on it here would make this hermetic classifier test depend on ambient
+				// package installation rather than on the fix under test.
+				await assertAllowed("plain git status", "git status --short --branch");
+				await assertAllowed("plain find", "find . -maxdepth 3 -type d");
+
+				// Direct plain `rg` must also stay read-only when it is genuinely
+				// available on this host's real PATH (a user-managed external
+				// executable, not one this repo controls). ripgrep is not part of
+				// the base OS image or this lane's installed toolset, so this check
+				// is best-effort/skip-when-absent rather than hermetic -- it proves
+				// the classifier's generic non-omx/gjc read-only path for a real,
+				// externally-resolved `rg` wherever one happens to exist, without
+				// making the suite depend on ripgrep being installed everywhere.
+				{
+					const { execFileSync } = await import("node:child_process");
+					let realRgPath: string | null = null;
+					try {
+						realRgPath = execFileSync("/bin/sh", ["-c", "command -v rg"], { encoding: "utf-8" }).trim() || null;
+					} catch {
+						realRgPath = null;
+					}
+					if (realRgPath) {
+						await assertAllowed("plain rg (real, externally-resolved binary)", `rg -n -i "foo" README.md`);
+					}
+				}
+
+				// #3313/#3314: omx/gjc help/version/status/read must not be misclassified as writes.
+				await assertAllowed("omx --help", "omx --help");
+				await assertAllowed("omx ralplan --help", "omx ralplan --help");
+				await assertAllowed("omx state read (bare)", "omx state read --json");
+				await assertAllowed("omx state read --mode deep-interview --json", "omx state read --mode deep-interview --json");
+				await assertAllowed("omx state get-status --mode=deep-interview --json", "omx state get-status --mode=deep-interview --json");
+				await assertAllowed("omx state read nested help", "omx state read --help");
+				await assertAllowed("omx auth nested help", "omx auth --help");
+				await assertBlocked("invalid state status spelling stays blocked", "omx state status --mode=deep-interview --json");
+
+				// #3314: sparkshell-wrapped read-only discovery must not be misclassified as a write.
+				await assertAllowed("sparkshell wrapped git status", "omx sparkshell -- git status --short --branch");
+				await assertAllowed("sparkshell nested help", "omx sparkshell --help");
+				await assertAllowed("sparkshell wrapped find", "omx sparkshell -- find . -maxdepth 1 -type f");
+				await assertAllowed("sparkshell json-flagged wrapped git status", "omx sparkshell --json -- git status --short --branch");
+
+				// #3313: deep-interview's own structured lifecycle stays reachable.
+				await assertAllowed("omx cancel", "omx cancel");
+
+				// The read-only allowlist authorizes the *outer* omx/gjc invocation, not
+				// just the wrapped argv shape, so it must require the same trusted-package-CLI
+				// execution-context proof the direct-cancel path already uses. An impostor
+				// binary (PATH-prefix override or path-qualified) must never reach the
+				// allow-return for --help, state read, or sparkshell, regardless of what its
+				// wrapped argv looks like.
+				{
+					const impostorBinDir = await mkdtemp(join(tmpdir(), "omx-impostor-bin-"));
+					await writeFile(join(impostorBinDir, "omx"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(impostorBinDir, "omx"), 0o755);
+					try {
+						await assertBlocked("PATH-prefix impostor omx --help stays blocked", `PATH="${impostorBinDir}" omx --help`);
+						await assertBlocked(
+							"PATH-prefix impostor omx state read stays blocked",
+							`PATH="${impostorBinDir}" omx state read --mode deep-interview --json`,
+						);
+						await assertBlocked(
+							"PATH-prefix impostor omx sparkshell stays blocked",
+							`PATH="${impostorBinDir}" omx sparkshell -- git status --short --branch`,
+						);
+					await assertBlocked(
+						"path-qualified impostor omx sparkshell stays blocked",
+						`${join(impostorBinDir, "omx")} sparkshell -- git status --short --branch`,
+					);
+					} finally {
+						await rm(impostorBinDir, { recursive: true, force: true });
+					}
+				}
+
+				// A relative-path impostor `./omx` resolves via the current directory,
+				// never via PATH, so it must stay blocked even when a legitimate
+				// trusted `omx` also exists on PATH -- basename-only trust would be
+				// fooled by the unrelated trusted PATH entry.
+				{
+					await writeFile(join(cwd, "omx"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(cwd, "omx"), 0o755);
+					try {
+						await assertBlocked(
+							"relative-path impostor ./omx sparkshell stays blocked with a legitimate trusted omx also on PATH",
+							"./omx sparkshell -- git status --short --branch",
+						);
+					} finally {
+						await rm(join(cwd, "omx"), { force: true });
+					}
+				}
+
+				// An inherited BASH_FUNC_omx%% shell-function shadow must stay blocked
+				// even against a trusted PATH resolution for the real binary.
+				{
+					const previousBashFuncOmx = process.env["BASH_FUNC_omx%%"];
+					process.env["BASH_FUNC_omx%%"] = "() { echo shadowed; }";
+					try {
+						await assertBlocked("inherited BASH_FUNC_omx%% shadow stays blocked", "omx --help");
+					} finally {
+						if (previousBashFuncOmx === undefined) delete process.env["BASH_FUNC_omx%%"];
+						else process.env["BASH_FUNC_omx%%"] = previousBashFuncOmx;
+					}
+				}
+
+
+				// gjc is a first-class alias of the same canonical package CLI; a trusted
+				// gjc shim must get the same read-only discovery allowance omx does.
+				{
+					const gjcTrustedBinDir = await mkdtemp(join(tmpdir(), "omx-gjc-trusted-bin-"));
+					await symlink(workspacePackageCli, join(gjcTrustedBinDir, "gjc"));
+					const previousGjcPath = process.env.PATH;
+					process.env.PATH = `${gjcTrustedBinDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
+					try {
+						await assertAllowed("trusted gjc --help", "gjc --help");
+						await assertAllowed("trusted gjc sparkshell wrapped git status", "gjc sparkshell -- git status --short --branch");
+					} finally {
+						if (previousGjcPath === undefined) delete process.env.PATH; else process.env.PATH = previousGjcPath;
+						await rm(gjcTrustedBinDir, { recursive: true, force: true });
+					}
+				}
+
+				// Lexical-boundary mismatches between our tokenizer/analysis and the
+				// actual shell that will execute the command must not let a
+				// differently-named executable borrow this trust: a wrapper
+				// (env/command/time) around an impostor, a non-ASCII whitespace
+				// character embedded mid-command, and a leading BOM stripped by
+				// ECMAScript trim() must all still resolve to denial.
+				{
+					const lexicalAttackerDir = await mkdtemp(join(tmpdir(), "omx-lexical-attacker-"));
+					await writeFile(join(lexicalAttackerDir, "omx"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(lexicalAttackerDir, "omx"), 0o755);
+					// A file literally named "omx<NBSP>--help" (single word to the real
+					// shell, since Bash does not treat U+00A0 as a blank).
+					await writeFile(join(lexicalAttackerDir, "omx\u00A0--help"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(lexicalAttackerDir, "omx\u00A0--help"), 0o755);
+					// A file literally named "\uFEFFomx" (leading BOM preserved by Bash).
+					await writeFile(join(lexicalAttackerDir, "\uFEFFomx"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(lexicalAttackerDir, "\uFEFFomx"), 0o755);
+					// Files literally named "omx<VT>--help" / "omx<FF>--help" (single
+					// words to the real shell -- Bash does not treat U+000B/U+000C as
+					// blanks either, only ASCII space/tab/newline).
+					await writeFile(join(lexicalAttackerDir, "omx\v--help"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(lexicalAttackerDir, "omx\v--help"), 0o755);
+					await writeFile(join(lexicalAttackerDir, "omx\f--help"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(lexicalAttackerDir, "omx\f--help"), 0o755);
+					const previousLexicalPath = process.env.PATH;
+					// Attacker directory first, then the legitimate trusted CLI later on PATH.
+					process.env.PATH = `${lexicalAttackerDir}:${trustedBinDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
+					try {
+						await assertBlocked("env-wrapped omx --help stays blocked", "env omx --help");
+						await assertBlocked("command-wrapped omx --help stays blocked", "command omx --help");
+						await assertBlocked("time-wrapped omx --help stays blocked", "time omx --help");
+						await assertBlocked(
+							"embedded NBSP between omx and --help stays blocked",
+							"omx\u00A0--help",
+						);
+						await assertBlocked(
+							"leading BOM before omx --help stays blocked",
+							"\uFEFFomx --help",
+						);
+						await assertBlocked(
+							"embedded vertical tab between omx and --help stays blocked",
+							"omx\v--help",
+						);
+						await assertBlocked(
+							"embedded form feed between omx and --help stays blocked",
+							"omx\f--help",
+						);
+					} finally {
+						if (previousLexicalPath === undefined) delete process.env.PATH; else process.env.PATH = previousLexicalPath;
+						await rm(lexicalAttackerDir, { recursive: true, force: true });
+					}
+				}
+
+				// Guards that must NOT relax: unsafe sparkshell modes, mutation-shaped
+				// wrapped argv, raw redirects into own session state, active-state
+				// overrides, and PATH-prefix smuggling on `omx cancel`. Nested help is
+				// allowed only in parser positions that short-circuit before side effects;
+				// trailing help on mutators must remain blocked. A `--help` meant for a
+				// sparkshell-wrapped script must not short-circuit scrutiny of that
+				// wrapped script, and every inherited or leading sidecar/cache identity
+				// override must deny the sparkshell allowance entirely.
+				await assertBlocked("sparkshell --shell mode stays scrutinized", "omx sparkshell --shell 'git status --short --branch'");
+				await assertBlocked("sparkshell tmux-pane mode stays scrutinized", "omx sparkshell --tmux-pane %42");
+				await assertBlocked("sparkshell trailing help does not short-circuit shell mode", "omx sparkshell --shell 'git status --short --branch' --help");
+				await assertBlocked("auth trailing help does not short-circuit slot mutation", "omx auth use slot --help");
+				await assertBlocked(
+					"workflow mutator trailing help does not short-circuit execution",
+					"omx performance-goal create --objective x --evaluator-command true --evaluator-contract x --help",
+				);
+				await assertBlocked("sparkshell wrapped write stays blocked", `omx sparkshell -- bash -c 'echo x > src/generated.ts'`);
+				await assertBlocked("omx cleanup --version stays blocked (not a bare top-level probe)", "omx cleanup --version");
+				await assertBlocked("omx cleanup -v stays blocked (not a bare top-level probe)", "omx cleanup -v");
+				await assertBlocked(
+					"sparkshell-wrapped --help meant for the wrapped script stays scrutinized",
+					"omx sparkshell -- ./mutate.sh --help",
+				);
+				for (const [name, value] of [
+					["OMX_SPARKSHELL_BIN", "/tmp/attacker-sidecar"],
+					["OMX_NATIVE_CACHE_DIR", "/tmp/attacker-native-cache"],
+					["OMX_NATIVE_MANIFEST_URL", "https://attacker.invalid/manifest.json"],
+					["OMX_NATIVE_RELEASE_BASE_URL", "https://attacker.invalid/releases"],
+					["OMX_NATIVE_AUTO_FETCH", "0"],
+					["XDG_CACHE_HOME", "/tmp/attacker-xdg-cache"],
+					["LOCALAPPDATA", "/tmp/attacker-localappdata"],
+				] as const) {
+					const previous = process.env[name];
+					process.env[name] = value;
+					try {
+						await assertBlocked(`inherited ${name} override denies the sparkshell allowance`, "omx sparkshell -- git status --short --branch");
+					} finally {
+						if (previous === undefined) delete process.env[name];
+						else process.env[name] = previous;
+					}
+					await assertBlocked(`leading ${name} override denies the sparkshell allowance`, `${name}=${JSON.stringify(value)} omx sparkshell -- git status --short --branch`);
+					await assertBlocked(`env-wrapper ${name} override denies the sparkshell allowance`, `env ${name}=${JSON.stringify(value)} omx sparkshell -- git status --short --branch`);
+				}
+				await assertBlocked(
+					"raw redirect into own session state",
+					`echo '{}' > ${join(sessionDir, "deep-interview-state.json")}`,
+					/is not under allowed deep-interview artifact/,
+				);
+				await assertBlocked(
+					"active-state override via omx state write stays blocked",
+					`omx state write --input '${JSON.stringify({ mode: "deep-interview", active: true, current_phase: "planning", session_id: sessionId, workingDirectory: cwd })}' --json`,
+				);
+				await assertBlocked("PATH-prefix smuggled omx cancel stays blocked", `PATH="${trustedBinDir}" omx cancel`, /PATH|write intent/);
+			} finally {
+				if (inheritedPath === undefined) delete process.env.PATH; else process.env.PATH = inheritedPath;
+				for (const name of unsafeRuntimeEnvironmentNames) {
+					if (inheritedUnsafeRuntimeEnvironment[name] === undefined) delete process.env[name];
+					else process.env[name] = inheritedUnsafeRuntimeEnvironment[name];
+				}
+				for (const name of sparkshellImplementationEnvironmentNames) {
+					const previous = (inheritedSparkshellImplementationEnvironment as Record<string, string | undefined>)[name];
+					if (previous === undefined) delete process.env[name];
+					else process.env[name] = previous;
+				}
+				await rm(trustedBinDir, { recursive: true, force: true });
+			}
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("issue #3314 permits ralplan planning read-only discovery without relaxing write guards", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-issue-3314-ralplan-"));
+		try {
+			const stateDir = join(cwd, ".omx", "state");
+			const sessionId = "sess-issue-3314-ralplan";
+			const threadId = "thread-issue-3314-ralplan";
+			const sessionDir = join(stateDir, "sessions", sessionId);
+			await mkdir(sessionDir, { recursive: true });
+			await writeJson(join(stateDir, "session.json"), { session_id: sessionId, cwd, leader_thread_id: threadId });
+			await writeJson(join(stateDir, "subagent-tracking.json"), {
+				schemaVersion: 1,
+				sessions: {
+					[sessionId]: {
+						session_id: sessionId,
+						leader_thread_id: threadId,
+						threads: { [threadId]: { thread_id: threadId, kind: "leader" } },
+					},
+				},
+			});
+			await writeJson(join(sessionDir, "skill-active-state.json"), {
+				version: 1,
+				active: true,
+				skill: "ralplan",
+				phase: "planning",
+				session_id: sessionId,
+				active_skills: [{ skill: "ralplan", phase: "planning", active: true, session_id: sessionId }],
+			});
+			await writeJson(join(sessionDir, "ralplan-state.json"), {
+				active: true,
+				mode: "ralplan",
+				current_phase: "planning",
+				session_id: sessionId,
+			});
+			await writeFile(join(cwd, "README.md"), "foo bar\n");
+
+			const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+			const trustedBinDir = await mkdtemp(join(tmpdir(), "omx-issue-3314-ralplan-trusted-bin-"));
+			await symlink(workspacePackageCli, join(trustedBinDir, "omx"));
+			const inheritedPath = process.env.PATH;
+			process.env.PATH = `${trustedBinDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
+			const unsafeRuntimeEnvironmentNames = [
+				"NODE_OPTIONS",
+				"OPENSSL_CONF",
+				"NODE_V8_COVERAGE",
+				"NODE_COMPILE_CACHE",
+				"NODE_REDIRECT_WARNINGS",
+				"NODE_REPORT_DIRECTORY",
+				"NODE_REPORT_FILENAME",
+			] as const;
+			const inheritedUnsafeRuntimeEnvironment = Object.fromEntries(
+				unsafeRuntimeEnvironmentNames.map((name) => [name, process.env[name]]),
+			);
+			for (const name of unsafeRuntimeEnvironmentNames) delete process.env[name];
+			const sparkshellImplementationEnvironmentNames = [
+				"OMX_SPARKSHELL_BIN",
+				"OMX_NATIVE_CACHE_DIR",
+				"OMX_NATIVE_MANIFEST_URL",
+				"OMX_NATIVE_RELEASE_BASE_URL",
+				"OMX_NATIVE_AUTO_FETCH",
+				"XDG_CACHE_HOME",
+				"LOCALAPPDATA",
+			] as const;
+			const inheritedSparkshellImplementationEnvironment = Object.fromEntries(
+				sparkshellImplementationEnvironmentNames.map((name) => [name, process.env[name]]),
+			);
+			for (const name of sparkshellImplementationEnvironmentNames) delete process.env[name];
+
+			const preToolUse = (command: string) => dispatchCodexNativeHook({
+				hook_event_name: "PreToolUse",
+				cwd,
+				session_id: sessionId,
+				thread_id: threadId,
+				agent_id: threadId,
+				tool_name: "Bash",
+				tool_use_id: `tool-issue-3314-ralplan-${Math.random()}`,
+				tool_input: { command },
+			}, { cwd });
+			const assertAllowed = async (label: string, command: string) => {
+				const result = await preToolUse(command);
+				assert.equal(result.outputJson, null, `${label}: ${JSON.stringify(result.outputJson)}`);
+			};
+			const assertBlocked = async (label: string, command: string) => {
+				const result = await preToolUse(command);
+				assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block", label);
+			};
+
+			try {
+				await assertAllowed("plain git status", "git status --short --branch");
+				await assertAllowed("plain find", "find . -maxdepth 3 -type d");
+				await assertAllowed("omx --help", "omx --help");
+				await assertAllowed("omx ralplan --help", "omx ralplan --help");
+				await assertAllowed("omx state read --mode ralplan --json", "omx state read --mode ralplan --json");
+				await assertAllowed("omx state get-status --mode ralplan --json", "omx state get-status --mode ralplan --json");
+				await assertBlocked("invalid state status spelling stays blocked", "omx state status --mode ralplan --json");
+				await assertAllowed("sparkshell wrapped git status", "omx sparkshell -- git status --short --branch");
+
+				{
+					const impostorBinDir = await mkdtemp(join(tmpdir(), "omx-impostor-bin-ralplan-"));
+					await writeFile(join(impostorBinDir, "omx"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(impostorBinDir, "omx"), 0o755);
+					try {
+						await assertBlocked("PATH-prefix impostor omx --help stays blocked", `PATH="${impostorBinDir}" omx --help`);
+						await assertBlocked(
+							"PATH-prefix impostor omx sparkshell stays blocked",
+							`PATH="${impostorBinDir}" omx sparkshell -- git status --short --branch`,
+						);
+					} finally {
+						await rm(impostorBinDir, { recursive: true, force: true });
+					}
+				}
+
+				{
+					const gjcTrustedBinDir = await mkdtemp(join(tmpdir(), "omx-gjc-trusted-bin-ralplan-"));
+					await symlink(workspacePackageCli, join(gjcTrustedBinDir, "gjc"));
+					const previousGjcPath = process.env.PATH;
+					process.env.PATH = `${gjcTrustedBinDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
+					try {
+						await assertAllowed("trusted gjc --help", "gjc --help");
+					} finally {
+						if (previousGjcPath === undefined) delete process.env.PATH; else process.env.PATH = previousGjcPath;
+						await rm(gjcTrustedBinDir, { recursive: true, force: true });
+					}
+				}
+
+				await assertBlocked("sparkshell --shell mode stays scrutinized", "omx sparkshell --shell 'git status --short --branch'");
+				await assertBlocked("sparkshell tmux-pane mode stays scrutinized", "omx sparkshell --tmux-pane %42");
+				await assertBlocked("sparkshell trailing help does not short-circuit shell mode", "omx sparkshell --shell 'git status --short --branch' --help");
+				await assertBlocked("auth trailing help does not short-circuit slot mutation", "omx auth use slot --help");
+				await assertBlocked(
+					"workflow mutator trailing help does not short-circuit execution",
+					"omx performance-goal create --objective x --evaluator-command true --evaluator-contract x --help",
+				);
+				await assertBlocked("sparkshell wrapped write stays blocked", `omx sparkshell -- bash -c 'echo x > src/generated.ts'`);
+				await assertBlocked("omx cleanup --version stays blocked (not a bare top-level probe)", "omx cleanup --version");
+				await assertBlocked(
+					"sparkshell-wrapped --help meant for the wrapped script stays scrutinized",
+					"omx sparkshell -- ./mutate.sh --help",
+				);
+				for (const [name, value] of [
+					["OMX_SPARKSHELL_BIN", "/tmp/attacker-sidecar"],
+					["OMX_NATIVE_CACHE_DIR", "/tmp/attacker-native-cache"],
+					["OMX_NATIVE_MANIFEST_URL", "https://attacker.invalid/manifest.json"],
+					["OMX_NATIVE_RELEASE_BASE_URL", "https://attacker.invalid/releases"],
+					["OMX_NATIVE_AUTO_FETCH", "0"],
+					["XDG_CACHE_HOME", "/tmp/attacker-xdg-cache"],
+					["LOCALAPPDATA", "/tmp/attacker-localappdata"],
+				] as const) {
+					const previous = process.env[name];
+					process.env[name] = value;
+					try {
+						await assertBlocked(`inherited ${name} override denies the sparkshell allowance`, "omx sparkshell -- git status --short --branch");
+					} finally {
+						if (previous === undefined) delete process.env[name];
+						else process.env[name] = previous;
+					}
+					await assertBlocked(`leading ${name} override denies the sparkshell allowance`, `${name}=${JSON.stringify(value)} omx sparkshell -- git status --short --branch`);
+				}
+				await assertBlocked(
+					"raw redirect into own session state",
+					`echo '{}' > ${join(sessionDir, "ralplan-state.json")}`,
+				);
+			} finally {
+				if (inheritedPath === undefined) delete process.env.PATH; else process.env.PATH = inheritedPath;
+				for (const name of unsafeRuntimeEnvironmentNames) {
+					if (inheritedUnsafeRuntimeEnvironment[name] === undefined) delete process.env[name];
+					else process.env[name] = inheritedUnsafeRuntimeEnvironment[name];
+				}
+				for (const name of sparkshellImplementationEnvironmentNames) {
+					const previous = (inheritedSparkshellImplementationEnvironment as Record<string, string | undefined>)[name];
+					if (previous === undefined) delete process.env[name];
+					else process.env[name] = previous;
+				}
+				await rm(trustedBinDir, { recursive: true, force: true });
+			}
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	it("does not protect matching state basenames outside the canonical state root", async () => {
@@ -13716,7 +14304,7 @@ exit 0
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	it("allows canonical leader deep-interview artifact and state writes while blocking implementation Bash writes", async () => {
+	it("allows canonical leader deep-interview artifact and state writes while blocking implementation Bash writes", async () => withCleanAmbientNodeRuntimeEnvironment(async () => {
 		const cwd = realpathSync(await mkdtemp(
 			join(tmpdir(), "omx-native-hook-pretool-deep-interview-artifact-"),
 		));
@@ -18108,9 +18696,9 @@ exit 0
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}));
 
-	it("allows canonical leader ralplan complete terminal state writes while blocking partial deactivation writes", async () => {
+	it("allows canonical leader ralplan complete terminal state writes while blocking partial deactivation writes", async () => withCleanAmbientNodeRuntimeEnvironment(async () => {
 		const cwd = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-pretool-ralplan-state-input-file-"),
 		);
@@ -18675,7 +19263,7 @@ exit 0
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}));
 
 	it("emits hook-specific deny ralplan PreToolUse JSON for wrapped implementation writes on the live CLI path", async () => {
 		const cwd = await mkdtemp(
@@ -33090,7 +33678,7 @@ PY`,
     }
   });
 
-  it("uses hook-native agent_id as child provenance without borrowing Team or legacy identity", async () => {
+  it("uses hook-native agent_id as child provenance without borrowing Team or legacy identity", async () => withCleanAmbientNodeRuntimeEnvironment(async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-conductor-agent-id-"));
     const originalTeamWorker = process.env.OMX_TEAM_WORKER;
     const originalInternalTeamWorker = process.env.OMX_TEAM_INTERNAL_WORKER;
@@ -33806,7 +34394,7 @@ PY`,
       else process.env.GJC_SESSION_ID = originalGjcSessionId;
       await rm(cwd, { recursive: true, force: true });
     }
-  });
+  }));
 
   it("keeps active Ralph starting phase behind the PreToolUse write guard", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-starting-pretool-"));
@@ -35136,8 +35724,19 @@ PY`,
   it("blocks non-shell direct writes in Main-root conductor states", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-conductor-bash-mutations-"));
     const previousPath = process.env.PATH;
+    const unsafeRuntimeEnvNames = [
+      "NODE_OPTIONS",
+      "OPENSSL_CONF",
+      "NODE_V8_COVERAGE",
+      "NODE_COMPILE_CACHE",
+      "NODE_REDIRECT_WARNINGS",
+      "NODE_REPORT_DIRECTORY",
+      "NODE_REPORT_FILENAME",
+    ] as const;
+    const previousRuntimeEnv = Object.fromEntries(unsafeRuntimeEnvNames.map((name) => [name, process.env[name]]));
     try {
       process.env.PATH = `${dirname(process.execPath)}:/usr/bin:/bin`;
+      for (const name of unsafeRuntimeEnvNames) delete process.env[name];
       const stateDir = join(cwd, ".omx", "state");
       const sessionId = "sess-conductor-bash-mutations";
       await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
@@ -35230,6 +35829,10 @@ PY`,
     } finally {
       if (typeof previousPath === "string") process.env.PATH = previousPath;
       else delete process.env.PATH;
+      for (const name of unsafeRuntimeEnvNames) {
+        if (previousRuntimeEnv[name] === undefined) delete process.env[name];
+        else process.env[name] = previousRuntimeEnv[name];
+      }
       await rm(cwd, { recursive: true, force: true });
     }
   });

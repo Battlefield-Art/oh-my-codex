@@ -1,7 +1,7 @@
 import { execFileSync } from "child_process";
 import { accessSync, closeSync, constants as fsConstants, existsSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from "fs";
 import { appendFile, lstat, mkdir, open, readFile, readdir, stat, unlink, writeFile } from "fs/promises";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "path";
+import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from "path";
 import { createHash } from "crypto";
 
 import { fileURLToPath, pathToFileURL } from "url";
@@ -6531,7 +6531,20 @@ function tokenizeShellWords(segment: string): string[] {
       }
       continue;
     }
-    if (!quote && /\s/.test(char)) {
+    // Bash's own lexer treats ONLY ASCII space, tab, and newline as
+    // word-separating blanks. It does NOT split on any other whitespace --
+    // not Unicode whitespace (NBSP U+00A0, BOM U+FEFF, Zs-class spaces,
+    // U+2028/2029), and not other ASCII control characters either (CR, VT,
+    // FF are literal bytes within a word to Bash, confirmed empirically via
+    // `bash -c`). JS regex `\s` (and an earlier, still-too-broad fix that
+    // additionally special-cased CR/VT/FF) previously let an embedded
+    // whitespace/control character make this tokenizer see two words
+    // ("omx", "--help") while Bash resolves and executes a single,
+    // differently-named executable ("omx<NBSP>--help", "omx<VT>--help",
+    // etc.) -- silently borrowing a trusted lookup for a different,
+    // attacker-controlled binary. Restrict this split to exactly the three
+    // characters Bash's own lexer recognizes as blanks.
+    if (!quote && (char === " " || char === "\t" || char === "\n")) {
       pushCurrent();
       continue;
     }
@@ -9374,24 +9387,252 @@ function isAllowedOmxCleanupDryRunCommand(command: string): boolean {
   if (!isSingleLiteralShellInvocation(command)) return false;
   const words = literalInvocationWords(command);
   const index = skipLiteralLeadingAssignments(words);
-  if (commandNameFromShellWord(words[index] ?? "") !== "omx") return false;
+  if (!["omx", "gjc"].includes(commandNameFromShellWord(words[index] ?? ""))) return false;
   const args = words.slice(index + 1).filter(Boolean);
   return args[0] === "cleanup"
     && args.includes("--dry-run")
     && args.every((arg, argIndex) => argIndex === 0 || arg === "--dry-run" || arg === "--json");
 }
 
-function isAllowedOmxReadOnlyCommand(command: string): boolean {
+function stateReadTrailingArgsAreSafe(trailing: string[]): boolean {
+  if (trailing.length === 1 && (trailing[0] === "--help" || trailing[0] === "-h" || trailing[0] === "help")) return true;
+  let sawMode = false;
+  let sawJson = false;
+  for (let index = 0; index < trailing.length; index += 1) {
+    const arg = trailing[index] ?? "";
+    if (arg === "--json") {
+      if (sawJson) return false;
+      sawJson = true;
+      continue;
+    }
+    if (arg === "--mode") {
+      if (sawMode) return false;
+      const value = trailing[index + 1] ?? "";
+      if (!value || value.startsWith("-")) return false;
+      sawMode = true;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--mode=")) {
+      if (sawMode || !arg.slice("--mode=".length)) return false;
+      sawMode = true;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+// Sparkshell's direct-argv dispatch (`omx sparkshell [--json] [--budget N] --
+// <argv...>`) executes the wrapped argv without shell reinterpretation, so
+// each wrapped word is already a literal token. Re-quoting those literal
+// tokens into a synthetic single-invocation command string lets the wrapped
+// invocation be re-scrutinized through the exact same write-intent checks
+// used for a directly-typed command, instead of trusting a bespoke allowlist.
+// `--shell`/`--tmux-pane`/any unrecognized sparkshell flag is refused (return
+// null) because those modes are not literal, bounded argv dispatch.
+function extractOmxSparkshellDirectArgvCommand(args: readonly string[]): string | null {
+  if (args[0] !== "sparkshell") return null;
+  let index = 1;
+  while (index < args.length) {
+    const arg = args[index] ?? "";
+    if (arg === "--") {
+      const wrapped = args.slice(index + 1);
+      if (wrapped.length === 0) return null;
+      return wrapped.map((word) => `'${word.replace(/'/g, `'\\''`)}'`).join(" ");
+    }
+    if (arg === "--json") {
+      index += 1;
+      continue;
+    }
+    if (arg === "--budget") {
+      const value = args[index + 1] ?? "";
+      if (!/^[1-9][0-9]*$/.test(value)) return null;
+      index += 2;
+      continue;
+    }
+    return null;
+  }
+  return null;
+}
+
+function isAllowedOmxSparkshellWrappedReadOnlyCommand(wrappedCommand: string): boolean {
+  if ([...OMX_SPARKSHELL_IMPLEMENTATION_ENV_NAMES].some(environmentNameIsPresent)) return false;
+  return !commandHasDeepInterviewWriteIntent(wrappedCommand)
+    && !commandHasNestedCliMutationIntent(wrappedCommand)
+    && collectOmxStateCommandOperations(wrappedCommand, "write").length === 0;
+}
+
+// The read-only allowlist (help/version/status/read, sparkshell-wrapped
+// discovery) must not authorize based on the bare `omx`/`gjc` basename alone:
+// an attacker-controlled PATH prefix, a path-qualified impostor executable
+// (absolute OR relative -- `./omx` resolves via the current directory, never
+// via PATH, so a basename-only trust check can be fooled by a legitimate
+// trusted `omx` existing elsewhere on PATH while a *different* `./omx` is
+// what the shell actually executes), or an inherited BASH_FUNC_omx%%/gjc%%
+// shell-function shadow could otherwise be granted this allowance regardless
+// of what it actually does, since the caller returns immediately on a
+// positive match. Share the exact trusted-package-CLI execution-context
+// proof already used for the direct-cancel path (including its literal bare
+// command-word grammar, function-shadow rejection, and inherited
+// NODE_OPTIONS/OPENSSL_CONF/Node-output-environment checks) so both paths
+// can never drift apart.
+
+const OMX_SPARKSHELL_IMPLEMENTATION_ENV_NAMES = new Set([
+  "OMX_SPARKSHELL_BIN",
+  "OMX_NATIVE_CACHE_DIR",
+  "OMX_NATIVE_MANIFEST_URL",
+  "OMX_NATIVE_RELEASE_BASE_URL",
+  "OMX_NATIVE_AUTO_FETCH",
+  "XDG_CACHE_HOME",
+  "LOCALAPPDATA",
+]);
+
+function environmentNameIsPresent(name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(process.env, name);
+}
+
+function commandHasLeadingEnvironmentName(command: string, names: ReadonlySet<string>): boolean {
+  const segments = splitShellCommandSegments(
+    stripHeredocBodiesForCommandScan(normalizeShellLineContinuations(command)),
+  );
+  for (const segment of segments) {
+    const words = tokenizeShellWords(segment);
+    const commandIndex = findWrappedCommandPositionIndex(words, 0);
+    const prefix = commandIndex === null ? words : words.slice(0, commandIndex);
+    if (prefix.some((word) => isEnvironmentAssignmentWord(word) && names.has(shellAssignmentName(word)))) return true;
+  }
+  return false;
+}
+
+function sparkshellImplementationOverrideIsPresent(command?: string): boolean {
+  if ([...OMX_SPARKSHELL_IMPLEMENTATION_ENV_NAMES].some(environmentNameIsPresent)) return true;
+  return command ? commandHasLeadingEnvironmentName(command, OMX_SPARKSHELL_IMPLEMENTATION_ENV_NAMES) : false;
+}
+const OMX_GJC_TRUSTED_CONTEXT_UNSAFE_INHERITED_ENV_NAMES = [
+  "NODE_OPTIONS",
+  "OPENSSL_CONF",
+];
+
+function omxOrGjcExecutionContextIsTrusted(
+  command: string,
+  cwd: string,
+  allowedCommandWords: readonly string[],
+): boolean {
+  if (commandHasUnsafeConductorShellState(command, cwd)) return false;
+  if (allowedCommandWords.some((name) => safeString(process.env[`BASH_FUNC_${name}%%`]).trim() !== "")) return false;
+  const unsafeInheritedNames = [...OMX_GJC_TRUSTED_CONTEXT_UNSAFE_INHERITED_ENV_NAMES, ...CONDUCTOR_NODE_OUTPUT_ENVIRONMENT_NAMES];
+  if (unsafeInheritedNames.some((name) => safeString(process.env[name]).trim() !== "")) return false;
+  if (commandHasUnsafeDynamicLoaderEnvironment(command)) return false;
+  if (commandHasUnsafeLeadingRuntimeEnvironment(command)) return false;
+  const words = tokenizeConductorShellWords(command);
+  const index = skipShellCommandPositionPrefixWords(words, 0);
+  // Require the literal bare command word (no path separator at all, not
+  // just an unqualified basename) so a relative or absolute impostor never
+  // borrows a trusted PATH resolution that belongs to a different, unrelated
+  // `omx`/`gjc` entry.
+  const commandWord = shellWordLiteral(words[index] ?? "");
+  if (!allowedCommandWords.includes(commandWord)) return false;
+  return conductorCommandResolvesTrustedPackageCli(words, 0, index, createConductorRuntimeShellState(cwd), cwd);
+}
+
+function isTrustedOmxOrGjcReadOnlyInvocation(command: string, cwd: string): boolean {
+  if (!isSingleLiteralShellInvocation(command)) return false;
+  return omxOrGjcExecutionContextIsTrusted(command, cwd, ["omx", "gjc"]);
+}
+const OMX_NESTED_HELP_COMMANDS = new Set([
+  "adapt",
+  "agents",
+  "agents-init",
+  "api",
+  "ask",
+  "autoresearch",
+  "autoresearch-goal",
+  "auth",
+  "capabilities",
+  "cleanup",
+  "deepinit",
+  "explore",
+  "hooks",
+  "hud",
+  "list",
+  "mcp-serve",
+  "mission",
+  "performance-goal",
+  "question",
+  "ralplan",
+  "ralph",
+  "resume",
+  "session",
+  "sidecar",
+  "sparkshell",
+  "state",
+  "team",
+  "tmux-hook",
+  "trace",
+  "ultragoal",
+  "url",
+  "wiki",
+]);
+const OMX_STATE_READ_ONLY_OPERATIONS = new Set(["read", "get-status"]);
+const OMX_HELP_TOKENS = new Set(["--help", "-h"]);
+
+function isAllowedOmxNestedHelpForm(args: readonly string[]): boolean {
+  if (args.length === 2 && OMX_NESTED_HELP_COMMANDS.has(args[0] ?? "")) {
+    return OMX_HELP_TOKENS.has(args[1] ?? "");
+  }
+  if (
+    args.length === 3
+    && args[0] === "state"
+    && OMX_STATE_READ_ONLY_OPERATIONS.has(args[1] ?? "")
+  ) {
+    return OMX_HELP_TOKENS.has(args[2] ?? "") || args[2] === "help";
+  }
+  return args.length === 2 && args[0] === "auth" && args[1] === "help";
+}
+
+// Shape-only recognizer (no trust check): true when `command` syntactically
+// resembles an OMX/GJC read-only surface or a recognized-but-sensitive
+// invocation that must be hard-denied when its strict parser form is not met.
+// It prevents the generic write-intent scanner from silently re-authorizing an
+// untrusted binary, shell-function shadow, invalid state spelling, or unsafe
+// sparkshell mode.
+function omxOrGjcReadOnlyShapeMatches(command: string): boolean {
   if (!isSingleLiteralShellInvocation(command)) return false;
   const words = literalInvocationWords(command);
   const index = skipLiteralLeadingAssignments(words);
-  if (commandNameFromShellWord(words[index] ?? "") !== "omx") return false;
+  const commandName = commandNameFromShellWord(words[index] ?? "");
+  if (commandName !== "omx" && commandName !== "gjc") return false;
   const args = words.slice(index + 1).filter(Boolean);
   if (args.length === 0) return false;
   if (args.some((arg) => arg === "--help" || arg === "-h" || arg === "--version" || arg === "-v")) return true;
   if (args[0] === "help" || args[0] === "status" || args[0] === "version") return true;
-  if (args[0] === "state" && ["read", "status"].includes(args[1] ?? "")) {
-    return args.slice(2).every((arg) => arg === "--json");
+  if (args[0] === "state" && ["read", "get-status", "status"].includes(args[1] ?? "")) return true;
+  if (args[0] === "sparkshell") return true;
+  return args[0] === "cleanup" && args.includes("--dry-run");
+}
+
+function isAllowedOmxReadOnlyCommand(command: string, cwd: string): boolean {
+  if (!isTrustedOmxOrGjcReadOnlyInvocation(command, cwd)) return false;
+  const words = literalInvocationWords(command);
+  const index = skipLiteralLeadingAssignments(words);
+  const commandName = commandNameFromShellWord(words[index] ?? "");
+  if (commandName !== "omx" && commandName !== "gjc") return false;
+  const args = words.slice(index + 1).filter(Boolean);
+  if (args.length === 0) return false;
+
+  if (args[0] === "sparkshell") {
+    if (sparkshellImplementationOverrideIsPresent(command)) return false;
+    if (args.length === 2 && OMX_HELP_TOKENS.has(args[1] ?? "")) return true;
+    const sparkshellWrapped = extractOmxSparkshellDirectArgvCommand(args);
+    return sparkshellWrapped !== null && isAllowedOmxSparkshellWrappedReadOnlyCommand(sparkshellWrapped);
+  }
+
+  if (args.length === 1 && (args[0] === "--help" || args[0] === "-h" || args[0] === "--version" || args[0] === "-v")) return true;
+  if (args.length === 1 && (args[0] === "help" || args[0] === "status" || args[0] === "version")) return true;
+  if (isAllowedOmxNestedHelpForm(args)) return true;
+  if (args[0] === "state" && OMX_STATE_READ_ONLY_OPERATIONS.has(args[1] ?? "")) {
+    return stateReadTrailingArgsAreSafe(args.slice(2));
   }
   return isAllowedOmxCleanupDryRunCommand(command);
 }
@@ -9418,16 +9659,27 @@ function isAllowedGhReadOnlyCommand(command: string): boolean {
 function isAllowedDeepInterviewCommandSpecificBash(
   payload: CodexHookPayload,
   command: string,
+  cwd: string,
 ): boolean {
   const questionClassification = classifyOmxQuestionPreToolUse(command, payload);
   if (questionClassification.kind === "allowed") return true;
-  // A command shaped like direct cancellation must never fall through to a
-  // generic allowance: when the trusted execution context cannot be proven,
-  // the exemption denies rather than degrading to the ordinary benign path.
+  // Parity with the ralplan/Conductor trusted direct-cancel path (#3313): a
+  // standalone (non-Autopilot-supervised) deep-interview session has no
+  // hook-owned cancellation handler, so `omx cancel` must still reach the
+  // same trusted-execution-context check ralplan already applies rather than
+  // being denied unconditionally. An unproven execution context still denies.
   if (readPreToolUseRawCommand(payload) === command && isDirectOmxCancelCommand(command)) {
-    return false;
+    return directOmxCancelCommandHasTrustedExecutionContext(command, cwd);
   }
-  return isAllowedOmxReadOnlyCommand(command)
+  // Authorization decisions whose security contract depends on exact bytes
+  // must compare against the unmodified command string, matching the
+  // direct-cancel exemption above: ECMAScript trim() removes a leading
+  // BOM/NBSP/CR from the analyzed `command`, which could otherwise let a
+  // differently-named executable (e.g. `\uFEFFomx`) borrow the trusted
+  // `omx`/`gjc` read-only allowance while the shell actually executes the
+  // untrimmed, differently-named binary.
+  if (readPreToolUseRawCommand(payload) !== command) return false;
+  return isAllowedOmxReadOnlyCommand(command, cwd)
     || isAllowedGhReadOnlyCommand(command)
     || isAllowedVersionProbeCommand(command);
 }
@@ -9435,20 +9687,10 @@ function isAllowedDeepInterviewCommandSpecificBash(
 // The pre-#3293 direct-cancel trust check is retained for Ralplan and
 // Conductor. IR2 scopes hook-owned terminalization to Autopilot deep-interview
 // only; those other workflows still execute their existing trusted command.
-const DIRECT_OMX_CANCEL_UNSAFE_INHERITED_ENV_NAMES = [
-  "NODE_OPTIONS",
-  "OPENSSL_CONF",
-];
-
+// Shares omxOrGjcExecutionContextIsTrusted with the read-only allowlist so the
+// two proofs cannot drift apart (see the comment above that helper).
 function directOmxCancelCommandHasTrustedExecutionContext(command: string, cwd: string): boolean {
-  if (commandHasUnsafeConductorShellState(command, cwd)) return false;
-  if (safeString(process.env["BASH_FUNC_omx%%"]).trim() !== "") return false;
-  const unsafeInheritedNames = [...DIRECT_OMX_CANCEL_UNSAFE_INHERITED_ENV_NAMES, ...CONDUCTOR_NODE_OUTPUT_ENVIRONMENT_NAMES];
-  if (unsafeInheritedNames.some((name) => safeString(process.env[name]).trim() !== "")) return false;
-  if (commandHasUnsafeDynamicLoaderEnvironment(command)) return false;
-  if (commandHasUnsafeLeadingRuntimeEnvironment(command)) return false;
-  const words = tokenizeConductorShellWords(command);
-  return conductorCommandResolvesTrustedPackageCli(words, 0, 0, createConductorRuntimeShellState(cwd), cwd);
+  return omxOrGjcExecutionContextIsTrusted(command, cwd, ["omx"]);
 }
 
 function isCommandResolutionSensitiveEnvironmentName(name: string): boolean {
@@ -9491,7 +9733,19 @@ function isAllowedDeepInterviewBashWrite(
     // compound/redirect/substitution form is denied so it cannot smuggle a mutation.
     return questionClassification.kind === "allowed" && isSingleLiteralShellInvocation(command);
   }
-  if (payload && isAllowedDeepInterviewCommandSpecificBash(payload, command)) return true;
+  if (payload && isAllowedDeepInterviewCommandSpecificBash(payload, command, cwd)) return true;
+  // A command that syntactically matches a direct-cancel or read-only omx/gjc
+  // shape but failed that specific check (untrusted execution context,
+  // invalid grammar, unsafe sparkshell mode, etc.) must hard-deny here rather
+  // than fall through to the generic write-intent scanner below: that
+  // scanner has no notion of this allowlist's trust requirement and can
+  // independently conclude "no write intent" for unrelated reasons (e.g. an
+  // inherited BASH_FUNC_omx%%/gjc%% shell-function shadow), silently
+  // re-authorizing exactly what the specific check just refused.
+  if (
+    (payload && readPreToolUseRawCommand(payload) === command && isDirectOmxCancelCommand(command))
+    || omxOrGjcReadOnlyShapeMatches(command)
+  ) return false;
   if (sourcesFileWrittenEarlierInSameCommand(cwd, command)) return false;
   const stateWriteOperations = collectOmxStateCommandOperations(command, "write");
   const hasUnsafeRuntimeStateWrite = (words: string[]): boolean => {
@@ -9667,6 +9921,24 @@ function isAllowedRalplanBashWrite(
   if (rawCommand === command && isDirectOmxCancelCommand(command, { allowForce: true })) {
     return directOmxCancelCommandHasTrustedExecutionContext(command, cwd);
   }
+  // Read-only discovery (help/version/status/read, sparkshell-wrapped
+  // read-only argv, and gh read-only commands) is not implementation intent
+  // and must not be misclassified as a write during ralplan planning (#3314).
+  // Requires raw/analyzed byte equality first, matching the direct-cancel
+  // exemption above: trimming can otherwise let a differently-named
+  // executable (e.g. leading BOM/NBSP) borrow this trusted allowance while
+  // the shell executes a different, untrimmed binary name.
+  if (
+    rawCommand === command
+    && (isAllowedOmxReadOnlyCommand(command, cwd) || isAllowedGhReadOnlyCommand(command) || isAllowedVersionProbeCommand(command))
+  ) {
+    return true;
+  }
+  // Hard-deny a recognized-but-untrusted omx/gjc read-only shape instead of
+  // falling through to the generic write-intent scanner below, which has no
+  // notion of this allowlist's trust requirement (see the identical deny in
+  // isAllowedDeepInterviewBashWrite for the full rationale).
+  if (omxOrGjcReadOnlyShapeMatches(command)) return false;
 
   const beadsCommand = classifyRalplanBeadsMetadataCommand(cwd, command);
   const targets = extractDeepInterviewCommandWriteTargets(command);
@@ -11676,7 +11948,7 @@ function omxCliInvocationHasMutationIntent(words: string[], commandIndex: number
   const commandName = operands[0] ?? "";
   const subcommand = operands[1] ?? "";
   if (!commandName || ["help", "read", "status", "version"].includes(commandName)) return false;
-  if (commandName === "state" && ["read", "status"].includes(subcommand)) return false;
+  if (commandName === "state" && ["read", "get-status"].includes(subcommand)) return false;
   if (["deep-interview", "ralplan", "ralph", "team", "ultragoal"].includes(commandName) && ["read", "status"].includes(subcommand)) return false;
   return true;
 }
@@ -16548,18 +16820,42 @@ function conductorNativeExecutableHeaderIsRecognized(header: Buffer): boolean {
     || header.includes(0);
 }
 
+const CONDUCTOR_WINDOWS_DEFAULT_PATHEXT = [".COM", ".EXE", ".BAT", ".CMD"] as const;
+function conductorPathListDelimiter(): string {
+  return process.platform === "win32" ? ";" : delimiter;
+}
+// Windows resolves a bare command through PATHEXT; enumerate the actual suffix
+// order instead of treating `:` as a universal PATH separator or trusting a
+// basename without proving which executable the shell selected.
+
+function conductorExecutablePathCandidates(directory: string, commandName: string): string[] | null {
+  if (process.platform !== "win32") return [join(directory, commandName)];
+  const rawPathext = process.env.PATHEXT;
+  const suffixes = rawPathext === undefined || rawPathext === ""
+    ? [...CONDUCTOR_WINDOWS_DEFAULT_PATHEXT]
+    : rawPathext.split(conductorPathListDelimiter()).map((suffix) => suffix.trim().toUpperCase()).filter(Boolean);
+  if (suffixes.length === 0 || suffixes.some((suffix) => !/^\.[A-Z0-9]+$/.test(suffix))) return null;
+  return [
+    join(directory, commandName),
+    ...suffixes.map((suffix) => join(directory, `${commandName}${suffix.toLowerCase()}`)),
+  ];
+}
+
 function conductorResolvePathInterpreter(commandName: string, state: ShellPosixState): string | null {
   const path = getConductorShellBinding(state, "PATH").value;
   if (!path || path === CONDUCTOR_UNKNOWN_SHELL_BINDING) return null;
-  for (const entry of path.split(":")) {
+  for (const entry of path.split(conductorPathListDelimiter())) {
     if (!entry || !isAbsolute(entry) || isConductorStaticDirectoryInvalidated(state, resolve(entry))) return null;
-    const candidate = join(entry, commandName);
-    try {
-      accessSync(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      return null;
+    const candidates = conductorExecutablePathCandidates(entry, commandName);
+    if (!candidates) return null;
+    for (const candidate of candidates) {
+      try {
+        accessSync(candidate, fsConstants.X_OK);
+        return candidate;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        return null;
+      }
     }
   }
   return null;
@@ -16623,7 +16919,7 @@ function conductorPathMayResolveRepositoryExecutable(
   } catch {
     return true;
   }
-  for (const entry of path.split(":")) {
+  for (const entry of path.split(conductorPathListDelimiter())) {
     if (!entry || !isAbsolute(entry)) return true;
     let canonical: string;
     try {
@@ -16639,16 +16935,23 @@ function conductorPathMayResolveRepositoryExecutable(
       }
     }
 
-    const candidate = join(entry, commandName);
-    if (!existsSync(candidate)) {
+    const candidates = conductorExecutablePathCandidates(entry, commandName);
+    if (!candidates) return true;
+    let candidate: string | undefined;
+    for (const candidatePath of candidates) {
+      if (existsSync(candidatePath)) {
+        candidate = candidatePath;
+        break;
+      }
       try {
-        lstatSync(candidate);
+        lstatSync(candidatePath);
         return true;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        return true;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
       }
     }
+    if (!candidate) continue;
+
     // An invalidated PATH entry cannot affect resolution when it lacks this command.
     if (
       isConductorStaticDirectoryInvalidated(state, resolve(entry))
@@ -16733,7 +17036,7 @@ function conductorPackageCliHasTrustedNodeInterpreter(candidate: string, state: 
   }
   const path = getConductorShellBinding(state, "PATH").value;
   if (!path || path === CONDUCTOR_UNKNOWN_SHELL_BINDING) return false;
-  for (const entry of path.split(":")) {
+  for (const entry of path.split(conductorPathListDelimiter())) {
     if (!isAbsolute(entry) || isConductorStaticDirectoryInvalidated(state, resolve(entry))) return false;
     try {
       if (!statSync(realpathSync(entry)).isDirectory()) return false;
@@ -16741,16 +17044,22 @@ function conductorPackageCliHasTrustedNodeInterpreter(candidate: string, state: 
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       return false;
     }
-    const nodeCandidate = join(entry, "node");
-    if (!existsSync(nodeCandidate)) {
+    const nodeCandidates = conductorExecutablePathCandidates(entry, "node");
+    if (!nodeCandidates) return false;
+    let nodeCandidate: string | undefined;
+    for (const candidatePath of nodeCandidates) {
+      if (existsSync(candidatePath)) {
+        nodeCandidate = candidatePath;
+        break;
+      }
       try {
-        lstatSync(nodeCandidate);
+        lstatSync(candidatePath);
         return false;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        return false;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
       }
     }
+    if (!nodeCandidate) continue;
     return conductorPackageCliNodeInterpreterIsTrusted(nodeCandidate, rootCwd);
   }
   return false;
@@ -16766,7 +17075,7 @@ function conductorResolvedPackageCliCandidateIsTrusted(
   const expectedCandidate = conductorKnownPackageCliPath(commandName);
   const path = getConductorShellBinding(state, "PATH").value;
   if (!path || path === CONDUCTOR_UNKNOWN_SHELL_BINDING) return false;
-  for (const entry of path.split(":")) {
+  for (const entry of path.split(conductorPathListDelimiter())) {
     if (!isAbsolute(entry)) return false;
     let binDirectory: string;
     try {
@@ -16780,16 +17089,22 @@ function conductorResolvedPackageCliCandidateIsTrusted(
         return false;
       }
     }
-    const candidate = join(binDirectory, commandName);
-    if (!existsSync(candidate)) {
+    const candidates = conductorExecutablePathCandidates(binDirectory, commandName);
+    if (!candidates) return false;
+    let candidate: string | undefined;
+    for (const candidatePath of candidates) {
+      if (existsSync(candidatePath)) {
+        candidate = candidatePath;
+        break;
+      }
       try {
-        lstatSync(candidate);
+        lstatSync(candidatePath);
         return false;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        return false;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
       }
     }
+    if (!candidate) continue;
     try {
       accessSync(candidate, fsConstants.X_OK);
       const trustedCli = expectedCandidate !== null && realpathSync(candidate) === expectedCandidate;

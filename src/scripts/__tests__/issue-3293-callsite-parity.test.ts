@@ -57,13 +57,28 @@ function assertBlocked(result: Awaited<ReturnType<typeof dispatchCodexNativeHook
 async function withTrustedOmx<T>(cwd: string, action: () => Promise<T>): Promise<T> {
 	const binDir = join(cwd, "trusted-bin");
 	const priorPath = process.env.PATH;
+	const unsafeRuntimeEnvNames = [
+		"NODE_OPTIONS",
+		"OPENSSL_CONF",
+		"NODE_V8_COVERAGE",
+		"NODE_COMPILE_CACHE",
+		"NODE_REDIRECT_WARNINGS",
+		"NODE_REPORT_DIRECTORY",
+		"NODE_REPORT_FILENAME",
+	] as const;
+	const priorRuntimeEnv = Object.fromEntries(unsafeRuntimeEnvNames.map((name) => [name, process.env[name]]));
 	await mkdir(binDir, { recursive: true });
 	await symlink(resolve(process.cwd(), "dist", "cli", "omx.js"), join(binDir, "omx"));
 	process.env.PATH = `${binDir}:${dirname(process.execPath)}`;
+	for (const name of unsafeRuntimeEnvNames) delete process.env[name];
 	try { return await action(); }
 	finally {
 		if (priorPath === undefined) delete process.env.PATH;
 		else process.env.PATH = priorPath;
+		for (const name of unsafeRuntimeEnvNames) {
+			if (priorRuntimeEnv[name] === undefined) delete process.env[name];
+			else process.env[name] = priorRuntimeEnv[name];
+		}
 	}
 }
 
@@ -85,7 +100,7 @@ describe("issue #3293 callsite parity baseline", () => {
 
 	it("deep-interview ~9498: non-cancel read-only OMX command is allowed", async () => {
 		const f = await fixture("deep-interview", "readonly");
-		try { assert.equal((await preToolUse(f, "omx state read --json")).outputJson, null); }
+		try { await withTrustedOmx(f.cwd, async () => assert.equal((await preToolUse(f, "omx state read --json")).outputJson, null)); }
 		finally { await rm(f.cwd, { recursive: true, force: true }); }
 	});
 
