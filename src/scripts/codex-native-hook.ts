@@ -17536,11 +17536,15 @@ function conductorPathnameExpansionIsAmbiguous(path: string): boolean {
 
 function normalizeWgetMutationTargets(targets: string[], effectiveCwd: string, rootCwd: string): string[] | null {
   const normalized: string[] = [];
+  const canonicalEffectiveCwd = canonicalizeComparablePath(effectiveCwd);
+  const canonicalRootCwd = canonicalizeComparablePath(rootCwd);
   for (const target of targets) {
     if (isUnresolvedVariableTarget(target) || /[`$]/.test(target) || conductorPathnameExpansionIsAmbiguous(target)) return null;
     try {
-      const absoluteTarget = isAbsolute(target) ? resolve(target) : resolve(effectiveCwd, target);
-      normalized.push(relative(rootCwd, absoluteTarget).replace(/\\/g, "/") || ".");
+      const absoluteTarget = isAbsolute(target)
+        ? canonicalizeComparablePath(target)
+        : resolve(canonicalEffectiveCwd, target);
+      normalized.push(relative(canonicalRootCwd, absoluteTarget).replace(/\\/g, "/") || ".");
     } catch {
       return null;
     }
