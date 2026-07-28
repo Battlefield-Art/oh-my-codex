@@ -33255,6 +33255,101 @@ PY`,
     }
   });
 
+  it("allows the exact installed omx CLI by absolute path for Main-root read-only commands (#3333)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-absolute-cli-readonly-"));
+    const installRoot = await mkdtemp(join(tmpdir(), "omx-native-hook-user-install-"));
+    const originalOmxEnvironment = Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => /^(?:OMX|GJC)_/.test(name)),
+    );
+    const originalPath = process.env.PATH;
+    const originalBashEnv = process.env.BASH_ENV;
+    try {
+      for (const name of Object.keys(process.env)) {
+        if (/^(?:OMX|GJC)_/.test(name)) delete process.env[name];
+      }
+      process.env.OMX_ROOT = cwd;
+      process.env.PATH = `${dirname(process.execPath)}:/usr/bin:/bin`;
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-conductor-absolute-cli-readonly";
+      const leaderThreadId = "thread-conductor-absolute-cli-readonly-leader";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      await writeCanonicalLeaderFixture(stateDir, sessionId, leaderThreadId, cwd);
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "executing");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "executing",
+        session_id: sessionId,
+      });
+      const absoluteOmx = join(installRoot, "bin", "omx");
+      await mkdir(dirname(absoluteOmx), { recursive: true });
+      await symlink(realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js")), absoluteOmx);
+
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: { command: `${absoluteOmx} ultragoal status --json` },
+      }, { cwd });
+
+      assert.equal(result.outputJson, null);
+
+      process.env.BASH_ENV = join(installRoot, "inherited-bash-env");
+      const checkpoint = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: {
+          command: `${absoluteOmx} ultragoal checkpoint --goal-id G001-ship --status complete --evidence 'G001 complete verified by tests reviews deployment .omx/ultragoal/goals.json .omx/ultragoal/ledger.jsonl' --codex-goal-json .omx/ultragoal/g001-codex-goal-complete.json --quality-gate-json .omx/ultragoal/g001-quality-gate.json --json`,
+        },
+      }, { cwd });
+      assert.equal(checkpoint.outputJson, null);
+
+      const lookalikeOmx = join(installRoot, "lookalike", "bin", "omx");
+      await mkdir(dirname(lookalikeOmx), { recursive: true });
+      await writeFile(lookalikeOmx, "#!/usr/bin/env node\n", "utf-8");
+      await chmod(lookalikeOmx, 0o755);
+      const lookalike = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: { command: `${lookalikeOmx} ultragoal status --json` },
+      }, { cwd });
+      assert.equal(lookalike.outputJson?.decision, "block");
+
+      const nested = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: { command: `bash -c '${absoluteOmx} ultragoal checkpoint --goal-id G001-ship --status complete --evidence done --codex-goal-json goal.json --quality-gate-json gate.json --json'` },
+      }, { cwd });
+      assert.equal(nested.outputJson?.decision, "block");
+    } finally {
+      for (const name of Object.keys(process.env)) {
+        if (/^(?:OMX|GJC)_/.test(name)) delete process.env[name];
+      }
+      Object.assign(process.env, originalOmxEnvironment);
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalBashEnv === undefined) delete process.env.BASH_ENV;
+      else process.env.BASH_ENV = originalBashEnv;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(installRoot, { recursive: true, force: true });
+    }
+  });
+
   it("allows finite Codex goal tools under Main-root Ultragoal checkpointing while near-misses stay unknown-denied (#3300)", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3300-goal-tool-transport-"));
     try {
