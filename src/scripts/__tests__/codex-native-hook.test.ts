@@ -218,7 +218,7 @@ async function withTrustedWorkspaceOmxCli<T>(
   await mkdir(binDir, { recursive: true });
   await rm(shimPath, { force: true });
   await symlink(cliPath, shimPath);
-  const path = `${binDir}:/usr/bin:/bin`;
+  const path = `${binDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
   return await action(commandForm === "env" ? `env PATH="${path}" omx` : `PATH="${path}" omx`, path);
 }
 
@@ -32419,6 +32419,63 @@ PY`,
           } finally {
             if (inheritedPath === undefined) delete process.env.PATH;
             else process.env.PATH = inheritedPath;
+          }
+        });
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it("blocks an untrusted omx shim ahead of the trusted workspace CLI on PATH under ultragoal conductor planning (#3343)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3343-untrusted-shim-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3343-untrusted-shim";
+      const leaderThreadId = "thread-3343-untrusted-shim";
+      await mkdir(join(cwd, ".git"), { recursive: true });
+      await writeNativeMappedSessionState(cwd, stateDir, sessionId, leaderThreadId, leaderThreadId);
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "planning");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "planning",
+        session_id: sessionId,
+        workingDirectory: cwd,
+      });
+
+      await withCleanAmbientNodeRuntimeEnvironment(async () => {
+        await withTrustedWorkspaceOmxCli(cwd, async (_omxCommand, trustedPath) => {
+          const attackerDir = await mkdtemp(join(tmpdir(), "omx-3343-untrusted-shim-attacker-"));
+          await writeFile(join(attackerDir, "omx"), "#!/bin/sh\necho pwned\n");
+          await chmod(join(attackerDir, "omx"), 0o755);
+          const inheritedPath = process.env.PATH;
+          // Attacker directory sits ahead of the trusted workspace bin dir on PATH.
+          process.env.PATH = `${attackerDir}:${trustedPath}`;
+          try {
+            const payload = JSON.stringify({ mode: "ultragoal", session_id: sessionId, workingDirectory: cwd });
+            const result = await dispatchCodexNativeHook(
+              {
+                hook_event_name: "PreToolUse",
+                cwd,
+                session_id: sessionId,
+                thread_id: leaderThreadId,
+                agent_id: leaderThreadId,
+                tool_name: "Bash",
+                tool_use_id: "tool-3343-untrusted-shim-state-read-input",
+                tool_input: {
+                  command: `omx state read --input '${payload}' --json`,
+                },
+              },
+              { cwd },
+            );
+
+            assert.notEqual(result.outputJson, null);
+            assert.equal(result.outputJson?.decision, "block");
+            assert.match(JSON.stringify(result.outputJson), /PATH/);
+          } finally {
+            if (inheritedPath === undefined) delete process.env.PATH;
+            else process.env.PATH = inheritedPath;
+            await rm(attackerDir, { recursive: true, force: true });
           }
         });
       });
