@@ -5,23 +5,30 @@
  * serialized by an adjacent lock directory and become visible only after an
  * atomic rename of a transaction-owned temporary file.
  */
+import { execFileSync as nodeExecFileSync } from 'node:child_process';
 import {
   appendFile,
+  mkdtemp as nodeMkdtemp,
+  link as nodeLink,
   lstat as nodeLstat,
   mkdir as nodeMkdir,
   open,
   readFile as nodeReadFile,
   readdir as nodeReaddir,
+  realpath,
   rename as nodeRename,
   rmdir as nodeRmdir,
   rm,
   unlink as nodeUnlink,
   writeFile as nodeWriteFile,
 } from 'fs/promises';
-import { readFileSync } from 'fs';
+import { constants as fsConstants, readFileSync } from 'fs';
+import type { FileHandle } from 'fs/promises';
+import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'crypto';
-import { dirname, join } from 'path';
+import { basename, dirname, isAbsolute, join } from 'path';
 import { omxRoot, omxLogsDir, sameFilePath } from '../utils/paths.js';
+import { resolveRuntimeBinaryPath } from '../runtime/bridge.js';
 import {
   getBaseStateDirWithSource,
   resolveWorkingDirectoryForState,
@@ -46,12 +53,15 @@ export interface SessionState {
   codex_session_id?: string;
   started_at: string;
   cwd: string;
+  state_root?: string;
   pid: number;
   platform?: NodeJS.Platform;
   pid_start_ticks?: number;
   pid_cmdline?: string;
   tmux_session_name?: string;
   tmux_pane_id?: string;
+  /** Private wrapper lineage evidence; native reconciliation never creates or repairs it. */
+  launch_lineage_token?: string;
 }
 
 export interface SessionPointerContext {
@@ -76,6 +86,8 @@ export interface SessionPointerReadResult {
   raw?: string;
 }
 
+/** Classified native session-owner sidecar evidence for fail-closed consumers. */
+export interface NativeSessionOwnerEvidence extends SessionPointerReadResult {}
 export type SessionPointerTransactionOperation =
   | 'pointer-context-resolve'
   | 'state-dir-create'
@@ -100,6 +112,7 @@ export type SessionPointerCleanupPhase =
   | 'remove-pointer-temp'
   | 'token-check'
   | 'rename'
+  | 'remove-release-owner'
   | 'remove-release-dir';
 
 export interface SessionPointerSecondaryFailure {
@@ -154,7 +167,65 @@ export type SessionPointerLaunchAbort =
   | SessionPointerContextAbort
   | ResolvedSessionPointerAbort;
 
+export type UnsupportedDirectoryCapabilityReason = 'platform' | 'inadequate-identity' | 'stat-feature';
+export type CapabilityCloseEvidence = Readonly<{
+  role: 'acquisition' | 'fresh-comparison' | 'original-retained';
+  phase: 'before-authorization' | 'post-finalization' | 'detached-pre-release';
+  status: 'not-needed' | 'closed' | 'failed';
+  error?: Readonly<{ name: string; message: string; code?: string }>;
+}>;
+export interface EstablishmentCleanupEvidence {
+  readonly capability: readonly CapabilityCloseEvidence[];
+}
+export interface LifecycleCleanupEvidence extends EstablishmentCleanupEvidence {
+  readonly comparison?: Readonly<{ status: 'not-run' | 'matched' | 'denied'; reason?: string }>;
+}
+export interface LaunchSessionBinding {
+  readonly context: Readonly<SessionPointerContext>;
+  readonly canonicalRealpath: string;
+  readonly directoryIdentity: Readonly<
+    | { kind: 'supported'; dev: bigint; ino: bigint }
+    | { kind: 'unsupported'; reason: UnsupportedDirectoryCapabilityReason }
+  >;
+  readonly canonicalSessionId: string;
+  readonly ownerOmxSessionId?: string;
+  readonly nativeSessionId?: string;
+  readonly startedAt: string;
+  readonly launchLineageToken: string;
+}
+export interface CommittedLaunchEvidence {
+  readonly context: Readonly<SessionPointerContext>;
+  readonly canonicalSessionId: string;
+}
+export class CommittedLaunchBlockedError extends Error {
+  readonly name = 'CommittedLaunchBlockedError';
+  constructor(readonly secondaryFailures: readonly SessionPointerSecondaryFailure[]) {
+    super('Session pointer committed, but lock release left recovery evidence.');
+  }
+}
+export type LaunchEstablishment =
+  | { kind: 'precommit-aborted'; abort: SessionPointerLaunchAbort; cleanup: EstablishmentCleanupEvidence }
+  | { kind: 'committed-released'; binding: LaunchSessionBinding; cleanup: EstablishmentCleanupEvidence }
+  | {
+      kind: 'committed-release-failed'; evidence: CommittedLaunchEvidence; error: CommittedLaunchBlockedError;
+      lockDisposition: 'held' | 'released-with-residue' | 'uncertain';
+      secondaryFailures: readonly SessionPointerSecondaryFailure[]; cleanup: EstablishmentCleanupEvidence;
+    };
+export type DetachedMetadataUpdate =
+  | { kind: 'precommit-aborted'; abort: SessionPointerLaunchAbort; cleanup: EstablishmentCleanupEvidence }
+  | { kind: 'committed-released'; evidence: CommittedLaunchEvidence; cleanup: EstablishmentCleanupEvidence }
+  | {
+      kind: 'committed-release-failed'; evidence: CommittedLaunchEvidence; error: CommittedLaunchBlockedError;
+      lockDisposition: 'held' | 'released-with-residue' | 'uncertain';
+      secondaryFailures: readonly SessionPointerSecondaryFailure[]; cleanup: EstablishmentCleanupEvidence;
+    };
+export interface BoundFinalizationReport {
+  readonly cleanup: LifecycleCleanupEvidence;
+  readonly finalized: boolean;
+}
+
 const SESSION_FILE = 'session.json';
+const SESSION_OWNER_FILE = 'session-owner.json';
 const HISTORY_FILE = 'session-history.jsonl';
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 const SESSION_POINTER_TOKEN_PATTERN = /^[A-Za-z0-9_-]{16,128}$/;
@@ -184,6 +255,30 @@ export function resolveSessionPointerContext(cwd: string): SessionPointerContext
     rootSource,
     sessionPath: pointerPath,
     lockPath: `${pointerPath}.lock`,
+  };
+}
+
+function resolveNativeSessionOwnerContext(
+  cwd: string,
+  nativeSessionId: string,
+): SessionPointerContext {
+  const root = resolveSessionPointerContext(cwd);
+  const normalized = normalizeSessionId(nativeSessionId);
+  if (!normalized) {
+    throw resolvedAbort(root, {
+      code: 'session_pointer_io_failure',
+      operation: 'pointer-classify',
+      lockPath: root.lockPath,
+      reason: 'A valid native session ID is required for owner evidence.',
+    });
+  }
+  const baseStateDir = join(root.baseStateDir, 'sessions', normalized);
+  const sessionPath = join(baseStateDir, SESSION_OWNER_FILE);
+  return {
+    ...root,
+    baseStateDir,
+    sessionPath,
+    lockPath: `${sessionPath}.lock`,
   };
 }
 
@@ -308,6 +403,8 @@ export interface SessionPointerFsDependencies {
   mkdir(path: string, options?: { recursive?: boolean }): Promise<void>;
   readdir(path: string): Promise<string[]>;
   lstat(path: string): Promise<{
+    dev: number;
+    ino: number;
     isDirectory(): boolean;
     isFile(): boolean;
     isSymbolicLink(): boolean;
@@ -320,6 +417,7 @@ export interface SessionPointerFsDependencies {
     regularFileSync?: SessionStartOptions['regularFileSync'],
   ): Promise<RegularFileSyncOutcome>;
   rename(from: string, to: string): Promise<void>;
+  link(path: string, dest: string): Promise<void>;
   unlink(path: string): Promise<void>;
   rmdir(path: string): Promise<void>;
 }
@@ -351,7 +449,11 @@ export interface SessionPointerTransactionDependencies {
     startTicks?: number;
     cmdlineHash?: string;
   };
+  atomicRenameNoReplace(from: string, to: string): Promise<RecoveryRenameNoReplaceResult>;
 }
+
+/** Recovery-only no-clobber rename seam. Normal lock lifecycle never uses it. */
+export type RecoveryRenameNoReplaceResult = 'moved' | 'not-moved' | 'unsupported';
 
 const defaultFsDependencies: SessionPointerFsDependencies = {
   mkdir: async (path, options) => {
@@ -377,6 +479,9 @@ const defaultFsDependencies: SessionPointerFsDependencies = {
   rename: async (from, to) => {
     await nodeRename(from, to);
   },
+  link: async (path, dest) => {
+    await nodeLink(path, dest);
+  },
   unlink: async (path) => {
     await nodeUnlink(path);
   },
@@ -384,6 +489,32 @@ const defaultFsDependencies: SessionPointerFsDependencies = {
     await nodeRmdir(path);
   },
 };
+
+async function defaultRecoveryRenameNoReplace(from: string, to: string): Promise<RecoveryRenameNoReplaceResult> {
+  if (!from.trim() || !to.trim() || !isAbsolute(from) || !isAbsolute(to)) return 'unsupported';
+
+  try {
+    const stdout = nodeExecFileSync(
+      resolveRuntimeBinaryPath(),
+      ['fs-rename-no-replace', from, to],
+      {
+        encoding: 'utf8',
+        maxBuffer: 64 * 1024,
+        shell: false,
+        stdio: ['ignore', 'pipe', 'pipe'],
+        timeout: 10_000,
+      },
+    );
+    const parsed = JSON.parse(String(stdout)) as { outcome?: unknown };
+    if (parsed.outcome === 'moved' || parsed.outcome === 'not-moved' || parsed.outcome === 'unsupported') {
+      return parsed.outcome;
+    }
+  } catch {
+    // Missing binaries, spawn failures, hard runtime errors, and malformed output
+    // all fail closed; recovery must never fall back to an overwriting rename.
+  }
+  return 'unsupported';
+}
 
 /** @internal Exposed only so source-module tests can verify default ESRCH handling. */
 export function __createDefaultPidProbeForTests(
@@ -428,6 +559,7 @@ const defaultTransactionDependencies: SessionPointerTransactionDependencies = {
   token: () => randomUUID(),
   probePid: defaultProbePid,
   readProcessIdentity: defaultReadProcessIdentity,
+  atomicRenameNoReplace: defaultRecoveryRenameNoReplace,
 };
 
 let transactionDependencies: SessionPointerTransactionDependencies = defaultTransactionDependencies;
@@ -584,6 +716,18 @@ function classifySessionProcess(
   return 'usable';
 }
 
+/**
+ * Classify process liveness for an already-parsed selected session pointer.
+ * Callers that need cwd/state_root authority must validate those against the
+ * SAME snapshot themselves; this evaluates only pid/start-tick evidence so a
+ * single immutable snapshot can drive both decisions.
+ */
+export function classifySessionStateLiveness(
+  state: SessionState,
+): 'usable' | 'stale-dead' | 'identity-indeterminate' {
+  return classifySessionProcess(state, transactionDependencies);
+}
+
 function classifyParsedSessionPointer(
   context: SessionPointerContext,
   value: unknown,
@@ -659,6 +803,7 @@ export async function readUsableSessionState(
 
 function createSessionState(
   cwd: string,
+  stateRoot: string,
   sessionId: string,
   pid: number,
   platform: NodeJS.Platform,
@@ -666,6 +811,7 @@ function createSessionState(
   options: {
     nowIso?: string;
     nativeSessionId?: string;
+    launchLineageToken?: string;
     previousNativeSessionId?: string;
     nativeSessionSwitchedAt?: string;
     ownerOmxSessionId?: string;
@@ -688,7 +834,9 @@ function createSessionState(
     ...(nativeSessionSwitchedAt ? { native_session_switched_at: nativeSessionSwitchedAt } : {}),
     ...(ownerOmxSessionId ? { owner_omx_session_id: ownerOmxSessionId } : {}),
     started_at: options.startedAt ?? nowIso,
+    ...(isValidToken(options.launchLineageToken) ? { launch_lineage_token: options.launchLineageToken } : {}),
     cwd,
+    state_root: stateRoot,
     pid,
     platform,
     ...(linuxIdentity ? { pid_start_ticks: linuxIdentity.startTicks } : {}),
@@ -696,6 +844,12 @@ function createSessionState(
     ...(tmuxSessionName ? { tmux_session_name: tmuxSessionName } : {}),
     ...(tmuxPaneId ? { tmux_pane_id: tmuxPaneId } : {}),
   };
+}
+
+function preserveExistingLaunchLineageToken(existing: SessionState | undefined, state: SessionState): SessionState {
+  return existing && Object.hasOwn(existing, 'launch_lineage_token')
+    ? { ...state, launch_lineage_token: existing.launch_lineage_token }
+    : state;
 }
 
 function normalizeNonempty(value: unknown): string | undefined {
@@ -744,11 +898,6 @@ function isStartCompatible(existing: SessionState, requestedSessionId: string): 
     || currentOwnerAlias(existing) === requestedSessionId;
 }
 
-function getOmxLaunchSessionId(state: SessionState): string | undefined {
-  if (state.session_id.startsWith('omx-')) return state.session_id;
-  const owner = currentOwnerAlias(state);
-  return owner?.startsWith('omx-') ? owner : undefined;
-}
 
 interface SessionPointerLockOwnerV1 {
   version: 1;
@@ -881,7 +1030,13 @@ async function inspectSessionPointerLockAtContext(context: SessionPointerContext
     status,
     lockPath: context.lockPath,
     evidenceSource,
-    safeToRecover: status === 'dead' && evidenceSource === 'owner-temp',
+    // Recoverable only on positively dead evidence (ESRCH), for canonical
+    // owner.json and pre-rename temp evidence alike; the atomic
+    // claim/quarantine protocol revalidates the exact entry, still-dead
+    // status, and owner token before quarantining. Live, reused,
+    // identity-indeterminate, ambiguous, symlink, malformed, unexpected,
+    // and io-error states stay fail-closed.
+    safeToRecover: status === 'dead',
   };
 }
 
@@ -890,88 +1045,236 @@ export async function inspectSessionPointerLock(cwd: string): Promise<SessionPoi
   return await inspectSessionPointerLockAtContext(resolveSessionPointerContext(cwd));
 }
 
-/** Explicitly quarantine only a dead, atomically claimed pointer lock; never force recovery. */
-export async function recoverSessionPointerLock(cwd: string): Promise<SessionPointerLockRecovery> {
-  const context = resolveSessionPointerContext(cwd);
-  const inspection = await inspectSessionPointerLockAtContext(context);
-  if (!inspection.safeToRecover) {
-    return { ...inspection, action: 'none', recovered: false, reason: inspection.status === 'absent' ? 'No session pointer lock exists.' : `Session pointer lock is not safe to recover (${inspection.status}).` };
-  }
+interface RecoveryIdentity { dev: number; ino: number }
+interface RecoveryCheckpoint {
+  version: number;
+  sourcePath: string;
+  identity: RecoveryIdentity;
+  evidenceIdentity?: RecoveryIdentity;
+  evidenceBytes?: string;
+  lockIdentity?: RecoveryIdentity;
+  lockParkPath?: string;
+  phase: string;
+}
 
-  let entries: string[];
-  try {
-    entries = await transactionDependencies.fs.readdir(context.lockPath);
-  } catch {
-    return { ...inspection, action: 'none', recovered: false, reason: 'Unable to re-read session pointer lock evidence.' };
-  }
-  const evidenceName = inspection.evidenceSource === 'owner.json' ? 'owner.json' : entries.find((entry) => /^owner\.([A-Za-z0-9_-]{16,128})\.tmp$/.test(entry));
-  if (!evidenceName || entries.length !== 1) {
-    return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
-  }
-  const owner = await inspectLockOwnerFile(join(context.lockPath, evidenceName));
-  if (owner.status !== 'dead' || !owner.owner) {
-    return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
-  }
+function sameRecoveryIdentity(stat: Awaited<ReturnType<SessionPointerFsDependencies['lstat']>>, identity: RecoveryIdentity, kind: 'file' | 'directory'): boolean {
+  return !stat.isSymbolicLink() && (kind === 'file' ? stat.isFile() : stat.isDirectory()) && stat.dev === identity.dev && stat.ino === identity.ino;
+}
 
-  let claimToken: string;
+async function lstatRecoveryPath(path: string): Promise<Awaited<ReturnType<SessionPointerFsDependencies['lstat']>> | undefined> {
+  try { return await transactionDependencies.fs.lstat(path); } catch (error) { if (isNotFound(error)) return undefined; throw error; }
+}
+async function probeRecoveryRenameCapability(): Promise<RecoveryRenameNoReplaceResult> {
+  let probeDir: string | undefined;
   try {
-    claimToken = transactionDependencies.token();
+    probeDir = await nodeMkdtemp(join(tmpdir(), 'omx-session-recovery-probe-'));
+    const from = join(probeDir, 'from');
+    const to = join(probeDir, 'to');
+    await nodeWriteFile(from, 'omx-recovery-capability-probe', { flag: 'wx' });
+    const outcome = await transactionDependencies.atomicRenameNoReplace(from, to);
+    return outcome === 'moved' || outcome === 'not-moved' || outcome === 'unsupported'
+      ? outcome
+      : 'unsupported';
   } catch {
-    return { ...inspection, action: 'none', recovered: false, reason: 'Unable to create recovery claim token.' };
-  }
-  if (!isValidToken(claimToken)) return { ...inspection, action: 'none', recovered: false, reason: 'Recovery claim token is invalid.' };
-  const claimName = `owner.${owner.owner.token}.${claimToken}.recovery`;
-  const claimPath = join(context.lockPath, claimName);
-  try {
-    await transactionDependencies.fs.lstat(claimPath);
-    return { ...inspection, action: 'none', recovered: false, reason: 'Recovery claim path already exists.' };
-  } catch (error) {
-    if (!isNotFound(error)) return { ...inspection, action: 'none', recovered: false, reason: 'Unable to inspect recovery claim path.' };
-  }
-  try {
-    await transactionDependencies.fs.rename(join(context.lockPath, evidenceName), claimPath);
-  } catch {
-    return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
-  }
-
-  const claimed = await inspectSessionPointerLockAtContext(context);
-  let claimedEntries: string[];
-  try {
-    claimedEntries = await transactionDependencies.fs.readdir(context.lockPath);
-  } catch {
-    return { ...claimed, action: 'none', recovered: false, reason: 'Unable to revalidate recovery claim.' };
-  }
-  const claimOwner = await inspectLockOwnerFile(claimPath);
-  if (claimedEntries.length !== 1 || claimedEntries[0] !== claimName || claimOwner.status !== 'dead' || claimOwner.owner?.token !== owner.owner.token || claimed.status !== 'unexpected') {
-    return { ...claimed, action: 'none', recovered: false, reason: 'Recovery claim revalidation failed.' };
-  }
-
-  const quarantinePath = `${context.lockPath}.quarantine.${owner.owner.token}.${claimToken}`;
-  try {
-    await transactionDependencies.fs.lstat(quarantinePath);
-    return { ...claimed, action: 'none', recovered: false, reason: 'Recovery quarantine path already exists.' };
-  } catch (error) {
-    if (!isNotFound(error)) return { ...claimed, action: 'none', recovered: false, reason: 'Unable to inspect recovery quarantine path.' };
-  }
-  try {
-    await transactionDependencies.fs.rename(claimPath, quarantinePath);
-  } catch {
-    return { ...claimed, action: 'none', recovered: false, reason: 'Unable to quarantine the exact session pointer recovery claim.' };
-  }
-  try {
-    await transactionDependencies.fs.rmdir(context.lockPath);
-  } catch (error) {
-    if (!isNotFound(error)) {
-      return {
-        ...claimed,
-        action: 'none',
-        recovered: false,
-        reason: 'The exact recovery claim was quarantined, but the canonical lock directory was not empty.',
-        quarantinePath,
-      };
+    return 'unsupported';
+  } finally {
+    if (probeDir) {
+      try { await rm(probeDir, { recursive: true, force: true }); } catch { /* best effort */ }
     }
   }
-  return { ...inspection, action: 'quarantined', recovered: true, reason: 'Dead session pointer lock was atomically claimed and quarantined.', quarantinePath };
+}
+
+async function moveRecoveryPathNoReplace(
+  from: string,
+  to: string,
+  identity: RecoveryIdentity,
+  kind: 'file' | 'directory',
+): Promise<{ moved: boolean; unsupported?: boolean; reason?: string }> {
+  try {
+    const outcome = await transactionDependencies.atomicRenameNoReplace(from, to);
+    if (outcome === 'unsupported') return { moved: false, unsupported: true, reason: 'Atomic no-replace recovery rename is unsupported on this platform.' };
+    if (outcome === 'not-moved') return { moved: false, reason: 'Atomic recovery move left its source pathname in place.' };
+  } catch (error) {
+    return { moved: false, reason: `Atomic no-replace recovery rename failed (${errorCode(error) ?? 'unknown'}).` };
+  }
+  const destination = await lstatRecoveryPath(to);
+  const source = await lstatRecoveryPath(from);
+  if (destination && sameRecoveryIdentity(destination, identity, kind) && !source) return { moved: true };
+  // A successor may have appeared at the canonical pathname after our move.
+  // Attempt a no-replace rollback only for the captured object; an occupied or
+  // foreign destination makes the rollback fail closed and leaves both residues.
+  if (destination && sameRecoveryIdentity(destination, identity, kind)) {
+    try { await transactionDependencies.atomicRenameNoReplace(to, from); } catch { /* durable residue is safer than cleanup */ }
+  }
+  return { moved: false, reason: 'Atomic recovery move did not leave the captured object at its token-bound destination.' };
+}
+
+async function completeRecoveryCheckpoint(
+  checkpointPath: string,
+  checkpointBytes: string,
+  checkpointIdentity: RecoveryIdentity,
+): Promise<{ completed: boolean; reason?: string }> {
+  const completedPath = checkpointPath.replace(/\.json$/, '.completed');
+  const current = await lstatRecoveryPath(checkpointPath);
+  if (!current || !sameRecoveryIdentity(current, checkpointIdentity, 'file') || await transactionDependencies.fs.readFile(checkpointPath, 'utf8') !== checkpointBytes) {
+    return { completed: false, reason: 'Recovery checkpoint was replaced before completion; it was preserved as residue.' };
+  }
+  const moved = await moveRecoveryPathNoReplace(checkpointPath, completedPath, checkpointIdentity, 'file');
+  if (!moved.moved) return { completed: false, reason: moved.reason };
+  const completedBytes = await transactionDependencies.fs.readFile(completedPath, 'utf8');
+  return completedBytes === checkpointBytes ? { completed: true } : { completed: false, reason: 'Completed recovery receipt bytes changed and were preserved as residue.' };
+}
+
+async function resumeRecoveryCheckpoint(
+  context: SessionPointerContext,
+  checkpointPath: string,
+  checkpointName: string,
+): Promise<SessionPointerLockRecovery> {
+  const match = new RegExp(`^${basename(context.lockPath).replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\.recovery\\.([A-Za-z0-9_-]{16,128})\\.([A-Za-z0-9_-]{16,128})\\.json$`).exec(checkpointName);
+  try {
+    const checkpointBytes = await transactionDependencies.fs.readFile(checkpointPath, 'utf8');
+    const checkpointStat = await transactionDependencies.fs.lstat(checkpointPath);
+    const checkpoint = JSON.parse(checkpointBytes) as RecoveryCheckpoint;
+    const ownerToken = match?.[1];
+    const recoveryToken = match?.[2];
+    const expectedSource = ownerToken && (checkpoint.sourcePath === join(context.lockPath, 'owner.json') || checkpoint.sourcePath === join(context.lockPath, `owner.${ownerToken}.tmp`));
+    const expectedPark = `${context.lockPath}.parked-lock-${recoveryToken}`;
+    const isLegacyV1 = checkpoint.version === 1 && checkpoint.lockIdentity === undefined && checkpoint.lockParkPath === undefined;
+    if (!match || !expectedSource || !checkpoint.identity || !['evidence-pending', 'evidence-quarantined', 'directory-pending'].includes(checkpoint.phase) || ![1, 2, 3].includes(checkpoint.version) || !isLegacyV1 && checkpoint.lockParkPath !== expectedPark || !sameRecoveryIdentity(checkpointStat, { dev: checkpointStat.dev, ino: checkpointStat.ino }, 'file')) throw new Error('invalid checkpoint');
+    const lockParkPath = checkpoint.lockParkPath ?? expectedPark;
+    const evidenceIdentity = checkpoint.evidenceIdentity ?? checkpoint.identity;
+    const claimPath = join(context.lockPath, `owner.${ownerToken}.${recoveryToken}.recovery`);
+    const lock = await lstatRecoveryPath(context.lockPath);
+    const parkedLock = await lstatRecoveryPath(lockParkPath);
+    if (lock && parkedLock) throw new Error('checkpoint lock paths are both present');
+    if (parkedLock) {
+      if (!checkpoint.lockIdentity || !sameRecoveryIdentity(parkedLock, checkpoint.lockIdentity, 'directory')) throw new Error('checkpoint parked lock identity mismatch');
+      const quarantinePath = `${context.lockPath}.quarantine.${ownerToken}.${recoveryToken}`;
+      const completed = await completeRecoveryCheckpoint(checkpointPath, checkpointBytes, { dev: checkpointStat.dev, ino: checkpointStat.ino });
+      if (!completed.completed) throw new Error(completed.reason);
+      return { status: 'dead', lockPath: context.lockPath, evidenceSource: 'owner.json', safeToRecover: true, action: 'quarantined', recovered: true, reason: 'Dead session pointer lock recovery checkpoint resumed.', quarantinePath };
+    }
+    if (!lock || lock.isSymbolicLink() || !lock.isDirectory()) throw new Error('checkpoint lock is missing or foreign');
+    const source = await lstatRecoveryPath(checkpoint.sourcePath);
+    const claim = await lstatRecoveryPath(claimPath);
+    const evidencePath = source && sameRecoveryIdentity(source, evidenceIdentity, 'file') ? checkpoint.sourcePath
+      : claim && sameRecoveryIdentity(claim, evidenceIdentity, 'file') ? claimPath : undefined;
+    if (!evidencePath) throw new Error('checkpoint evidence is missing or foreign');
+    if (claim && !sameRecoveryIdentity(claim, evidenceIdentity, 'file')) throw new Error('checkpoint claim is foreign');
+    // v1/v2 did not persist the directory identity. It is safe to derive only
+    // while the original directory still contains the exact recorded evidence.
+    const lockIdentity = checkpoint.lockIdentity ?? { dev: lock.dev, ino: lock.ino };
+    if (!sameRecoveryIdentity(lock, lockIdentity, 'directory')) throw new Error('checkpoint lock identity mismatch');
+    const ownerBytes = await transactionDependencies.fs.readFile(evidencePath, 'utf8');
+    const owner = await inspectLockOwnerFile(evidencePath);
+    if (owner.status !== 'dead' || owner.owner?.token !== ownerToken || checkpoint.evidenceBytes !== undefined && checkpoint.evidenceBytes !== ownerBytes) throw new Error('checkpoint owner evidence changed');
+    const quarantinePath = `${context.lockPath}.quarantine.${ownerToken}.${recoveryToken}`;
+    const quarantine = await lstatRecoveryPath(quarantinePath);
+    if (quarantine) {
+      if (!sameRecoveryIdentity(quarantine, evidenceIdentity, 'file')) throw new Error('checkpoint quarantine is foreign');
+    } else {
+      await transactionDependencies.fs.link(evidencePath, quarantinePath);
+      const linked = await lstatRecoveryPath(quarantinePath);
+      if (!linked || !sameRecoveryIdentity(linked, evidenceIdentity, 'file')) throw new Error('checkpoint quarantine link mismatch');
+    }
+    // Revalidate the bytes, dead owner and identities immediately before moving
+    // the entire directory incarnation out of the canonical lock pathname.
+    const currentLock = await lstatRecoveryPath(context.lockPath);
+    const currentEvidence = await lstatRecoveryPath(evidencePath);
+    const currentBytes = currentEvidence && sameRecoveryIdentity(currentEvidence, evidenceIdentity, 'file') ? await transactionDependencies.fs.readFile(evidencePath, 'utf8') : undefined;
+    const currentOwner = currentBytes === undefined ? undefined : await inspectLockOwnerFile(evidencePath);
+    if (!currentLock || !sameRecoveryIdentity(currentLock, lockIdentity, 'directory') || currentBytes !== ownerBytes || currentOwner?.status !== 'dead' || currentOwner.owner?.token !== ownerToken) throw new Error('checkpoint owner evidence changed before directory quarantine');
+    const lockEntries = await transactionDependencies.fs.readdir(context.lockPath);
+    const allowedEntries = new Set([basename(checkpoint.sourcePath), basename(claimPath)]);
+    if (lockEntries.some((entry) => !allowedEntries.has(entry))) throw new Error('checkpoint lock contains foreign recovery evidence');
+    const moved = await moveRecoveryPathNoReplace(context.lockPath, lockParkPath, lockIdentity, 'directory');
+    if (!moved.moved) throw new Error(moved.reason);
+    const completed = await completeRecoveryCheckpoint(checkpointPath, checkpointBytes, { dev: checkpointStat.dev, ino: checkpointStat.ino });
+    if (!completed.completed) throw new Error(completed.reason);
+    return { status: 'dead', lockPath: context.lockPath, evidenceSource: 'owner.json', safeToRecover: true, action: 'quarantined', recovered: true, reason: 'Dead session pointer lock recovered into durable quarantine residues.', quarantinePath };
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : 'unknown';
+    return { status: 'unexpected', lockPath: context.lockPath, evidenceSource: 'none', safeToRecover: false, action: 'none', recovered: false, reason: `Recovery checkpoint is malformed or no longer identifies its recorded recovery state (${detail}).` };
+  }
+}
+
+/** Explicitly quarantine only a dead lock by moving its entire directory incarnation. */
+export async function recoverSessionPointerLock(cwd: string): Promise<SessionPointerLockRecovery> {
+  const context = resolveSessionPointerContext(cwd);
+  const checkpointPrefix = `${basename(context.lockPath)}.recovery.`;
+  let checkpointNames: string[];
+  try {
+    checkpointNames = (await transactionDependencies.fs.readdir(dirname(context.lockPath))).filter((name) => name.startsWith(checkpointPrefix) && name.endsWith('.json'));
+  } catch (error) {
+    if (!isNotFound(error)) return { status: 'io-error', lockPath: context.lockPath, evidenceSource: 'none', safeToRecover: false, action: 'none', recovered: false, reason: 'Unable to enumerate session pointer recovery checkpoints.' };
+    checkpointNames = [];
+  }
+  if (checkpointNames.length > 1) return { status: 'unexpected', lockPath: context.lockPath, evidenceSource: 'none', safeToRecover: false, action: 'none', recovered: false, reason: 'Multiple recovery checkpoints exist.' };
+  if (checkpointNames.length === 1) return await resumeRecoveryCheckpoint(context, join(dirname(context.lockPath), checkpointNames[0]!), checkpointNames[0]!);
+
+  const inspection = await inspectSessionPointerLockAtContext(context);
+  if (!inspection.safeToRecover) return { ...inspection, action: 'none', recovered: false, reason: inspection.status === 'absent' ? 'No session pointer lock exists.' : `Session pointer lock is not safe to recover (${inspection.status}).` };
+  try {
+    const evidenceName = inspection.evidenceSource === 'owner.json'
+      ? 'owner.json'
+      : (await transactionDependencies.fs.readdir(context.lockPath)).find((entry) => /^owner\.([A-Za-z0-9_-]{16,128})\.tmp$/.test(entry));
+    if (!evidenceName) return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
+    const evidencePath = join(context.lockPath, evidenceName);
+    const evidence = await lstatRecoveryPath(evidencePath);
+    const lock = await lstatRecoveryPath(context.lockPath);
+    const ownerBytes = evidence && sameRecoveryIdentity(evidence, { dev: evidence.dev, ino: evidence.ino }, 'file')
+      ? await transactionDependencies.fs.readFile(evidencePath, 'utf8')
+      : undefined;
+    const owner = ownerBytes === undefined ? undefined : await inspectLockOwnerFile(evidencePath);
+    if (!lock || lock.isSymbolicLink() || !lock.isDirectory() || !evidence
+      || !sameRecoveryIdentity(evidence, { dev: evidence.dev, ino: evidence.ino }, 'file')
+      || owner?.status !== 'dead' || !owner.owner) {
+      return { ...inspection, action: 'none', recovered: false, reason: 'Session pointer lock evidence changed before recovery claim.' };
+    }
+
+    // Fresh recovery probes before checkpoint creation; an unsupported host leaves the
+    // canonical lock and owner evidence untouched. Existing checkpoints are resumed
+    // independently and may remain as durable recovery residue.
+
+    const capability = await probeRecoveryRenameCapability();
+    if (capability === 'unsupported') {
+      return {
+        ...inspection,
+        action: 'none',
+        recovered: false,
+        reason: 'Atomic no-replace recovery rename is unsupported on this platform.',
+      };
+    }
+
+    const recoveryToken = transactionDependencies.token();
+    if (!isValidToken(recoveryToken)) return { ...inspection, action: 'none', recovered: false, reason: 'Recovery claim token is invalid.' };
+    const checkpointPath = `${context.lockPath}.recovery.${owner.owner.token}.${recoveryToken}.json`;
+    const checkpoint: RecoveryCheckpoint = {
+      version: 3,
+      sourcePath: evidencePath,
+      identity: { dev: evidence.dev, ino: evidence.ino },
+      evidenceIdentity: { dev: evidence.dev, ino: evidence.ino },
+      evidenceBytes: ownerBytes,
+      lockIdentity: { dev: lock.dev, ino: lock.ino },
+      lockParkPath: `${context.lockPath}.parked-lock-${recoveryToken}`,
+      phase: 'evidence-pending',
+    };
+    try {
+      await transactionDependencies.fs.writeFile(checkpointPath, JSON.stringify(checkpoint), { flag: 'wx' });
+    } catch (error) {
+      return { ...inspection, action: 'none', recovered: false, reason: `Unable to create recovery checkpoint (${errorCode(error) ?? 'unknown'}).` };
+    }
+    return await resumeRecoveryCheckpoint(context, checkpointPath, basename(checkpointPath));
+  } catch (error) {
+    return {
+      ...inspection,
+      status: 'io-error',
+      safeToRecover: false,
+      action: 'none',
+      recovered: false,
+      reason: `Unable to inspect session pointer lock recovery state (${errorCode(error) ?? errorMessage(error)}).`,
+    };
+  }
 }
 
 interface HeldPointerLock {
@@ -1246,7 +1549,7 @@ async function releasePointerLock(lock: HeldPointerLock): Promise<SessionPointer
     if (!isNotFound(error)) {
       return [{
         operation: 'lock-release',
-        phase: 'remove-release-dir',
+        phase: 'remove-release-owner',
         ownership: 'released',
         message: `Unable to remove released session pointer lock owner: ${errorMessage(error)}`,
         cause: error,
@@ -1270,6 +1573,11 @@ async function releasePointerLock(lock: HeldPointerLock): Promise<SessionPointer
   }
 }
 
+/** @internal Test-only release of a held pointer lock; do not use outside session tests. */
+export async function __releasePointerLockForTests(cwd: string, token: string): Promise<SessionPointerSecondaryFailure[]> {
+  return await releasePointerLock({ context: resolveSessionPointerContext(cwd), token });
+}
+
 function recoveryAbort(
   context: SessionPointerContext,
   primary: ResolvedSessionPointerAbort,
@@ -1290,9 +1598,16 @@ function recoveryAbort(
   });
 }
 
-function releaseFailureError(failures: readonly SessionPointerSecondaryFailure[]): Error {
-  const error = new Error('Session pointer committed, but lock release left recovery evidence.');
-  Object.assign(error, { secondaryFailures: failures });
+function releaseFailureError<T>(
+  failures: readonly SessionPointerSecondaryFailure[],
+  context?: SessionPointerContext,
+  value?: T,
+): CommittedLaunchBlockedError & { context?: SessionPointerContext; value?: T } {
+  const error = new CommittedLaunchBlockedError(failures) as CommittedLaunchBlockedError & {
+    context?: SessionPointerContext; value?: T;
+  };
+  if (context) error.context = context;
+  if (value !== undefined) error.value = value;
   return error;
 }
 
@@ -1364,8 +1679,10 @@ async function writePointerTransaction<T>(
   candidateSessionId: string | undefined,
   options: Pick<SessionStartOptions, 'context' | 'platform' | 'regularFileSync'>,
   timeoutMs: number,
-  transition: (pointer: SessionPointerReadResult, context: SessionPointerContext) => T,
+  transition: (pointer: SessionPointerReadResult, context: SessionPointerContext) => T | Promise<T>,
   pointerState: (value: T) => SessionState,
+  beforeCommit?: (context: SessionPointerContext) => Promise<void>,
+  afterCommit?: (context: SessionPointerContext) => Promise<void>,
 ): Promise<PointerTransactionResult<T>> {
   let context: SessionPointerContext;
   try {
@@ -1410,6 +1727,7 @@ async function writePointerTransaction<T>(
   );
   const pointerTempPath = `${context.sessionPath}.tmp-${lock.token}`;
   let pointerCommitted = false;
+  let pointerTempWritten = false;
 
   try {
     let pointer: SessionPointerReadResult;
@@ -1428,7 +1746,7 @@ async function writePointerTransaction<T>(
 
     let next: T;
     try {
-      next = transition(pointer, context);
+      next = await transition(pointer, context);
     } catch (error) {
       if (isSessionPointerLaunchAbort(error)) throw error;
       const state = pointer.state;
@@ -1442,6 +1760,7 @@ async function writePointerTransaction<T>(
 
     const serialized = JSON.stringify(pointerState(next), null, 2);
     try {
+      pointerTempWritten = true;
       await transactionDependencies.fs.writeFile(pointerTempPath, serialized, { mode: 0o600, flag: 'wx' });
     } catch (error) {
       throw resolvedAbort(context, {
@@ -1468,10 +1787,27 @@ async function writePointerTransaction<T>(
         cause: error,
       });
     }
+    if (beforeCommit) await beforeCommit(context);
     try {
       await transactionDependencies.fs.rename(pointerTempPath, context.sessionPath);
       pointerCommitted = true;
+      if (afterCommit) {
+        try {
+          await afterCommit(context);
+        } catch (error) {
+          const releaseFailures = await releasePointerLock(lock);
+          throw releaseFailureError([
+            {
+              operation: 'lock-release', phase: 'rename', ownership: 'uncertain',
+              message: `Selected state root identity changed after pointer publication: ${errorMessage(error)}`,
+              cause: error, evidencePath: context.sessionPath,
+            },
+            ...releaseFailures,
+          ], context, next);
+        }
+      }
     } catch (error) {
+      if (error instanceof CommittedLaunchBlockedError) throw error;
       throw resolvedAbort(context, {
         code: 'session_pointer_io_failure',
         operation: 'pointer-rename',
@@ -1483,7 +1819,7 @@ async function writePointerTransaction<T>(
     }
 
     const releaseFailures = await releasePointerLock(lock);
-    if (releaseFailures.length > 0) throw releaseFailureError(releaseFailures);
+    if (releaseFailures.length > 0) throw releaseFailureError(releaseFailures, context, next);
     emitDegradedDurabilityWarning('session pointer start/reconcile', tracker);
     return { context, value: next };
   } catch (error) {
@@ -1498,9 +1834,7 @@ async function writePointerTransaction<T>(
         reason: `Session pointer transition failed before commit: ${errorMessage(error)}`,
         cause: error,
       });
-    const ownsPointerTemp = primary.operation === 'pointer-temp-write'
-      || primary.operation === 'pointer-fsync'
-      || primary.operation === 'pointer-rename';
+    const ownsPointerTemp = pointerTempWritten;
     throw await finalizePrecommitAbort(lock, primary, ownsPointerTemp ? pointerTempPath : undefined);
   }
 }
@@ -1508,14 +1842,25 @@ async function writePointerTransaction<T>(
 function startPointerTransition(
   requestedSessionId: string,
   options: SessionStartOptions,
+  requireLaunchLineageToken = false,
+  requireAbsent = false,
 ): (pointer: SessionPointerReadResult, context: SessionPointerContext) => SessionState {
   return (pointer, context) => {
+    if (requireAbsent && pointer.status !== 'absent') {
+      if (pointer.status === 'usable' && pointer.state) {
+        throw ownerConflictAbort(context, requestedSessionId, pointer.state);
+      }
+      throw unusablePointerAbort(context, requestedSessionId, pointer);
+    }
     if (pointer.status !== 'absent' && pointer.status !== 'stale-dead' && pointer.status !== 'usable') {
       throw unusablePointerAbort(context, requestedSessionId, pointer);
     }
 
     const existing = pointer.status === 'usable' ? pointer.state : undefined;
     if (existing && !isStartCompatible(existing, requestedSessionId)) {
+      throw ownerConflictAbort(context, requestedSessionId, existing);
+    }
+    if (requireLaunchLineageToken && existing && !isValidToken(existing.launch_lineage_token)) {
       throw ownerConflictAbort(context, requestedSessionId, existing);
     }
 
@@ -1539,22 +1884,60 @@ function startPointerTransition(
       }, error);
     }
 
-    return createSessionState(context.cwd, canonicalSessionId, pid, platform, sessionIdentityFor(pid, platform), {
+    const state = createSessionState(context.cwd, context.baseStateDir, canonicalSessionId, pid, platform, sessionIdentityFor(pid, platform), {
       nativeSessionId: options.nativeSessionId ?? existing?.native_session_id,
       previousNativeSessionId: options.previousNativeSessionId ?? existing?.previous_native_session_id,
       nativeSessionSwitchedAt: options.nativeSessionSwitchedAt ?? existing?.native_session_switched_at,
       ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
+      launchLineageToken: existing
+        ? (isValidToken(existing.launch_lineage_token) ? existing.launch_lineage_token : undefined)
+        : transactionDependencies.token(),
       tmuxSessionName: options.tmuxSessionName ?? existing?.tmux_session_name,
       tmuxPaneId: options.tmuxPaneId ?? existing?.tmux_pane_id,
     });
+    return preserveExistingLaunchLineageToken(existing, state);
   };
 }
 
-/** Write or merge a wrapper-owned canonical pointer through the exact-root transaction. */
+/** Create a wrapper-owned canonical pointer only when the selected pointer is absent. */
 export async function writeSessionStart(
   cwd: string,
   sessionId: string,
   options: SessionStartOptions = {},
+): Promise<SessionState> {
+  const candidateSessionId = normalizeSessionId(sessionId);
+  let context: SessionPointerContext;
+  try {
+    context = options.context ?? resolveSessionPointerContext(cwd);
+  } catch (error) {
+    throw contextAbort(cwd, candidateSessionId, error);
+  }
+  let pointer: SessionPointerReadResult;
+  try {
+    pointer = await readSessionPointer(context);
+  } catch (error) {
+    throw resolvedAbort(context, {
+      code: 'session_pointer_io_failure', operation: 'pointer-read', candidateSessionId,
+      lockPath: context.lockPath, reason: `Unable to read selected session pointer: ${errorMessage(error)}`, cause: error,
+    });
+  }
+  if (pointer.status !== 'absent') {
+    if (pointer.status === 'usable' && pointer.state) {
+      throw ownerConflictAbort(context, candidateSessionId ?? sessionId, pointer.state);
+    }
+    throw unusablePointerAbort(context, candidateSessionId ?? sessionId, pointer);
+  }
+  return await writeSessionStartTransition(cwd, sessionId, { ...options, context });
+}
+
+async function writeSessionStartTransition(
+  cwd: string,
+  sessionId: string,
+  options: SessionStartOptions,
+  requireLaunchLineageToken = false,
+  requireAbsent = false,
+  beforeCommit?: (context: SessionPointerContext) => Promise<void>,
+  afterCommit?: (context: SessionPointerContext) => Promise<void>,
 ): Promise<SessionState> {
   const requestedSessionId = normalizeSessionId(sessionId);
   const result = await writePointerTransaction(
@@ -1562,8 +1945,10 @@ export async function writeSessionStart(
     requestedSessionId,
     options,
     DEFAULT_POINTER_TIMEOUT_MS,
-    startPointerTransition(requestedSessionId ?? sessionId, options),
+    startPointerTransition(requestedSessionId ?? sessionId, options, requireLaunchLineageToken, requireAbsent),
     (state) => state,
+    beforeCommit,
+    afterCommit,
   );
   await appendToLogAtContext(result.context, {
     event: 'session_start',
@@ -1575,15 +1960,573 @@ export async function writeSessionStart(
   return result.value;
 }
 
-interface NativeReconcileTransition {
-  state: SessionState;
-  replacementLog?: Record<string, unknown>;
+const DIRECTORY_CAPABILITY_PLATFORMS = new Set<NodeJS.Platform>([
+  'linux', 'darwin', 'freebsd', 'openbsd', 'netbsd', 'sunos',
+]);
+
+export class LaunchContextResolutionError extends Error {
+  readonly name = 'LaunchContextResolutionError';
+  constructor(readonly cleanup: EstablishmentCleanupEvidence, cause: unknown) {
+    super(`Unable to establish launch directory capability: ${errorMessage(cause)}`, { cause });
+  }
+}
+
+interface BindingLease {
+  handle?: FileHandle;
+  closed: boolean;
+  closeEvidence?: CapabilityCloseEvidence;
+}
+const bindingLeases = new WeakMap<LaunchSessionBinding, BindingLease>();
+const bindingFinalizations = new WeakMap<LaunchSessionBinding, Promise<BoundFinalizationReport>>();
+
+function safeError(error: unknown): Readonly<{ name: string; message: string; code?: string }> {
+  return {
+    name: error instanceof Error ? error.name : 'Error',
+    message: errorMessage(error),
+    ...(errorCode(error) ? { code: errorCode(error) } : {}),
+  };
+}
+
+function lockDisposition(failures: readonly SessionPointerSecondaryFailure[]): 'held' | 'released-with-residue' | 'uncertain' {
+  if (failures.some((failure) => failure.ownership === 'uncertain')) return 'uncertain';
+  return failures.some((failure) => failure.ownership === 'held') ? 'held' : 'released-with-residue';
+}
+
+async function acquireDirectoryCapability(
+  cwd: string,
+  platform: NodeJS.Platform,
+): Promise<{ canonicalRealpath: string; identity: LaunchSessionBinding['directoryIdentity']; lease: BindingLease; cleanup: CapabilityCloseEvidence[] }> {
+  const cleanup: CapabilityCloseEvidence[] = [];
+  let canonicalRealpath: string;
+  try {
+    canonicalRealpath = await realpath(cwd);
+  } catch (error) {
+    throw new LaunchContextResolutionError({ capability: cleanup }, error);
+  }
+  if (!DIRECTORY_CAPABILITY_PLATFORMS.has(platform)) {
+    return { canonicalRealpath, identity: { kind: 'unsupported', reason: 'platform' }, lease: { closed: false }, cleanup };
+  }
+  let handle: FileHandle;
+  try {
+    handle = await open(canonicalRealpath, 'r');
+  } catch (error) {
+    throw new LaunchContextResolutionError({ capability: cleanup }, error);
+  }
+  let statFailure: unknown;
+  try {
+    const stats = await handle.stat({ bigint: true });
+    if (!stats.isDirectory() || typeof stats.dev !== 'bigint' || typeof stats.ino !== 'bigint' || stats.dev <= 0n || stats.ino <= 0n) {
+      try {
+        await handle.close();
+        cleanup.push({ role: 'acquisition', phase: 'before-authorization', status: 'closed' });
+      } catch (closeError) {
+        cleanup.push({ role: 'acquisition', phase: 'before-authorization', status: 'failed', error: safeError(closeError) });
+        throw new LaunchContextResolutionError({ capability: cleanup }, closeError);
+      }
+      return { canonicalRealpath, identity: { kind: 'unsupported', reason: 'inadequate-identity' }, lease: { closed: false }, cleanup };
+    }
+    return { canonicalRealpath, identity: { kind: 'supported', dev: stats.dev, ino: stats.ino }, lease: { handle, closed: false }, cleanup };
+  } catch (error) {
+    if (error instanceof LaunchContextResolutionError) throw error;
+    statFailure = error;
+  }
+  try {
+    await handle.close();
+    cleanup.push({ role: 'acquisition', phase: 'before-authorization', status: 'closed' });
+  } catch (closeError) {
+    cleanup.push({ role: 'acquisition', phase: 'before-authorization', status: 'failed', error: safeError(closeError) });
+    throw new LaunchContextResolutionError({ capability: cleanup }, closeError);
+  }
+  const code = errorCode(statFailure);
+  if (code === 'ENOSYS' || code === 'ENOTSUP' || code === 'EOPNOTSUPP' || code === 'EINVAL') {
+    return { canonicalRealpath, identity: { kind: 'unsupported', reason: 'stat-feature' }, lease: { closed: false }, cleanup };
+  }
+  throw new LaunchContextResolutionError({ capability: cleanup }, statFailure);
+}
+
+export async function closeLaunchSessionBindingOnce(
+  binding: LaunchSessionBinding,
+  phase: CapabilityCloseEvidence['phase'] = 'post-finalization',
+): Promise<CapabilityCloseEvidence> {
+  const lease = bindingLeases.get(binding);
+  if (!lease || lease.closed) return lease?.closeEvidence ?? { role: 'original-retained', phase, status: 'not-needed' };
+  lease.closed = true;
+  try {
+    await lease.handle?.close();
+    return lease.closeEvidence = { role: 'original-retained', phase, status: 'closed' };
+  } catch (error) {
+    return lease.closeEvidence = { role: 'original-retained', phase, status: 'failed', error: safeError(error) };
+  }
+}
+
+export async function establishLaunchSessionBinding(
+  cwd: string,
+  requestedSessionId: string,
+  options: SessionStartOptions = {},
+): Promise<LaunchEstablishment> {
+  const platform = options.platform ?? process.platform;
+  let context: SessionPointerContext;
+  try {
+    context = options.context ?? resolveSessionPointerContext(cwd);
+    await transactionDependencies.fs.mkdir(context.baseStateDir, { recursive: true });
+  } catch (error) {
+    throw new LaunchContextResolutionError({ capability: [] }, error);
+  }
+  const acquired = await acquireDirectoryCapability(context.baseStateDir, platform);
+  const cleanup = (): EstablishmentCleanupEvidence => ({ capability: acquired.cleanup });
+  const revalidateSelectedRoot = async (lockedContext: SessionPointerContext): Promise<void> => {
+    if (acquired.identity.kind !== 'supported') return;
+    const retained = await acquired.lease.handle?.stat({ bigint: true });
+    if (!retained || !retained.isDirectory() || retained.dev !== acquired.identity.dev || retained.ino !== acquired.identity.ino) {
+      throw resolvedAbort(lockedContext, {
+        code: 'session_pointer_io_failure', operation: 'pointer-classify', candidateSessionId: normalizeSessionId(requestedSessionId),
+        lockPath: lockedContext.lockPath, reason: 'Selected state root identity changed during pointer publication.',
+      });
+    }
+    const canonical = await realpath(lockedContext.baseStateDir);
+    const fresh = await open(canonical, 'r');
+    try {
+      const stats = await fresh.stat({ bigint: true });
+      if (canonical !== acquired.canonicalRealpath || !stats.isDirectory() || stats.dev !== acquired.identity.dev || stats.ino !== acquired.identity.ino) {
+        throw resolvedAbort(lockedContext, {
+          code: 'session_pointer_io_failure', operation: 'pointer-classify', candidateSessionId: normalizeSessionId(requestedSessionId),
+          lockPath: lockedContext.lockPath, reason: 'Selected state root was replaced during pointer publication.',
+        });
+      }
+    } finally {
+      await fresh.close();
+    }
+  };
+  try {
+    const state = await writeSessionStartTransition(
+      context.cwd, requestedSessionId, { ...options, context }, true, true,
+      revalidateSelectedRoot, revalidateSelectedRoot,
+    );
+    const token = state.launch_lineage_token;
+    if (!isValidToken(token)) {
+      const close = await closeLease(acquired.lease, 'before-authorization');
+      if (close) acquired.cleanup.push(close);
+      throw new LaunchContextResolutionError(cleanup(), new Error('Committed session pointer lacks a valid lineage token.'));
+    }
+    const binding: LaunchSessionBinding = Object.freeze({
+      context: Object.freeze({ ...context }), canonicalRealpath: acquired.canonicalRealpath,
+      directoryIdentity: acquired.identity, canonicalSessionId: state.session_id,
+      ...(state.owner_omx_session_id ? { ownerOmxSessionId: state.owner_omx_session_id } : {}),
+      ...(state.native_session_id ? { nativeSessionId: state.native_session_id } : {}),
+      startedAt: state.started_at, launchLineageToken: token,
+    });
+    bindingLeases.set(binding, acquired.lease);
+    return { kind: 'committed-released', binding, cleanup: cleanup() };
+  } catch (error) {
+    if (error instanceof CommittedLaunchBlockedError) {
+      const state = (error as CommittedLaunchBlockedError & { value?: SessionState }).value;
+      const errorContext = (error as CommittedLaunchBlockedError & { context?: SessionPointerContext }).context ?? context;
+      const close = await closeLease(acquired.lease, 'before-authorization');
+      if (close) acquired.cleanup.push(close);
+      return {
+        kind: 'committed-release-failed', evidence: { context: errorContext, canonicalSessionId: state?.session_id ?? requestedSessionId },
+        error, lockDisposition: lockDisposition(error.secondaryFailures), secondaryFailures: error.secondaryFailures, cleanup: cleanup(),
+      };
+    }
+    const close = await closeLease(acquired.lease, 'before-authorization');
+    if (close) acquired.cleanup.push(close);
+    if (isSessionPointerLaunchAbort(error)) return { kind: 'precommit-aborted', abort: error, cleanup: cleanup() };
+    throw error;
+  }
+}
+
+async function closeLease(lease: BindingLease, phase: CapabilityCloseEvidence['phase']): Promise<CapabilityCloseEvidence | undefined> {
+  if (lease.closed) return undefined;
+  lease.closed = true;
+  try {
+    await lease.handle?.close();
+    return { role: 'acquisition', phase, status: 'closed' };
+  } catch (error) {
+    return { role: 'acquisition', phase, status: 'failed', error: safeError(error) };
+  }
+}
+
+export async function updateDetachedSessionMetadata(
+  binding: LaunchSessionBinding,
+  patch: { tmuxSessionName?: string; tmuxPaneId?: string },
+): Promise<DetachedMetadataUpdate> {
+  const capability: CapabilityCloseEvidence[] = [];
+  const cleanup: EstablishmentCleanupEvidence = { capability };
+  try {
+    let pointerBeforeTransaction: SessionPointerReadResult;
+    try {
+      pointerBeforeTransaction = await readSessionPointer(binding.context);
+    } catch (error) {
+      throw resolvedAbort(binding.context, {
+        code: 'session_pointer_io_failure', operation: 'pointer-read', candidateSessionId: binding.canonicalSessionId,
+        lockPath: binding.context.lockPath, reason: `Unable to read selected session pointer: ${errorMessage(error)}`, cause: error,
+      });
+    }
+    if (pointerBeforeTransaction.status !== 'usable'
+      || !isAuthorizedBoundPointer(binding, binding.context, binding.canonicalSessionId, pointerBeforeTransaction.state)) {
+      throw unusablePointerAbort(binding.context, binding.canonicalSessionId, pointerBeforeTransaction);
+    }
+    const authorization = await authorizeBoundDirectoryBeforeTransaction(
+      binding,
+      pointerBeforeTransaction,
+      binding.context.cwd,
+    );
+    capability.push(...authorization.capability);
+
+    const result = await writePointerTransaction(
+      binding.context.cwd,
+      binding.canonicalSessionId,
+      { context: binding.context },
+      DEFAULT_POINTER_TIMEOUT_MS,
+      async (pointer, context) => {
+        const state = pointer.status === 'usable' ? pointer.state : undefined;
+        if (!state || !isAuthorizedBoundPointer(binding, context, binding.canonicalSessionId, state)) {
+          throw unusablePointerAbort(context, binding.canonicalSessionId, pointer);
+        }
+        await consumeBoundDirectoryAuthorizationUnderLock(binding, authorization, pointer);
+        return {
+          ...state,
+          ...(patch.tmuxSessionName !== undefined ? { tmux_session_name: patch.tmuxSessionName } : {}),
+          ...(patch.tmuxPaneId !== undefined ? { tmux_pane_id: patch.tmuxPaneId } : {}),
+        };
+      },
+      (state) => state,
+    );
+    return { kind: 'committed-released', evidence: { context: result.context, canonicalSessionId: binding.canonicalSessionId }, cleanup };
+  } catch (error) {
+    if (error instanceof CommittedLaunchBlockedError) {
+      const context = (error as CommittedLaunchBlockedError & { context?: SessionPointerContext }).context ?? binding.context;
+      return { kind: 'committed-release-failed', evidence: { context, canonicalSessionId: binding.canonicalSessionId }, error,
+        lockDisposition: lockDisposition(error.secondaryFailures), secondaryFailures: error.secondaryFailures, cleanup };
+    }
+    if (isSessionPointerLaunchAbort(error)) return { kind: 'precommit-aborted', abort: error, cleanup };
+    throw error;
+  }
+}
+
+function isAuthorizedBoundPointer(
+  binding: LaunchSessionBinding,
+  context: SessionPointerContext,
+  candidateSessionId: string,
+  state: SessionState | undefined,
+): boolean {
+  const lease = bindingLeases.get(binding);
+  if (!lease || (binding.directoryIdentity.kind === 'supported' && lease.closed) || !state) return false;
+  if (!isValidToken(binding.launchLineageToken) || !isValidToken(state.launch_lineage_token)) return false;
+  if (candidateSessionId !== binding.canonicalSessionId) return false;
+  if (state.launch_lineage_token !== binding.launchLineageToken) return false;
+  if (state.started_at !== binding.startedAt) return false;
+  const directCanonicalIdentity = state.session_id === binding.canonicalSessionId
+    && ((state.owner_omx_session_id ?? undefined) === binding.ownerOmxSessionId
+      || (binding.ownerOmxSessionId === undefined && state.owner_omx_session_id === binding.canonicalSessionId))
+    && (binding.nativeSessionId === undefined || state.native_session_id === binding.nativeSessionId);
+  const replacedNativeIdentity = state.owner_omx_session_id === binding.canonicalSessionId
+    && normalizeSessionId(state.session_id) !== undefined
+    && state.native_session_id === state.session_id;
+  if (!directCanonicalIdentity && !replacedNativeIdentity) return false;
+  try {
+    return context.rootSource === binding.context.rootSource
+      && context.baseStateDir === binding.context.baseStateDir
+      && context.sessionPath === binding.context.sessionPath
+      && sameFilePath(context.cwd, binding.context.cwd)
+      && sameFilePath(state.cwd, binding.context.cwd);
+  } catch {
+    return false;
+  }
+}
+
+function isAuthorizedBoundStaleDeadPointer(
+  binding: LaunchSessionBinding,
+  context: SessionPointerContext,
+  candidateSessionId: string,
+  state: SessionState | undefined,
+): boolean {
+  return isAuthorizedBoundPointer(binding, context, candidateSessionId, state)
+    && Boolean(normalizeSessionId(state?.native_session_id));
+}
+
+interface BoundDirectoryAuthorization {
+  readonly comparison: LifecycleCleanupEvidence['comparison'];
+  readonly capability: CapabilityCloseEvidence[];
+  readonly pointerStatus: SessionPointerStatus;
+  readonly pointerRaw?: string;
+}
+
+class BoundDirectoryComparisonDenied extends Error {
+  constructor(readonly comparison: NonNullable<LifecycleCleanupEvidence['comparison']>, readonly capability: CapabilityCloseEvidence[]) {
+    super(comparison.reason);
+  }
+}
+
+async function authorizeBoundDirectoryBeforeTransaction(
+  binding: LaunchSessionBinding,
+  pointer: SessionPointerReadResult,
+  postLaunchCwd: string,
+): Promise<BoundDirectoryAuthorization> {
+  const capability: CapabilityCloseEvidence[] = [];
+  const lease = bindingLeases.get(binding);
+  if (!lease || lease.closed) {
+    throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'binding-lease-closed' }, capability);
+  }
+  try {
+    if (!sameFilePath(binding.context.cwd, postLaunchCwd)
+      || !pointer.state?.cwd
+      || !sameFilePath(binding.context.cwd, pointer.state.cwd)) {
+      throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'cwd-identity-mismatch' }, capability);
+    }
+    if (binding.directoryIdentity.kind !== 'supported') {
+      return {
+        comparison: { status: 'matched', reason: `unsupported-directory-capability:${binding.directoryIdentity.reason}` },
+        capability,
+        pointerStatus: pointer.status,
+        pointerRaw: pointer.raw,
+      };
+    }
+    const retained = await lease.handle?.stat({ bigint: true });
+    if (!retained || !retained.isDirectory() || retained.dev !== binding.directoryIdentity.dev || retained.ino !== binding.directoryIdentity.ino) {
+      throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'retained-directory-identity-mismatch' }, capability);
+    }
+    const canonical = await realpath(binding.context.baseStateDir);
+    const handle = await open(canonical, 'r');
+    let matched = false;
+    try {
+      const stats = await handle.stat({ bigint: true });
+      matched = canonical === binding.canonicalRealpath
+        && stats.isDirectory()
+        && stats.dev === binding.directoryIdentity.dev
+        && stats.ino === binding.directoryIdentity.ino;
+    } finally {
+      try {
+        await handle.close();
+        capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'closed' });
+      } catch (error) {
+        capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'failed', error: safeError(error) });
+        throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'fresh-comparison-close-failed' }, capability);
+      }
+    }
+    if (!matched) throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'directory-identity-mismatch' }, capability);
+    return { comparison: { status: 'matched' }, capability, pointerStatus: pointer.status, pointerRaw: pointer.raw };
+  } catch (error) {
+    if (error instanceof BoundDirectoryComparisonDenied) throw error;
+    throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: errorMessage(error) }, capability);
+  }
+}
+
+async function consumeBoundDirectoryAuthorizationUnderLock(
+  binding: LaunchSessionBinding,
+  authorization: BoundDirectoryAuthorization,
+  pointer: SessionPointerReadResult,
+): Promise<{ comparison: LifecycleCleanupEvidence['comparison']; capability: CapabilityCloseEvidence[] }> {
+  if (authorization.comparison?.status !== 'matched' || binding.directoryIdentity.kind !== 'supported') return authorization;
+  const lease = bindingLeases.get(binding);
+  try {
+    const retained = await lease?.handle?.stat({ bigint: true });
+    if (!retained || !retained.isDirectory() || retained.dev !== binding.directoryIdentity.dev || retained.ino !== binding.directoryIdentity.ino) {
+      throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'retained-directory-identity-mismatch' }, authorization.capability);
+    }
+    if (!pointer.state?.cwd || !sameFilePath(binding.context.cwd, pointer.state.cwd)) {
+      throw new BoundDirectoryComparisonDenied(
+        { status: 'denied', reason: 'cwd-identity-mismatch-under-lock' },
+        authorization.capability,
+      );
+    }
+    const canonical = await realpath(binding.context.baseStateDir);
+    const handle = await open(canonical, 'r');
+    let matched = false;
+    try {
+      const stats = await handle.stat({ bigint: true });
+      matched = canonical === binding.canonicalRealpath
+        && stats.isDirectory()
+        && stats.dev === binding.directoryIdentity.dev
+        && stats.ino === binding.directoryIdentity.ino;
+    } finally {
+      try {
+        await handle.close();
+        authorization.capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'closed' });
+      } catch (error) {
+        authorization.capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'failed', error: safeError(error) });
+        throw new BoundDirectoryComparisonDenied(
+          { status: 'denied', reason: 'fresh-comparison-close-failed-under-lock' },
+          authorization.capability,
+        );
+      }
+    }
+    if (!matched) throw new BoundDirectoryComparisonDenied(
+      { status: 'denied', reason: 'directory-identity-mismatch-under-lock' },
+      authorization.capability,
+    );
+    if (pointer.status !== authorization.pointerStatus || pointer.raw !== authorization.pointerRaw) {
+      throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'pointer-changed-before-consume' }, authorization.capability);
+    }
+    return authorization;
+  } catch (error) {
+    if (error instanceof BoundDirectoryComparisonDenied) throw error;
+    throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: errorMessage(error) }, authorization.capability);
+  }
+}
+
+export function finalizeBoundOnce(
+  binding: LaunchSessionBinding,
+  _reason: string,
+  postLaunchCwd = binding.context.cwd,
+): Promise<BoundFinalizationReport> {
+  const existing = bindingFinalizations.get(binding);
+  if (existing) return existing;
+  const finalization = (async (): Promise<BoundFinalizationReport> => {
+    try {
+      const revalidation = await writeSessionEnd(binding.context.cwd, binding.canonicalSessionId, {
+        context: binding.context, binding, postLaunchCwd,
+      });
+      return { finalized: true, cleanup: { capability: revalidation.capability, comparison: revalidation.comparison } };
+    } catch (error) {
+      if (error instanceof BoundDirectoryComparisonDenied) {
+        return { finalized: false, cleanup: { capability: error.capability, comparison: error.comparison } };
+      }
+      if (isSessionPointerLaunchAbort(error)) {
+        return { finalized: false, cleanup: { capability: [], comparison: { status: 'denied', reason: error.code } } };
+      }
+      throw error;
+    }
+  })();
+  bindingFinalizations.set(binding, finalization);
+  return finalization;
+}
+
+
+function nativeSessionOwnerTransition(
+  nativeSessionId: string,
+  options: SessionStartOptions,
+): (pointer: SessionPointerReadResult, context: SessionPointerContext) => SessionState {
+  return (pointer, context) => {
+    if (pointer.status !== 'absent' && pointer.status !== 'stale-dead' && pointer.status !== 'usable') {
+      throw unusablePointerAbort(context, nativeSessionId, pointer);
+    }
+    const pid = resolvePid(options);
+    const platform = options.platform ?? process.platform;
+    const linuxIdentity = sessionIdentityFor(pid, platform);
+    const existing = pointer.status === 'usable' ? pointer.state : undefined;
+    if (existing && (
+      normalizeSessionId(existing.session_id) !== nativeSessionId
+      || normalizeSessionId(existing.native_session_id) !== nativeSessionId
+      || existing.platform !== platform
+      || !isSessionStateAuthoritativeForCwd(existing, context.cwd)
+      || existing.pid !== pid
+    )) {
+      throw ownerConflictAbort(context, nativeSessionId, existing);
+    }
+    return createSessionState(context.cwd, context.baseStateDir, nativeSessionId, pid, platform, linuxIdentity, {
+      nativeSessionId,
+      startedAt: existing?.started_at,
+      tmuxSessionName: options.tmuxSessionName ?? existing?.tmux_session_name,
+      tmuxPaneId: options.tmuxPaneId ?? existing?.tmux_pane_id,
+    });
+  };
+}
+
+export async function writeNativeSessionOwner(
+  cwd: string,
+  nativeSessionId: string,
+  options: SessionStartOptions = {},
+): Promise<SessionState> {
+  const normalized = normalizeSessionId(nativeSessionId);
+  const context = resolveNativeSessionOwnerContext(cwd, nativeSessionId);
+  const result = await writePointerTransaction(
+    cwd,
+    normalized,
+    { context },
+    NATIVE_POINTER_TIMEOUT_MS,
+    nativeSessionOwnerTransition(normalized ?? nativeSessionId, options),
+    (state) => state,
+  );
+  return result.value;
+}
+
+/** Read and classify the exact native session-owner sidecar without consulting alternate roots. */
+export async function readNativeSessionOwnerEvidence(
+  cwd: string,
+  nativeSessionId: string,
+): Promise<NativeSessionOwnerEvidence> {
+  const normalized = normalizeSessionId(nativeSessionId);
+  if (!normalized) return { status: 'malformed' };
+  const context = resolveNativeSessionOwnerContext(cwd, normalized);
+  const nativeOwnerDir = dirname(context.sessionPath);
+  const sessionsDir = dirname(nativeOwnerDir);
+  const stateRootDir = dirname(sessionsDir);
+  const directoryPaths = [stateRootDir, sessionsDir, nativeOwnerDir];
+  const directoryIdentities: Array<{ path: string; dev: number; ino: number }> = [];
+  try {
+    for (const directoryPath of directoryPaths) {
+      const stat = await transactionDependencies.fs.lstat(directoryPath);
+      if (stat.isSymbolicLink() || !stat.isDirectory()) return { status: 'malformed' };
+      directoryIdentities.push({ path: directoryPath, dev: stat.dev, ino: stat.ino });
+    }
+    const pathStat = await transactionDependencies.fs.lstat(context.sessionPath);
+    if (pathStat.isSymbolicLink() || !pathStat.isFile()) return { status: 'malformed' };
+  } catch (error) {
+    if (isNotFound(error)) return { status: 'absent' };
+    throw error;
+  }
+
+  const handle = await open(context.sessionPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+  let raw: string;
+  try {
+    const openedStat = await handle.stat();
+    if (!openedStat.isFile()) return { status: 'malformed' };
+    raw = await handle.readFile({ encoding: 'utf8' });
+    const finalPathStat = await transactionDependencies.fs.lstat(context.sessionPath);
+    if (finalPathStat.isSymbolicLink()
+      || finalPathStat.dev !== openedStat.dev
+      || finalPathStat.ino !== openedStat.ino) {
+      return { status: 'malformed', raw };
+    }
+    for (const identity of directoryIdentities) {
+      const finalDirectoryStat = await transactionDependencies.fs.lstat(identity.path);
+      if (finalDirectoryStat.isSymbolicLink()
+        || !finalDirectoryStat.isDirectory()
+        || finalDirectoryStat.dev !== identity.dev
+        || finalDirectoryStat.ino !== identity.ino) {
+        return { status: 'malformed', raw };
+      }
+    }
+  } finally {
+    await handle.close();
+  }
+
+  let pointer: SessionPointerReadResult;
+  try {
+    pointer = classifyParsedSessionPointer(context, JSON.parse(raw), raw);
+  } catch (error) {
+    if (error instanceof SyntaxError) return { status: 'malformed', raw };
+    throw error;
+  }
+  if (pointer.status === 'absent' || pointer.status === 'foreign-cwd' || pointer.status === 'malformed' || pointer.status === 'identity-indeterminate') {
+    return pointer;
+  }
+  const state = pointer.state;
+  return state?.session_id === normalized
+    && state.native_session_id === normalized
+    && state.platform === process.platform
+    && isSessionStateAuthoritativeForCwd(state, context.cwd)
+    ? pointer
+    : { status: 'malformed', state, raw: pointer.raw };
+}
+
+export async function readNativeSessionOwner(
+  cwd: string,
+  nativeSessionId: string,
+): Promise<SessionState | null> {
+  try {
+    const evidence = await readNativeSessionOwnerEvidence(cwd, nativeSessionId);
+    return evidence.status === 'usable' ? evidence.state ?? null : null;
+  } catch {
+    return null;
+  }
 }
 
 function reconcileNativeTransition(
   nativeSessionId: string,
   options: SessionStartOptions,
-): (pointer: SessionPointerReadResult, context: SessionPointerContext) => NativeReconcileTransition {
+): (pointer: SessionPointerReadResult, context: SessionPointerContext) => SessionState {
   return (pointer, context) => {
     if (pointer.status !== 'absent' && pointer.status !== 'stale-dead' && pointer.status !== 'usable') {
       throw unusablePointerAbort(context, nativeSessionId, pointer);
@@ -1593,44 +2536,22 @@ function reconcileNativeTransition(
     const platform = options.platform ?? process.platform;
     const linuxIdentity = sessionIdentityFor(pid, platform);
     const existing = pointer.status === 'usable' ? pointer.state : undefined;
-    const nowIso = new Date().toISOString();
 
     if (!existing) {
       const ownerCandidate = verifiedOwnerCandidate(context, options);
       const ownerOmxSessionId = ownerCandidate;
-      return {
-        state: createSessionState(context.cwd, nativeSessionId, pid, platform, linuxIdentity, {
-          nativeSessionId,
-          ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
-        }),
-      };
+      return createSessionState(context.cwd, context.baseStateDir, nativeSessionId, pid, platform, linuxIdentity, {
+        nativeSessionId,
+        ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
+      });
     }
 
     const existingNativeSessionId = normalizeSessionId(existing.native_session_id);
     if (existingNativeSessionId && existingNativeSessionId !== nativeSessionId) {
-      const ownerOmxSessionId = getOmxLaunchSessionId(existing);
-      return {
-        state: createSessionState(context.cwd, nativeSessionId, pid, platform, linuxIdentity, {
-          nativeSessionId,
-          ...(ownerOmxSessionId ? {
-            previousNativeSessionId: existingNativeSessionId,
-            nativeSessionSwitchedAt: nowIso,
-            ownerOmxSessionId,
-          } : {}),
-        }),
-        ...(ownerOmxSessionId ? {
-          replacementLog: {
-            event: 'native_session_replaced',
-            session_id: ownerOmxSessionId,
-            ...(existing.session_id !== ownerOmxSessionId ? { active_session_id: existing.session_id } : {}),
-            previous_native_session_id: existingNativeSessionId,
-            replaced_by_native_session_id: nativeSessionId,
-            pid,
-            timestamp: nowIso,
-          },
-        } : {}),
-      };
+      throw ownerConflictAbort(context, nativeSessionId, existing);
     }
+
+    const nowIso = new Date().toISOString();
 
     const ownerCandidate = verifiedOwnerCandidate(context, options);
     let ownerOmxSessionId: string | undefined;
@@ -1644,25 +2565,26 @@ function reconcileNativeTransition(
       throw ownerConflictAbort(context, nativeSessionId, existing, error);
     }
 
-    return {
-      state: createSessionState(context.cwd, existing.session_id, pid, platform, linuxIdentity, {
-        nowIso,
-        nativeSessionId,
-        previousNativeSessionId: existing.previous_native_session_id,
-        nativeSessionSwitchedAt: existing.native_session_switched_at,
-        ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
-        startedAt: existing.started_at,
-        tmuxSessionName: existing.tmux_session_name,
-        tmuxPaneId: existing.tmux_pane_id,
-      }),
-    };
+    return preserveExistingLaunchLineageToken(existing, createSessionState(context.cwd, context.baseStateDir, existing.session_id, pid, platform, linuxIdentity, {
+      nowIso,
+      nativeSessionId,
+      previousNativeSessionId: existing.previous_native_session_id,
+      nativeSessionSwitchedAt: existing.native_session_switched_at,
+      ...(ownerOmxSessionId ? { ownerOmxSessionId } : {}),
+      startedAt: existing.started_at,
+      tmuxSessionName: existing.tmux_session_name,
+      tmuxPaneId: existing.tmux_pane_id,
+      launchLineageToken: isValidToken(existing.launch_lineage_token)
+        ? existing.launch_lineage_token
+        : undefined,
+    }));
   };
 }
 
 /**
- * Reconcile a native SessionStart without borrowing another root's pointer.
- * A different native ID retains the existing OMX owner chain, but never binds a
- * new owner alias during that replacement transition.
+ * Reconcile native SessionStart only when the selected pointer is absent, stale,
+ * or already belongs to that native session. A different live native ID is
+ * authoritative owner evidence and must never be replaced.
  */
 export async function reconcileNativeSessionStart(
   cwd: string,
@@ -1676,19 +2598,16 @@ export async function reconcileNativeSessionStart(
     options,
     NATIVE_POINTER_TIMEOUT_MS,
     reconcileNativeTransition(normalizedNativeSessionId ?? nativeSessionId, options),
-    (transition) => transition.state,
+    (state) => state,
   );
-  if (result.value.replacementLog) {
-    await appendToLogAtContext(result.context, result.value.replacementLog).catch(() => {});
-  }
   await appendToLogAtContext(result.context, {
-    event: result.value.replacementLog ? 'session_start' : 'session_start_reconciled',
-    session_id: result.value.state.session_id,
+    event: 'session_start_reconciled',
+    session_id: result.value.session_id,
     native_session_id: normalizedNativeSessionId ?? nativeSessionId,
-    pid: result.value.state.pid,
-    timestamp: result.value.state.native_session_switched_at ?? new Date().toISOString(),
+    pid: result.value.pid,
+    timestamp: new Date().toISOString(),
   }).catch(() => {});
-  return result.value.state;
+  return result.value;
 }
 
 function historyDirectory(context: SessionPointerContext): string {
@@ -1724,8 +2643,11 @@ async function removeDeadSessionHudState(
 export async function writeSessionEnd(
   cwd: string,
   sessionId: string,
-  options: Pick<SessionStartOptions, 'context' | 'platform' | 'regularFileSync'> = {},
-): Promise<void> {
+  options: Pick<SessionStartOptions, 'context' | 'platform' | 'regularFileSync'> & {
+    binding?: LaunchSessionBinding;
+    postLaunchCwd?: string;
+  } = {},
+): Promise<{ comparison: LifecycleCleanupEvidence['comparison']; capability: CapabilityCloseEvidence[] }> {
   const candidateSessionId = normalizeSessionId(sessionId);
   let context: SessionPointerContext;
   try {
@@ -1744,18 +2666,34 @@ export async function writeSessionEnd(
     });
   }
 
-  try {
-    await transactionDependencies.fs.mkdir(context.baseStateDir, { recursive: true });
-  } catch (error) {
+  if (!options.binding) {
     throw resolvedAbort(context, {
-      code: 'session_pointer_io_failure',
-      operation: 'state-dir-create',
-      candidateSessionId,
-      lockPath: context.lockPath,
-      reason: `Unable to create selected session state directory: ${errorMessage(error)}`,
-      cause: error,
+      code: 'session_pointer_io_failure', operation: 'pointer-classify', candidateSessionId,
+      lockPath: context.lockPath, reason: 'A live launch binding is required to end a session pointer.',
     });
   }
+
+  let preLockPointer: SessionPointerReadResult;
+  try {
+    preLockPointer = await readSessionPointer(context);
+  } catch (error) {
+    throw resolvedAbort(context, {
+      code: 'session_pointer_io_failure', operation: 'pointer-read', candidateSessionId,
+      lockPath: context.lockPath, reason: `Unable to read selected session pointer: ${errorMessage(error)}`, cause: error,
+    });
+  }
+  const preLockAuthorizedBoundUsable = preLockPointer.status === 'usable'
+    && isAuthorizedBoundPointer(options.binding, context, candidateSessionId, preLockPointer.state);
+  const preLockAuthorizedBoundStaleDead = preLockPointer.status === 'stale-dead'
+    && isAuthorizedBoundStaleDeadPointer(options.binding, context, candidateSessionId, preLockPointer.state);
+  if (!preLockAuthorizedBoundUsable && !preLockAuthorizedBoundStaleDead) {
+    throw unusablePointerAbort(context, candidateSessionId, preLockPointer);
+  }
+  await authorizeBoundDirectoryBeforeTransaction(
+    options.binding,
+    preLockPointer,
+    options.postLaunchCwd ?? options.binding.context.cwd,
+  );
 
   const platform = options.platform ?? process.platform;
   const tracker: RegularFileDurabilityTracker = { degraded: false };
@@ -1768,6 +2706,9 @@ export async function writeSessionEnd(
     options.regularFileSync,
   );
   let primary: unknown;
+  let revalidation: { comparison: LifecycleCleanupEvidence['comparison']; capability: CapabilityCloseEvidence[] } = {
+    comparison: { status: 'not-run' }, capability: [],
+  };
   try {
     let pointer: SessionPointerReadResult;
     try {
@@ -1782,15 +2723,22 @@ export async function writeSessionEnd(
         cause: error,
       });
     }
-    if (pointer.status !== 'absent' && pointer.status !== 'usable') {
+    const authorizedBoundUsable = pointer.status === 'usable'
+      && isAuthorizedBoundPointer(options.binding, context, candidateSessionId, pointer.state);
+    const authorizedBoundStaleDead = pointer.status === 'stale-dead'
+      && isAuthorizedBoundStaleDeadPointer(options.binding, context, candidateSessionId, pointer.state);
+    if (!authorizedBoundUsable && !authorizedBoundStaleDead) {
       throw unusablePointerAbort(context, candidateSessionId, pointer);
     }
+    const authorization = await authorizeBoundDirectoryBeforeTransaction(
+      options.binding,
+      pointer,
+      options.postLaunchCwd ?? options.binding.context.cwd,
+    );
+    revalidation = await consumeBoundDirectoryAuthorizationUnderLock(options.binding, authorization, pointer);
 
-    const state = pointer.state;
-    const ownsCurrentSessionFile = state == null
-      || state.session_id === candidateSessionId
-      || state.native_session_id === candidateSessionId
-      || state.owner_omx_session_id === candidateSessionId;
+    const state = pointer.state!;
+    const ownsCurrentSessionFile = true;
     const endTime = new Date().toISOString();
     const historyEntry = {
       session_id: ownsCurrentSessionFile
@@ -1841,6 +2789,7 @@ export async function writeSessionEnd(
   }
   if (releaseFailures.length > 0) throw releaseFailureError(releaseFailures);
   emitDegradedDurabilityWarning('session pointer end', tracker);
+  return revalidation;
 }
 
 /** Reset session-scoped HUD/metrics files at launch. */

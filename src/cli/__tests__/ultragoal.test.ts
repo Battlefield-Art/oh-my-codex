@@ -68,6 +68,70 @@ async function capture(run: () => Promise<void>): Promise<{ stdout: string[]; st
 }
 
 describe('cli/ultragoal', () => {
+  it('does not create durable artifacts when OMX_SESSION_ID is unbound', async () => {
+    await withCwd(async (cwd) => {
+      const previousSessionId = process.env.OMX_SESSION_ID;
+      process.env.OMX_SESSION_ID = 'sess-unbound';
+      try {
+        const result = await capture(() => ultragoalCommand([
+          'create-goals',
+          '--brief',
+          '- First milestone',
+        ]));
+
+        assert.equal(result.exitCode, 1);
+        assert.match(result.stderr.join('\n'), /writable lifecycle authority/);
+        assert.match(result.stderr.join('\n'), /OMX_SESSION_ID is not bound to session\.json/);
+        assert.equal(existsSync(join(cwd, '.omx/ultragoal')), false);
+        assert.equal(existsSync(join(cwd, '.omx/ultragoal/brief.md')), false);
+        assert.equal(existsSync(join(cwd, '.omx/ultragoal/goals.json')), false);
+        assert.equal(existsSync(join(cwd, '.omx/ultragoal/ledger.jsonl')), false);
+      } finally {
+        if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
+        else delete process.env.OMX_SESSION_ID;
+      }
+    });
+  });
+
+  it('preserves an existing plan when unbound OMX_SESSION_ID rejects --force recreation', async () => {
+    await withCwd(async (cwd) => {
+      const previousSessionId = process.env.OMX_SESSION_ID;
+      delete process.env.OMX_SESSION_ID;
+      try {
+        const created = await capture(() => ultragoalCommand([
+          'create-goals',
+          '--brief',
+          '- Original milestone',
+        ]));
+        assert.equal(created.exitCode, undefined);
+
+        const artifactPaths = [
+          join(cwd, '.omx/ultragoal/brief.md'),
+          join(cwd, '.omx/ultragoal/goals.json'),
+          join(cwd, '.omx/ultragoal/ledger.jsonl'),
+        ];
+        const before = await Promise.all(artifactPaths.map((path) => readFile(path)));
+
+        process.env.OMX_SESSION_ID = 'sess-unbound-force';
+        const rejected = await capture(() => ultragoalCommand([
+          'create-goals',
+          '--brief',
+          '- Replacement milestone',
+          '--force',
+        ]));
+
+        assert.equal(rejected.exitCode, 1);
+        assert.match(rejected.stderr.join('\n'), /writable lifecycle authority/);
+        assert.match(rejected.stderr.join('\n'), /OMX_SESSION_ID is not bound to session\.json/);
+        const after = await Promise.all(artifactPaths.map((path) => readFile(path)));
+        assert.deepEqual(after, before);
+      } finally {
+        if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
+        else delete process.env.OMX_SESSION_ID;
+      }
+    });
+  });
+
   it('refuses mutating ultragoal commands from Team worker environments', async () => {
     const mutators: string[][] = [
       ['create-goals', '--brief', 'worker must not create'],
@@ -230,6 +294,9 @@ describe('cli/ultragoal', () => {
         assert.equal(roleRoutingOutput.includes(buildRoleRoutingUnavailableGuidance(expectedRoleRoutingSupport)), true);
         assert.equal(roleRoutingOutput.includes(LEADER_CONDUCTOR_BLOCK), false);
         assert.equal(roleRoutingOutput.includes(buildUnsupportedNativeSubagentGuidance(unsupportedEvidence)), false);
+        assert.match(roleRoutingOutput, /When adapted Ralplan authority is requested, run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`/);
+        assert.match(roleRoutingOutput, /Ordinary native sessions and ordinary work remain under their own workflow gates/);
+        assert.doesNotMatch(roleRoutingOutput, /Before Ralplan planner, reviewer, HUD, runtime, or delegation work/);
       } finally {
         if (typeof previousSessionId === 'string') process.env.OMX_SESSION_ID = previousSessionId;
         else delete process.env.OMX_SESSION_ID;
@@ -322,7 +389,7 @@ describe('cli/ultragoal', () => {
         reconciliation?: { ok: boolean; warnings: string[]; snapshot: { unavailableReason?: string } };
       };
       assert.equal(parsed.summary.complete, 1);
-      assert.equal(parsed.summary.aggregateComplete, false);
+      assert.equal(parsed.summary.aggregateComplete, true);
       assert.equal(parsed.summary.artifactComplete, true);
       assert.equal(parsed.codexGoalFallback?.status, 'codex_goal_reconciliation_unavailable');
       assert.equal(parsed.codexGoalFallback?.reason, 'db_schema_context_error');
@@ -336,7 +403,7 @@ describe('cli/ultragoal', () => {
         JSON.stringify({ error: 'SQL error: no such table: thread_goals' }),
       ]));
       const output = human.stdout.join('\n');
-      assert.match(output, /ultragoal artifact goals: complete/);
+      assert.match(output, /ultragoal aggregate product: complete/);
       assert.match(output, /codex goal fallback: Codex goal DB\/schema\/context is unavailable/);
       assert.match(output, /codex goal warning: .*no such table: thread_goals/);
     });
@@ -720,6 +787,60 @@ describe('cli/ultragoal', () => {
 
       const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
       assert.match(ledger, /"event":"goal_blocked"/);
+    });
+  });
+  it('records matching native blocked Codex goal checkpoints as non-terminal and exposes status diagnostics', async () => {
+    await withCwd(async (cwd) => {
+      await capture(() => ultragoalCommand(['create-goals', '--brief', '- First milestone']));
+      await capture(() => ultragoalCommand(['complete-goals']));
+      const statusOut = await capture(() => ultragoalCommand(['status', '--json']));
+      const status = JSON.parse(statusOut.stdout.join('\n')) as { plan?: { codexObjective?: string }; goals?: Array<{ objective?: string }> };
+      // fall back to known aggregate objective text if needed
+      const objective = status.plan?.codexObjective
+        ?? 'Complete the durable ultragoal plan in .omx/ultragoal/goals.json, including later accepted/appended stories, under the original brief constraints; use .omx/ultragoal/ledger.jsonl as the audit trail.';
+
+      const blockedJson = JSON.stringify({ goal: { objective, status: 'blocked' } });
+      const blocked = await capture(() => ultragoalCommand([
+        'checkpoint',
+        '--goal-id', 'G001-first-milestone',
+        '--status', 'blocked',
+        '--evidence', 'native matching blocked needs attention',
+        '--codex-goal-json', blockedJson,
+        '--json',
+      ]));
+      assert.equal(blocked.exitCode, undefined, blocked.stderr.join('\n'));
+      const parsed = JSON.parse(blocked.stdout.join('\n')) as { summary: { inProgress: number }; plan: { activeGoalId?: string } };
+      assert.equal(parsed.summary.inProgress, 1);
+      assert.equal(parsed.plan.activeGoalId, 'G001-first-milestone');
+
+      const ledger = await readFile(join(cwd, '.omx/ultragoal/ledger.jsonl'), 'utf-8');
+      assert.match(ledger, /"event":"goal_blocked"/);
+      assert.match(ledger, /"status":"blocked"/);
+
+      const recon = await capture(() => ultragoalCommand([
+        'status',
+        '--codex-goal-json', blockedJson,
+        '--json',
+      ]));
+      assert.equal(recon.exitCode, undefined, recon.stderr.join('\n'));
+      const reconParsed = JSON.parse(recon.stdout.join('\n')) as {
+        reconciliation?: { ok?: boolean; snapshot?: { status?: string; raw?: { goal?: { status?: string } } }; errors?: string[] };
+      };
+      assert.equal(reconParsed.reconciliation?.snapshot?.status, 'blocked');
+      assert.equal(reconParsed.reconciliation?.snapshot?.raw?.goal?.status, 'blocked');
+      assert.equal(reconParsed.reconciliation?.ok, false);
+      assert.match((reconParsed.reconciliation?.errors ?? []).join('\n'), /got blocked/);
+      assert.doesNotMatch((reconParsed.reconciliation?.errors ?? []).join('\n'), /got unknown/);
+
+      const mismatch = await capture(() => ultragoalCommand([
+        'checkpoint',
+        '--goal-id', 'G001-first-milestone',
+        '--status', 'blocked',
+        '--evidence', 'foreign blocked goal',
+        '--codex-goal-json', '{"goal":{"objective":"Different blocked work","status":"blocked"}}',
+      ]));
+      assert.equal(mismatch.exitCode, 1);
+      assert.match(mismatch.stderr.join('\n'), /objective mismatch/);
     });
   });
 

@@ -1,14 +1,16 @@
 import assert from "node:assert/strict";
-import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, realpathSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { existsSync, realpathSync, statSync } from "node:fs";
 import {
 	chmod,
+	appendFile,
 	mkdir,
 	mkdtemp,
 	readFile,
 	readdir,
 	rm,
 	symlink,
+	utimes,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -26,14 +28,25 @@ import {
 	writeTeamLeaderAttention,
   writeWorkerIdentity,
 } from "../../team/state.js";
+import { registerTeamNotice } from "../../team/notice-ledger.js";
 import {
 	dispatchCodexNativeHook,
+	isSloppyFallbackTranscriptStartUsable,
+  readUnambiguousSessionStartNativeId,
+  resolvePersistedReopenRootContext,
 	isCodexNativeHookMainModule,
 	looksLikeGoalCompletionPrompt,
 	mapCodexHookEventToOmxEvent,
 	resolveSessionOwnerPidFromAncestry,
 } from "../codex-native-hook.js";
-import { writeSessionStart } from "../../hooks/session.js";
+import {
+	closeLaunchSessionBindingOnce,
+	establishLaunchSessionBinding,
+	finalizeBoundOnce,
+	updateDetachedSessionMetadata,
+	writeSessionStart,
+} from "../../hooks/session.js";
+import { neutralizeOwnedRoutingRalplan } from '../../ralplan/documented-leader-preflight.js';
 import { resetTriageConfigCache } from "../../hooks/triage-config.js";
 import { executeStateOperation } from "../../state/operations.js";
 import { HUD_TMUX_HEIGHT_LINES } from "../../hud/constants.js";
@@ -54,14 +67,7 @@ import {
 import { getBaseStateDir } from "../../state/paths.js";
 import { maybeNudgeLeaderForAllowedWorkerStop } from "../notify-hook/team-worker-stop.js";
 import { MAX_NATIVE_STDIN_JSON_BYTES } from "../hook-payload-guard.js";
-import { readSubagentTrackingState, recordPendingRoleIntent } from "../../subagents/tracker.js";
-import { buildRoleIntentSpawnTaskName } from "../../leader/contract.js";
 
-import {
-	NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE,
-	readRoleRoutingMarker,
-	writeRoleRoutingMarker,
-} from "../../subagents/role-routing-marker.js";
 
 const ARGUMENT_PRODUCING_RUNTIME_DENIAL_COMMANDS = [
   ["node-xargs-wrapper-read", `printf x | xargs node -e "require('fs').readFileSync('src/victim.ts','utf8')"`],
@@ -154,6 +160,31 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 	await writeFile(path, JSON.stringify(value, null, 2));
 }
 
+const AMBIENT_UNSAFE_NODE_RUNTIME_ENV_NAMES = [
+	"NODE_OPTIONS",
+	"OPENSSL_CONF",
+	"NODE_V8_COVERAGE",
+	"NODE_COMPILE_CACHE",
+	"NODE_REDIRECT_WARNINGS",
+	"NODE_REPORT_DIRECTORY",
+	"NODE_REPORT_FILENAME",
+] as const;
+
+async function withCleanAmbientNodeRuntimeEnvironment<T>(run: () => Promise<T>): Promise<T> {
+	const previousRuntimeEnv = Object.fromEntries(
+		AMBIENT_UNSAFE_NODE_RUNTIME_ENV_NAMES.map((name) => [name, process.env[name]]),
+	);
+	for (const name of AMBIENT_UNSAFE_NODE_RUNTIME_ENV_NAMES) delete process.env[name];
+	try {
+		return await run();
+	} finally {
+		for (const name of AMBIENT_UNSAFE_NODE_RUNTIME_ENV_NAMES) {
+			if (previousRuntimeEnv[name] === undefined) delete process.env[name];
+			else process.env[name] = previousRuntimeEnv[name];
+		}
+	}
+}
+
 async function writeCanonicalLeaderFixture(
 	stateDir: string,
 	sessionId: string,
@@ -190,7 +221,7 @@ async function withTrustedWorkspaceOmxCli<T>(
   await mkdir(binDir, { recursive: true });
   await rm(shimPath, { force: true });
   await symlink(cliPath, shimPath);
-  const path = `${binDir}:/usr/bin:/bin`;
+  const path = `${binDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
   return await action(commandForm === "env" ? `env PATH="${path}" omx` : `PATH="${path}" omx`, path);
 }
 
@@ -255,6 +286,56 @@ async function writeLiveNativeMappedSessionState(
   }
 }
 
+async function writeLiveNativeSessionOwnerSidecar(
+	cwd: string,
+	stateDir: string,
+	sessionId: string,
+): Promise<void> {
+	const selected = JSON.parse(
+		await readFile(join(stateDir, "session.json"), "utf-8"),
+	) as Record<string, unknown>;
+	await writeJson(
+		join(stateDir, "sessions", sessionId, "session-owner.json"),
+		{
+			...selected,
+			session_id: sessionId,
+			native_session_id: sessionId,
+			started_at: new Date().toISOString(),
+			cwd,
+		},
+	);
+}
+
+async function withIndependentNativeSession(
+	suffix: string,
+	run: (fixture: {
+		cwd: string;
+		stateDir: string;
+		sessionId: string;
+		pointerBefore: string;
+	}) => Promise<void>,
+): Promise<void> {
+	const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-sidecar-${suffix}-`));
+	try {
+		const stateDir = join(cwd, ".omx", "state");
+		const selectedSessionId = `native-selected-${suffix}`;
+		const sessionId = `native-independent-${suffix}`;
+		await writeSessionStart(cwd, selectedSessionId, {
+			nativeSessionId: selectedSessionId,
+			pid: process.pid,
+		});
+		await writeLiveNativeSessionOwnerSidecar(cwd, stateDir, sessionId);
+		await run({
+			cwd,
+			stateDir,
+			sessionId,
+			pointerBefore: await readFile(join(stateDir, "session.json"), "utf-8"),
+		});
+	} finally {
+		await rm(cwd, { recursive: true, force: true });
+	}
+}
+
 async function writeSessionSkillActiveState(
 	stateDir: string,
 	sessionId: string,
@@ -271,6 +352,62 @@ async function writeSessionSkillActiveState(
 			active_skills: [{ skill, phase, active: true, session_id: sessionId }],
 		},
 	);
+}
+
+
+async function writeIssue3239ActiveAutopilotDeepInterviewState(
+	cwd: string,
+	sessionId: string,
+	threadId: string,
+): Promise<void> {
+	const stateDir = join(cwd, ".omx", "state");
+	const sessionDir = join(stateDir, "sessions", sessionId);
+	await mkdir(sessionDir, { recursive: true });
+	await writeJson(join(stateDir, "session.json"), {
+		session_id: sessionId,
+		leader_thread_id: threadId,
+		cwd,
+	});
+	await writeJson(join(stateDir, "subagent-tracking.json"), {
+		schemaVersion: 1,
+		sessions: {
+			[sessionId]: {
+				session_id: sessionId,
+				leader_thread_id: threadId,
+				threads: {
+					[threadId]: { thread_id: threadId, kind: "leader" },
+				},
+			},
+		},
+	});
+	await writeJson(join(sessionDir, "skill-active-state.json"), {
+		version: 1,
+		active: true,
+		skill: "autopilot",
+		phase: "deep-interview",
+		session_id: sessionId,
+		thread_id: threadId,
+		active_skills: [
+			{ skill: "autopilot", phase: "deep-interview", active: true, session_id: sessionId, thread_id: threadId },
+		],
+	});
+	await writeJson(join(sessionDir, "autopilot-state.json"), {
+		active: true,
+		mode: "autopilot",
+		current_phase: "deep-interview",
+		session_id: sessionId,
+		thread_id: threadId,
+		workingDirectory: cwd,
+		deep_interview_gate: { status: "required" },
+	});
+	await writeJson(join(sessionDir, "deep-interview-state.json"), {
+		active: true,
+		mode: "deep-interview",
+		current_phase: "intent-first",
+		session_id: sessionId,
+		thread_id: threadId,
+		workingDirectory: cwd,
+	});
 }
 
 async function setTeamPaneIds(
@@ -293,6 +430,54 @@ async function setTeamPaneIds(
 		}));
 		await writeJson(filePath, parsed);
 	}
+}
+
+async function configureAuthoritativeTeamWorker(
+  cwd: string,
+  teamName: string,
+  workerPaneId = "%10",
+): Promise<void> {
+  const stateRoot = join(cwd, ".omx", "state");
+  await initTeamState(teamName, "session pointer ownership regression", "executor", 1, cwd, undefined, {
+    OMX_SESSION_ID: "leader-session",
+  });
+  await setTeamPaneIds(cwd, teamName, {
+    leaderPaneId: "%42",
+    workerPaneIds: { "worker-1": workerPaneId },
+  });
+  for (const fileName of ["config.json", "manifest.v2.json"]) {
+    const filePath = join(stateRoot, "team", teamName, fileName);
+    const state = JSON.parse(await readFile(filePath, "utf-8")) as {
+      team_state_root?: string;
+      leader_cwd?: string;
+      workers?: Array<Record<string, unknown>>;
+    };
+    state.team_state_root = stateRoot;
+    state.leader_cwd = cwd;
+    state.workers = (state.workers ?? []).map((worker) => ({
+      ...worker,
+      working_dir: cwd,
+      worktree_path: cwd,
+      team_state_root: stateRoot,
+    }));
+    await writeJson(filePath, state);
+  }
+  await writeJson(join(stateRoot, "team", teamName, "workers", "worker-1", "identity.json"), {
+    name: "worker-1",
+    index: 1,
+    role: "executor",
+    pane_id: workerPaneId,
+    working_dir: cwd,
+    worktree_path: cwd,
+    team_state_root: stateRoot,
+  });
+  process.env.TMUX = "1";
+  process.env.TMUX_PANE = workerPaneId;
+  process.env.OMX_TEAM_INTERNAL_WORKER = `${teamName}/worker-1`;
+  process.env.OMX_TEAM_WORKER = `${teamName}/worker-1`;
+  process.env.OMX_TEAM_STATE_ROOT = stateRoot;
+  process.env.OMX_TEAM_LEADER_CWD = cwd;
+  process.env.OMX_SESSION_ID = "leader-session";
 }
 
 async function withIsolatedHome<T>(
@@ -690,7 +875,7 @@ describe("codex native hook config", () => {
 	});
 });
 
-describe("codex native hook dispatch", () => {
+describe("codex native hook dispatch", { concurrency: false }, () => {
 	it("treats space-containing argv entry paths as the main module", () => {
 		const entryPath = "/tmp/omx native/codex-native-hook.js";
 
@@ -2023,6 +2208,26 @@ PY`,
 		}
 	});
 
+	it("drains oversized stdin without breaking the parent writer pipe", async () => {
+		const child = spawn(process.execPath, [nativeHookScriptPath()], {
+			stdio: ["pipe", "ignore", "ignore"],
+		});
+		const payload = JSON.stringify({
+			hook_event_name: "UserPromptSubmit",
+			prompt: "x".repeat(MAX_NATIVE_STDIN_JSON_BYTES * 2),
+		});
+		const exitCode = new Promise<number | null>((resolve) => {
+			child.once("close", resolve);
+		});
+		const writeError = await new Promise<Error | null>((resolve) => {
+			child.stdin.once("error", resolve);
+			child.stdin.end(payload, () => resolve(null));
+		});
+
+		assert.equal(writeError, null);
+		assert.equal(await exitCode, 0);
+	});
+
 	it("blocks oversized Stop stdin when current session autopilot is active", async () => {
 		const cwd = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-cli-stop-oversized-active-"),
@@ -2298,13 +2503,13 @@ PY`,
       { name: "doc-preserves-earlier", prompt: "Use autopilot mode; \"note\"; use $ralplan is the workflow command.", expectedSkill: "autopilot" },
       { name: "doc-colon-followup", prompt: "use $ralplan is the workflow command: use $autopilot build it", expectedSkill: "autopilot" },
       { name: "table-followup", prompt: "Mode | Meaning\n--- | ---\nmanual | documentation\n$ralplan plan it", expectedSkill: "ralplan" },
-      { name: "neg-advance-reopen", prompt: "Do not run $ralplan but advance to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false },
-      { name: "neg-jump-reopen", prompt: "Do not run $ralplan but jump straight to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false },
+      { name: "neg-advance-reopen", prompt: "Do not run $ralplan but advance to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false, insideTmux: true },
+      { name: "neg-jump-reopen", prompt: "Do not run $ralplan but jump straight to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false, insideTmux: true },
       { name: "reference-plain-title", prompt: "[docs]: /target \"title\nplain text\"\n$ralplan plan it", expectedSkill: "ralplan" },
       { name: "reference-plain-destination", prompt: "[docs]: ./target\n$ralplan plan it", expectedSkill: "ralplan" },
       { name: "directive-use-the", prompt: "Do not run $ralplan; use the $autopilot build it", expectedSkill: "autopilot" },
       { name: "directive-continue-after-quote", prompt: "\"quoted\"\ncontinue with $ralplan", expectedSkill: "ralplan" },
-      { name: "doc-advance-followup", prompt: "use $ralplan is the workflow command; advance to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false },
+      { name: "doc-advance-followup", prompt: "use $ralplan is the workflow command; advance to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false, insideTmux: true },
       { name: "directive-run-analyze", prompt: "run $analyze", expectedSkill: "analyze", expectedStopBlock: false },
       { name: "directive-run-code-review", prompt: "run $code-review", expectedSkill: "code-review", expectedStopBlock: false },
       { name: "directive-please-use-code-review", prompt: "please use $code-review", expectedSkill: "code-review", expectedStopBlock: false },
@@ -2318,7 +2523,7 @@ PY`,
       { name: "directive-continue-code-review", prompt: "continue $code-review", expectedSkill: "code-review", expectedStopBlock: false },
       { name: "directive-documentation", prompt: "use $ralplan is the consensus-planning command", expectedSkill: null },
       { name: "g1a-ordered-multi-skill", prompt: "$ralplan, $autopilot; $team", expectedSkill: "ralplan", expectedDeferredSkills: ["autopilot", "team"], expectedActiveSkills: ["ralplan"], expectedActiveDetailSkills: ["ralplan"], insideTmux: true },
-      { name: "g1c-duplicate-alias", prompt: "$autopilot $oh-my-codex:autopilot build it", expectedSkill: "autopilot", expectedDeferredSkills: [], expectedActiveSkills: ["autopilot"] },
+      { name: "g1c-duplicate-alias", prompt: "$autopilot $oh-my-codex:autopilot build it", expectedSkill: "autopilot", expectedDeferredSkills: [], expectedActiveSkills: [] },
       { name: "b3-longer-valid-fence", prompt: "```text\n$ralplan plan it\n````\n$ralplan plan it", expectedSkill: "ralplan" },
       { name: "b4-shorter-invalid-fence", prompt: "````text\n$ralplan plan it\n```\n$autopilot build it", expectedSkill: null },
       { name: "b5-different-marker-invalid-fence", prompt: "```text\n$ralplan plan it\n~~~\n$autopilot build it", expectedSkill: null },
@@ -2568,12 +2773,26 @@ PY`,
 
         const sessionDir = join(cwd, ".omx", "state", "sessions", sessionId);
         const skillStatePath = join(sessionDir, "skill-active-state.json");
+        const expectsAutopilotDenial = testCase.expectedSkill === "autopilot";
         if (testCase.expectedSkill === null) {
           assert.equal(existsSync(skillStatePath), false, testCase.name);
         } else {
-          const skillState = JSON.parse(await readFile(skillStatePath, "utf-8")) as { active?: boolean; skill?: string; deferred_skills?: string[]; active_skills?: Array<{ skill?: string }> };
-          assert.equal(skillState.active, true, testCase.name);
-          assert.equal(skillState.skill, testCase.expectedSkill, testCase.name);
+          const skillState = JSON.parse(await readFile(skillStatePath, "utf-8")) as { active?: boolean; skill?: string; phase?: string; error?: string; deferred_skills?: string[]; active_skills?: Array<{ skill?: string }> };
+          if (expectsAutopilotDenial) {
+            assert.equal(skillState.active, false, testCase.name);
+            assert.equal(skillState.skill, "autopilot", testCase.name);
+            assert.equal(skillState.phase, "failed", testCase.name);
+            assert.equal(skillState.error, "documented_host_consensus_receipt_unavailable", testCase.name);
+            assert.deepEqual(skillState.active_skills, [], testCase.name);
+            const guidance = String((submit.outputJson as { hookSpecificOutput?: { additionalContext?: string } } | null)?.hookSpecificOutput?.additionalContext ?? "");
+            assert.match(guidance, /documented_host_consensus_receipt_unavailable/, testCase.name);
+            assert.doesNotMatch(guidance, /Autopilot protocol:|deep-interview -> ralplan -> ultragoal/, testCase.name);
+            assert.equal(existsSync(join(sessionDir, "deep-interview-state.json")), false, testCase.name);
+            assert.equal(existsSync(join(sessionDir, "ultragoal-state.json")), false, testCase.name);
+          } else {
+            assert.equal(skillState.active, true, testCase.name);
+            assert.equal(skillState.skill, testCase.expectedSkill, testCase.name);
+          }
           if ("expectedDeferredSkills" in testCase) {
             assert.deepEqual(skillState.deferred_skills ?? [], testCase.expectedDeferredSkills, testCase.name);
           }
@@ -2599,8 +2818,9 @@ PY`,
           thread_id: `thread-${testCase.name}`,
           turn_id: `stop-${testCase.name}`,
         }, { cwd });
-        if (testCase.expectedSkill === null) assert.equal(stop.outputJson, null, testCase.name);
-        else if ("expectedStopBlock" in testCase && !testCase.expectedStopBlock) {
+        if (testCase.expectedSkill === null || expectsAutopilotDenial) {
+          assert.equal(stop.outputJson, null, testCase.name);
+        } else if ("expectedStopBlock" in testCase && !testCase.expectedStopBlock) {
           assert.notEqual((stop.outputJson as { decision?: string } | null)?.decision, "block", testCase.name);
         } else assert.equal((stop.outputJson as { decision?: string } | null)?.decision, "block", testCase.name);
       } finally {
@@ -2732,13 +2952,13 @@ PY`,
       { name: "doc-preserves-earlier", prompt: "Use autopilot mode; \"note\"; use $ralplan is the workflow command.", expectedSkill: "autopilot" },
       { name: "doc-colon-followup", prompt: "use $ralplan is the workflow command: use $autopilot build it", expectedSkill: "autopilot" },
       { name: "table-followup", prompt: "Mode | Meaning\n--- | ---\nmanual | documentation\n$ralplan plan it", expectedSkill: "ralplan" },
-      { name: "neg-advance-reopen", prompt: "Do not run $ralplan but advance to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false },
-      { name: "neg-jump-reopen", prompt: "Do not run $ralplan but jump straight to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false },
+      { name: "neg-advance-reopen", prompt: "Do not run $ralplan but advance to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false, insideTmux: true },
+      { name: "neg-jump-reopen", prompt: "Do not run $ralplan but jump straight to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false, insideTmux: true },
       { name: "reference-plain-title", prompt: "[docs]: /target \"title\nplain text\"\n$ralplan plan it", expectedSkill: "ralplan" },
       { name: "reference-plain-destination", prompt: "[docs]: ./target\n$ralplan plan it", expectedSkill: "ralplan" },
       { name: "directive-use-the", prompt: "Do not run $ralplan; use the $autopilot build it", expectedSkill: "autopilot" },
       { name: "directive-continue-after-quote", prompt: "\"quoted\"\ncontinue with $ralplan", expectedSkill: "ralplan" },
-      { name: "doc-advance-followup", prompt: "use $ralplan is the workflow command; advance to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false },
+      { name: "doc-advance-followup", prompt: "use $ralplan is the workflow command; advance to $ultragoal", expectedSkill: "ultragoal", expectedStopBlock: false, insideTmux: true },
       { name: "directive-run-analyze", prompt: "run $analyze", expectedSkill: "analyze", expectedStopBlock: false },
       { name: "directive-run-code-review", prompt: "run $code-review", expectedSkill: "code-review", expectedStopBlock: false },
       { name: "directive-please-use-code-review", prompt: "please use $code-review", expectedSkill: "code-review", expectedStopBlock: false },
@@ -2752,7 +2972,7 @@ PY`,
       { name: "directive-continue-code-review", prompt: "continue $code-review", expectedSkill: "code-review", expectedStopBlock: false },
       { name: "directive-documentation", prompt: "use $ralplan is the consensus-planning command", expectedSkill: null },
       { name: "g1a-ordered-multi-skill", prompt: "$ralplan, $autopilot; $team", expectedSkill: "ralplan", expectedDeferredSkills: ["autopilot", "team"], expectedActiveSkills: ["ralplan"], expectedActiveDetailSkills: ["ralplan"], insideTmux: true },
-      { name: "g1c-duplicate-alias", prompt: "$autopilot $oh-my-codex:autopilot build it", expectedSkill: "autopilot", expectedDeferredSkills: [], expectedActiveSkills: ["autopilot"] },
+      { name: "g1c-duplicate-alias", prompt: "$autopilot $oh-my-codex:autopilot build it", expectedSkill: "autopilot", expectedDeferredSkills: [], expectedActiveSkills: [] },
       { name: "b3-longer-valid-fence", prompt: "```text\n$ralplan plan it\n````\n$ralplan plan it", expectedSkill: "ralplan" },
       { name: "b4-shorter-invalid-fence", prompt: "````text\n$ralplan plan it\n```\n$autopilot build it", expectedSkill: null },
       { name: "b5-different-marker-invalid-fence", prompt: "```text\n$ralplan plan it\n~~~\n$autopilot build it", expectedSkill: null },
@@ -3046,6 +3266,7 @@ PY`,
 
         const sessionDir = join(cwd, ".omx", "state", "sessions", sessionId);
         const skillStatePath = join(sessionDir, "skill-active-state.json");
+        const expectsAutopilotDenial = testCase.expectedSkill === "autopilot";
         if (testCase.expectedSkill === null) {
           assert.equal(existsSync(skillStatePath), false, testCase.name);
           assert.equal(existsSync(join(sessionDir, "ralplan-state.json")), false, testCase.name);
@@ -3055,11 +3276,26 @@ PY`,
           const skillState = JSON.parse(await readFile(skillStatePath, "utf-8")) as {
             active?: boolean;
             skill?: string;
+            phase?: string;
+            error?: string;
             deferred_skills?: string[];
             active_skills?: Array<{ skill?: string }>;
           };
-          assert.equal(skillState.active, true, testCase.name);
-          assert.equal(skillState.skill, testCase.expectedSkill, testCase.name);
+          if (expectsAutopilotDenial) {
+            assert.equal(skillState.active, false, testCase.name);
+            assert.equal(skillState.skill, "autopilot", testCase.name);
+            assert.equal(skillState.phase, "failed", testCase.name);
+            assert.equal(skillState.error, "documented_host_consensus_receipt_unavailable", testCase.name);
+            assert.deepEqual(skillState.active_skills, [], testCase.name);
+            const guidance = String((submit.hookSpecificOutput as { additionalContext?: string } | undefined)?.additionalContext ?? "");
+            assert.match(guidance, /documented_host_consensus_receipt_unavailable/, testCase.name);
+            assert.doesNotMatch(guidance, /Autopilot protocol:|deep-interview -> ralplan -> ultragoal/, testCase.name);
+            assert.equal(existsSync(join(sessionDir, "deep-interview-state.json")), false, testCase.name);
+            assert.equal(existsSync(join(sessionDir, "ultragoal-state.json")), false, testCase.name);
+          } else {
+            assert.equal(skillState.active, true, testCase.name);
+            assert.equal(skillState.skill, testCase.expectedSkill, testCase.name);
+          }
           if ("expectedDeferredSkills" in testCase) {
             assert.deepEqual(skillState.deferred_skills ?? [], testCase.expectedDeferredSkills, testCase.name);
           }
@@ -3085,7 +3321,7 @@ PY`,
           thread_id: `thread-${caseIndex}`,
           turn_id: `stop-${caseIndex}`,
         }, { cwd, env }));
-        if (testCase.expectedSkill === null) assert.deepEqual(stop, {}, testCase.name);
+        if (testCase.expectedSkill === null || expectsAutopilotDenial) assert.deepEqual(stop, {}, testCase.name);
         else if ("expectedStopBlock" in testCase && !testCase.expectedStopBlock) {
           assert.notEqual(stop.decision, "block", testCase.name);
         } else assert.equal(stop.decision, "block", testCase.name);
@@ -3095,7 +3331,7 @@ PY`,
     }
   });
 
-  it("restarts terminal Autopilot through disabled-Team explicit UserPromptSubmit and blocks compiled Stop", async () => {
+  it("keeps terminal Autopilot failed and inactive when disabled-Team restart lacks host receipt verification", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-disabled-team-terminal-restart-"));
     const sessionId = "sess-disabled-team-terminal-restart";
     const threadId = "thread-disabled-team-terminal-restart";
@@ -3128,16 +3364,26 @@ PY`,
         prompt: "$team $autopilot retry",
       }, { cwd });
       assert.equal(restart.skillState?.skill, "autopilot");
-      assert.equal(restart.skillState?.active, true);
+      assert.equal(restart.skillState?.active, false);
+      assert.equal(restart.skillState?.phase, "failed");
+      assert.equal(restart.skillState?.error, "documented_host_consensus_receipt_unavailable");
+      assert.deepEqual(restart.skillState?.active_skills, []);
+      const restartGuidance = String((restart.outputJson as { hookSpecificOutput?: { additionalContext?: string } } | null)?.hookSpecificOutput?.additionalContext ?? "");
+      assert.match(restartGuidance, /documented_host_consensus_receipt_unavailable/);
+      assert.doesNotMatch(restartGuidance, /Autopilot protocol:|deep-interview -> ralplan -> ultragoal/);
       assert.equal(existsSync(join(cwd, ".omx", "state", "team-state.json")), false);
 
       const restartedState = JSON.parse(await readFile(autopilotPath, "utf-8")) as {
         active?: boolean;
         current_phase?: string;
+        error?: string;
       };
       assert.notDeepEqual(await readFile(autopilotPath), before);
-      assert.equal(restartedState.active, true);
-      assert.equal(restartedState.current_phase, "deep-interview");
+      assert.equal(restartedState.active, false);
+      assert.equal(restartedState.current_phase, "failed");
+      assert.equal(restartedState.error, "documented_host_consensus_receipt_unavailable");
+      assert.equal(existsSync(join(sessionDir, "deep-interview-state.json")), false);
+      assert.equal(existsSync(join(sessionDir, "ultragoal-state.json")), false);
 
       const stop = parseSingleJsonStdout(runNativeHookCli({
         hook_event_name: "Stop",
@@ -3150,7 +3396,7 @@ PY`,
         cwd,
         env: { ...process.env, OMX_ROOT: "", OMX_STATE_ROOT: "" },
       }));
-      assert.equal(stop.decision, "block");
+      assert.deepEqual(stop, {});
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -3285,19 +3531,15 @@ PY`,
         output = parseSingleJsonStdout(runNativeHookCli(input.toString("utf-8"), { cwd, env }));
       }
       assert.doesNotMatch(JSON.stringify(output), /\$team" -> team/);
-      assert.doesNotMatch(JSON.stringify(output), /\$team" -> team/);
       const skillState = JSON.parse(await readFile(sessionSkillPath, "utf-8")) as { active?: boolean; skill?: string; turn_id?: string; active_skills?: Array<{ skill?: string }> };
       assert.equal(skillState.active, true);
       assert.equal(skillState.skill, "autopilot");
       assert.equal(skillState.turn_id, turnId);
       assert.deepEqual(skillState.active_skills?.map((entry) => entry.skill), ["autopilot"]);
-      const autopilotState = JSON.parse(await readFile(sessionAutopilotPath, "utf-8")) as { active?: boolean; current_phase?: string; turn_id?: string; state?: { handoff_artifacts?: { context_snapshot?: { path?: string } } } };
+      const autopilotState = JSON.parse(await readFile(sessionAutopilotPath, "utf-8")) as { active?: boolean; current_phase?: string; turn_id?: string };
       assert.equal(autopilotState.active, true);
       assert.equal(autopilotState.current_phase, "deep-interview");
       assert.equal(autopilotState.turn_id, turnId);
-      const contextSnapshotPath = autopilotState.state?.handoff_artifacts?.context_snapshot?.path;
-      assert.ok(contextSnapshotPath);
-      assert.ok((await readFile(resolve(cwd, contextSnapshotPath))).includes(Buffer.from(prompt, "utf-8")));
       assert.equal(existsSync(join(stateDir, "team-state.json")), false);
       const stopPayload = { ...payload, hook_event_name: "Stop" as const, turn_id: `stop-g1bu-${transport}` };
       if (transport === "raw") {
@@ -3874,15 +4116,97 @@ PY`,
       assert.match(additionalContext, /not available from this outside-tmux surface/);
       const sessionState = JSON.parse(
         await readFile(join(cwd, ".omx", "state", "session.json"), "utf-8"),
-      ) as { session_id?: string; native_session_id?: string; pid?: number };
+      ) as { session_id?: string; native_session_id?: string; pid?: number; launch_lineage_token?: string };
       assert.equal(sessionState.session_id, "sess-start-1");
       assert.equal(sessionState.native_session_id, "sess-start-1");
       assert.equal(sessionState.pid, 43210);
+      assert.equal(sessionState.launch_lineage_token, undefined, 'native SessionStart must never mint or backfill wrapper lineage authority');
+      const ownerState = JSON.parse(
+        await readFile(
+          join(cwd, ".omx", "state", "sessions", "sess-start-1", "session-owner.json"),
+          "utf-8",
+        ),
+      ) as { session_id?: string; native_session_id?: string; pid?: number };
+      assert.equal(ownerState.session_id, "sess-start-1");
+      assert.equal(ownerState.native_session_id, "sess-start-1");
+      assert.equal(ownerState.pid, 43210);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
+  it("preserves wrapper lineage and detached metadata through shipped native SessionStart reconciliation", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-session-start-wrapper-lineage-"));
+    try {
+      const established = await establishLaunchSessionBinding(cwd, "omx-launch-lineage");
+      assert.equal(established.kind, "committed-released");
+      if (established.kind !== "committed-released") return;
+
+      const metadata = await updateDetachedSessionMetadata(established.binding, {
+        tmuxSessionName: "omx-detached-lineage",
+        tmuxPaneId: "%3202",
+      });
+      assert.equal(metadata.kind, "committed-released");
+
+      const pointerPath = join(cwd, ".omx", "state", "session.json");
+      const ownedPointer = JSON.parse(await readFile(pointerPath, "utf-8")) as Record<string, unknown>;
+      await writeFile(pointerPath, JSON.stringify({ ...ownedPointer, owner_omx_session_id: "omx-launch-lineage" }), "utf-8");
+
+      await dispatchCodexNativeHook(
+        { hook_event_name: "SessionStart", cwd, session_id: "codex-native-lineage" },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+
+      const sessionState = JSON.parse(
+        await readFile(join(cwd, ".omx", "state", "session.json"), "utf-8"),
+      ) as {
+        session_id?: string;
+        native_session_id?: string;
+        owner_omx_session_id?: string;
+        started_at?: string;
+        launch_lineage_token?: string;
+        tmux_session_name?: string;
+        tmux_pane_id?: string;
+      };
+      assert.equal(sessionState.session_id, "omx-launch-lineage");
+      assert.equal(sessionState.native_session_id, "codex-native-lineage");
+      assert.equal(sessionState.owner_omx_session_id, "omx-launch-lineage");
+      assert.equal(typeof sessionState.started_at, "string");
+      assert.equal(sessionState.launch_lineage_token, established.binding.launchLineageToken);
+      assert.equal(sessionState.tmux_session_name, "omx-detached-lineage");
+      assert.equal(sessionState.tmux_pane_id, "%3202");
+
+      const firstFinalization = finalizeBoundOnce(established.binding, "test");
+      const secondFinalization = finalizeBoundOnce(established.binding, "duplicate");
+      assert.equal(firstFinalization, secondFinalization);
+      assert.equal((await firstFinalization).finalized, true);
+      assert.equal((await closeLaunchSessionBindingOnce(established.binding)).status, "closed");
+      assert.equal((await closeLaunchSessionBindingOnce(established.binding)).status, "closed");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it('does not advertise a neutralized Ralplan seed in SessionStart context', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-native-hook-neutralized-ralplan-'));
+    const previousSessionId = process.env.OMX_SESSION_ID;
+    try {
+      const sessionId = 'neutralized-session';
+      await writeSessionStart(cwd, sessionId);
+      const directory = join(cwd, '.omx', 'state', 'sessions', sessionId);
+      await mkdir(directory, { recursive: true });
+      await writeFile(join(directory, 'ralplan-state.json'), JSON.stringify({ active: true, mode: 'ralplan', current_phase: 'planning', started_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z', session_id: sessionId }));
+      await writeFile(join(directory, 'skill-active-state.json'), JSON.stringify({ version: 1, active: true, skill: 'ralplan', keyword: '$RALPLAN', phase: 'planning', activated_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z', source: 'keyword-detector', session_id: sessionId, initialized_mode: 'ralplan', initialized_state_path: `.omx/state/sessions/${sessionId}/ralplan-state.json`, active_skills: [{ skill: 'ralplan', active: true, phase: 'planning', activated_at: '2026-01-01T00:00:00.000Z', updated_at: '2026-01-01T00:00:00.000Z', session_id: sessionId }] }));
+      process.env.OMX_SESSION_ID = sessionId;
+      assert.equal(await neutralizeOwnedRoutingRalplan(cwd), true);
+      const result = await dispatchCodexNativeHook({ hook_event_name: 'SessionStart', cwd, session_id: sessionId }, { cwd });
+      const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } }).hookSpecificOutput?.additionalContext ?? '');
+      assert.doesNotMatch(context, /- ralplan phase:/);
+    } finally {
+      previousSessionId === undefined ? delete process.env.OMX_SESSION_ID : process.env.OMX_SESSION_ID = previousSessionId;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
   it("reconciles native SessionStart on Windows EPERM with one degraded-durability warning", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-session-start-windows-eperm-"));
     const originalWrite = process.stderr.write;
@@ -3942,6 +4266,9 @@ PY`,
                 lane_id: "plan-review",
                 scope: "SessionStart reopen",
                 status: "available",
+                provenance_kind: "native_subagent",
+                direct_child_root_id: "codex-leader-reopen",
+                direct_child_parent_id: "codex-leader-reopen",
                 last_handoff_summary: "reviewed the restart plan",
               },
             },
@@ -3979,6 +4306,509 @@ PY`,
     }
   });
 
+  for (const status of ["closed", "available"] as const) {
+    it(`issue #3284 excludes the current root when persisted as a ${status} subagent`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-3284-root-self-${status}-`));
+      try {
+        const stateDir = join(cwd, ".omx", "state");
+        const canonicalSessionId = `omx-3284-${status}`;
+        const rootNativeSessionId = `codex-root-${status}`;
+        const childId = `codex-child-${status}`;
+        await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+        await writeJson(join(stateDir, "subagent-tracking.json"), {
+          schemaVersion: 1,
+          sessions: {
+            [canonicalSessionId]: { session_id: canonicalSessionId, leader_thread_id: `turn-like-${status}`,
+              updated_at: "2026-07-23T00:00:00.000Z", threads: {
+                [rootNativeSessionId]: { thread_id: rootNativeSessionId, kind: "subagent", status,
+                  first_seen_at: "2026-07-23T00:00:00.000Z", last_seen_at: "2026-07-23T00:00:00.000Z", turn_count: 1 },
+                [childId]: { thread_id: childId, kind: "subagent", status: "available", provenance_kind: "native_subagent",
+                  direct_child_root_id: rootNativeSessionId, direct_child_parent_id: rootNativeSessionId,
+                  first_seen_at: "2026-07-23T00:01:00.000Z", last_seen_at: "2026-07-23T00:01:00.000Z", turn_count: 1 },
+              } },
+            [rootNativeSessionId]: { session_id: rootNativeSessionId, leader_thread_id: `turn-like-correlation-${status}`,
+              updated_at: "2026-07-23T00:00:00.000Z", threads: {
+                [rootNativeSessionId]: { thread_id: rootNativeSessionId, kind: "subagent", status, provenance_kind: "native_subagent",
+                  direct_child_root_id: rootNativeSessionId, direct_child_parent_id: rootNativeSessionId,
+                  resume_requested_at: "2026-07-23T00:02:00.000Z",
+                  first_seen_at: "2026-07-23T00:00:00.000Z", last_seen_at: "2026-07-23T00:00:00.000Z", turn_count: 1 },
+              } },
+          },
+        });
+        const result = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd,
+          session_id: rootNativeSessionId, source: "resume" }, { cwd, sessionOwnerPid: process.pid });
+        const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+        assert.equal(context.includes(`resume_agent(${JSON.stringify(rootNativeSessionId)})`), false);
+        assert.equal(context.includes(`resume_agent(${JSON.stringify(childId)})`), true);
+        const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+        assert.equal(tracking.sessions[canonicalSessionId].threads[rootNativeSessionId].resume_requested_at, undefined);
+        assert.equal(tracking.sessions[canonicalSessionId].threads[rootNativeSessionId].kind, "leader");
+        assert.equal(tracking.sessions[canonicalSessionId].leader_thread_id, rootNativeSessionId);
+        assert.equal(tracking.sessions[rootNativeSessionId].threads[rootNativeSessionId].kind, "leader");
+        assert.equal(tracking.sessions[rootNativeSessionId].threads[rootNativeSessionId].resume_requested_at, undefined);
+        assert.equal(tracking.sessions[rootNativeSessionId].threads[rootNativeSessionId].direct_child_root_id, undefined);
+        assert.equal(tracking.sessions[rootNativeSessionId].leader_thread_id, rootNativeSessionId);
+        assert.match(tracking.sessions[canonicalSessionId].threads[childId].resume_requested_at, /^\d{4}-\d{2}-\d{2}T/);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("issue #3284 excludes a delegated top-level root labelled thread_source subagent with no parent evidence", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-3284-delegated-root-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-3284-delegated";
+      const rootNativeSessionId = "codex-delegated-root";
+      const childId = "codex-delegated-child";
+      await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+      // Evidence comment 5069022871: rollout provenance marks the task
+      // thread_source "subagent", yet it has no parent_thread_id/forked_from_id
+      // and is the root of its current collaboration tree.
+      const transcriptPath = join(cwd, "rollout-delegated-root.jsonl");
+      await writeFile(transcriptPath, `${JSON.stringify({
+        type: "session_meta",
+        payload: { id: rootNativeSessionId, source: { thread_source: "subagent" } },
+      })}\n`);
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [canonicalSessionId]: { session_id: canonicalSessionId, leader_thread_id: "turn-like-foreign",
+            updated_at: "2026-07-24T00:00:00.000Z", threads: {
+              [rootNativeSessionId]: { thread_id: rootNativeSessionId, kind: "subagent", status: "closed",
+                first_seen_at: "2026-07-24T00:00:00.000Z", last_seen_at: "2026-07-24T00:00:00.000Z", turn_count: 1 },
+              [childId]: { thread_id: childId, kind: "subagent", status: "available", provenance_kind: "native_subagent",
+                direct_child_root_id: rootNativeSessionId, direct_child_parent_id: rootNativeSessionId,
+                first_seen_at: "2026-07-24T00:01:00.000Z", last_seen_at: "2026-07-24T00:01:00.000Z", turn_count: 1 },
+            } },
+        },
+      });
+      const result = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd,
+        session_id: rootNativeSessionId, source: "resume", transcript_path: transcriptPath }, { cwd, sessionOwnerPid: process.pid });
+      const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+      assert.equal(context.includes(`resume_agent(${JSON.stringify(rootNativeSessionId)})`), false);
+      assert.equal(context.includes(`resume_agent(${JSON.stringify(childId)})`), true);
+      const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+      assert.equal(tracking.sessions[canonicalSessionId].threads[rootNativeSessionId].kind, "leader");
+      assert.equal(tracking.sessions[canonicalSessionId].leader_thread_id, rootNativeSessionId);
+      assert.equal(tracking.sessions[canonicalSessionId].threads[rootNativeSessionId].resume_requested_at, undefined);
+      assert.match(tracking.sessions[canonicalSessionId].threads[childId].resume_requested_at, /^\d{4}-\d{2}-\d{2}T/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #3284 repairs a root inversion on a non-reopen SessionStart source without emitting reopen output", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-3284-repair-other-source-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-3284-other-source";
+      const rootNativeSessionId = "codex-root-other-source";
+      await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [canonicalSessionId]: { session_id: canonicalSessionId, leader_thread_id: "turn-like-foreign",
+            updated_at: "2026-07-24T00:00:00.000Z", threads: {
+              [rootNativeSessionId]: { thread_id: rootNativeSessionId, kind: "subagent", status: "closed",
+                first_seen_at: "2026-07-24T00:00:00.000Z", last_seen_at: "2026-07-24T00:00:00.000Z", turn_count: 1 },
+            } },
+        },
+      });
+      const result = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd,
+        session_id: rootNativeSessionId, source: "clear" }, { cwd, sessionOwnerPid: process.pid });
+      const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+      assert.doesNotMatch(context, /\[Persisted subagent reopen\]/);
+      const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+      assert.equal(tracking.sessions[canonicalSessionId].threads[rootNativeSessionId].kind, "leader");
+      assert.equal(tracking.sessions[canonicalSessionId].leader_thread_id, rootNativeSessionId);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  for (const source of ["startup", "resume"] as const) {
+    it(`issue #3284 quarantines root reopen authority without asserting leader identity for a self-parented child SessionStart on ${source}`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-3284-self-parented-${source}-`));
+      try {
+        const stateDir = join(cwd, ".omx", "state");
+        const canonicalSessionId = `omx-3284-self-parented-${source}`;
+        const nativeRoleThreadId = `codex-role-thread-${source}`;
+        await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
+        await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: nativeRoleThreadId, pid: process.pid });
+        const transcriptPath = join(cwd, `rollout-self-parented-${source}.jsonl`);
+        await writeFile(transcriptPath, `${JSON.stringify({
+          type: "session_meta",
+          payload: { id: nativeRoleThreadId, source: { subagent: { thread_spawn: {
+            parent_thread_id: nativeRoleThreadId, depth: 1, agent_nickname: "Architect", agent_role: "architect" } } } },
+        })}\n`);
+        await writeJson(join(stateDir, "subagent-tracking.json"), {
+          schemaVersion: 1,
+          sessions: {
+            [canonicalSessionId]: { session_id: canonicalSessionId, leader_thread_id: "turn-like-foreign",
+              updated_at: "2026-07-24T00:00:00.000Z", threads: {
+                [nativeRoleThreadId]: { thread_id: nativeRoleThreadId, kind: "subagent", status: "available",
+                  provenance_kind: "native_subagent", direct_child_root_id: nativeRoleThreadId,
+                  direct_child_parent_id: nativeRoleThreadId, resume_requested_at: "2026-07-24T00:02:00.000Z",
+                  first_seen_at: "2026-07-24T00:00:00.000Z", last_seen_at: "2026-07-24T00:00:00.000Z", turn_count: 1 },
+              } },
+          },
+        });
+        const result = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd,
+          session_id: nativeRoleThreadId, source, transcript_path: transcriptPath }, { cwd, sessionOwnerPid: process.pid });
+        const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+        assert.doesNotMatch(context, /\[Persisted subagent reopen\]/);
+        assert.doesNotMatch(context, /resume_agent\(/);
+        // The transcript marker names this very root as its own child, so it is
+        // not distinct-child evidence and cannot override the authenticated
+        // pointer identity. The root's reopen authority is quarantined without
+        // asserting leader identity, so descriptive subagent evidence survives.
+        const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+        const rootRecord = tracking.sessions[canonicalSessionId].threads[nativeRoleThreadId];
+        assert.equal(rootRecord.kind, "subagent");
+        assert.equal(rootRecord.reopen_authority_revoked, true);
+        assert.equal(rootRecord.reopen_authority_conflict_reason, "contradictory_root_child_evidence");
+        assert.equal(rootRecord.resume_requested_at, undefined);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("issue #3284 suppresses root handling only for an authenticated direct-child SessionStart", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-3284-distinct-child-suppression-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-3284-distinct-child";
+      const rootNativeSessionId = "root-3284-distinct-child";
+      const childId = "child-3284-distinct";
+      await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
+      await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+      const transcriptPath = join(cwd, "rollout-distinct-child.jsonl");
+      await writeFile(transcriptPath, `${JSON.stringify({
+        type: "session_meta",
+        payload: { id: childId, source: { subagent: { thread_spawn: { parent_thread_id: rootNativeSessionId, depth: 1 } } } },
+      })}\n`);
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [canonicalSessionId]: { session_id: canonicalSessionId, leader_thread_id: "turn-like-foreign",
+            updated_at: "2026-07-24T00:00:00.000Z", threads: {
+              [rootNativeSessionId]: { thread_id: rootNativeSessionId, kind: "subagent", status: "available",
+                first_seen_at: "2026-07-24T00:00:00.000Z", last_seen_at: "2026-07-24T00:00:00.000Z", turn_count: 1 },
+            } },
+        },
+      });
+      // The event's own unambiguous native id IS the marker's child, and the
+      // marker's parent is exactly the authenticated native root, so this is a
+      // real direct-child session start and must not act as a root observation.
+      const result = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd,
+        session_id: childId, sessionId: childId, source: "resume", transcript_path: transcriptPath }, { cwd, sessionOwnerPid: process.pid });
+      const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+      assert.doesNotMatch(context, /resume_agent\(/);
+      const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+      assert.equal(tracking.sessions[canonicalSessionId].threads[rootNativeSessionId].kind, "subagent");
+      assert.equal(tracking.sessions[canonicalSessionId].threads[rootNativeSessionId].reopen_authority_revoked, undefined);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  for (const marker of [
+    { name: "arbitrary-nonexistent-child", childId: "made-up-child", parentId: "made-up-parent" },
+    { name: "nested-grandchild", childId: "grandchild-3284", parentId: "intermediate-3284" },
+    { name: "foreign-root-child", childId: "foreign-child-3284", parentId: "foreign-root-3284" },
+  ] as const) {
+    it(`issue #3284 does not let an unauthenticated ${marker.name} marker suppress root quarantine`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-3284-unauth-marker-${marker.name}-`));
+      try {
+        const stateDir = join(cwd, ".omx", "state");
+        const canonicalSessionId = `omx-3284-unauth-${marker.name}`;
+        const rootNativeSessionId = `root-3284-unauth-${marker.name}`;
+        await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
+        await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+        const transcriptPath = join(cwd, `unauth-${marker.name}.jsonl`);
+        await writeFile(transcriptPath, `${JSON.stringify({
+          type: "session_meta",
+          payload: { id: marker.childId, source: { subagent: { thread_spawn: { parent_thread_id: marker.parentId, depth: 1 } } } },
+        })}\n`);
+        await writeJson(join(stateDir, "subagent-tracking.json"), {
+          schemaVersion: 1,
+          sessions: {
+            [canonicalSessionId]: { session_id: canonicalSessionId, leader_thread_id: "turn-like-foreign",
+              updated_at: "2026-07-24T00:00:00.000Z", threads: {
+                [rootNativeSessionId]: { thread_id: rootNativeSessionId, kind: "subagent", status: "available",
+                  provenance_kind: "native_subagent", direct_child_root_id: rootNativeSessionId,
+                  direct_child_parent_id: rootNativeSessionId, resume_requested_at: "2026-07-24T00:02:00.000Z",
+                  first_seen_at: "2026-07-24T00:00:00.000Z", last_seen_at: "2026-07-24T00:00:00.000Z", turn_count: 1 },
+              } },
+          },
+        });
+        const result = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd,
+          session_id: rootNativeSessionId, source: "resume", transcript_path: transcriptPath }, { cwd, sessionOwnerPid: process.pid });
+        const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+        assert.doesNotMatch(context, /resume_agent\(/);
+        // The marker is not bound to the authenticated event identity, so the
+        // pointer-authoritative root never gains reopen authority: it is denied
+        // either by the dispatcher's foreign-parent revocation or by the
+        // contradictory-evidence quarantine. Both are fail-closed.
+        const rootRecord = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"))
+          .sessions[canonicalSessionId].threads[rootNativeSessionId];
+        assert.equal(rootRecord.reopen_authority_revoked, true);
+        assert.ok(
+          ["contradictory_root_child_evidence", "foreign_parent", "identity_untrusted"].includes(rootRecord.reopen_authority_conflict_reason),
+          `unexpected conflict reason: ${rootRecord.reopen_authority_conflict_reason}`,
+        );
+        // Reopen eligibility is what matters: the revoked root can never be
+        // emitted regardless of leftover descriptive bookkeeping.
+        assert.equal(rootRecord.direct_child_root_id !== undefined && rootRecord.reopen_authority_revoked !== true, false);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("issue #3284 fails closed when SessionStart native id aliases conflict", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-3284-alias-conflict-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-3284-alias";
+      const rootNativeSessionId = "codex-root-alias";
+      await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+      await writeJson(join(stateDir, "subagent-tracking.json"), { schemaVersion: 1, sessions: {
+        [canonicalSessionId]: { session_id: canonicalSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: {
+          child: { thread_id: "child", kind: "subagent", status: "available", provenance_kind: "native_subagent",
+            direct_child_root_id: rootNativeSessionId, direct_child_parent_id: rootNativeSessionId,
+            first_seen_at: "2026-07-23T00:00:00.000Z", last_seen_at: "2026-07-23T00:00:00.000Z", turn_count: 1 },
+        } },
+      } });
+      const result = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd,
+        session_id: rootNativeSessionId, sessionId: "foreign-root", source: "resume" }, { cwd, sessionOwnerPid: process.pid });
+      const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+      assert.doesNotMatch(context, /\[Persisted subagent reopen\]/);
+      const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+      assert.equal(tracking.sessions[canonicalSessionId].threads.child.resume_requested_at, undefined);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #3284 enforces the native alias truth table and root-context failure precedence", () => {
+    assert.deepEqual(readUnambiguousSessionStartNativeId(undefined), { ok: false, reason: "missing" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: "root", sessionId: "root" }), { ok: true, value: "root" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: "root", sessionId: "foreign" }), { ok: false, reason: "conflict" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: "root", sessionId: undefined }), { ok: false, reason: "malformed" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: 42, sessionId: "root" } as never), { ok: false, reason: "malformed" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: "root" }), { ok: true, value: "root" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ sessionId: "root" }), { ok: true, value: "root" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: "foreign", sessionId: "root" }), { ok: false, reason: "conflict" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: undefined, sessionId: "root" }), { ok: false, reason: "malformed" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: "root", sessionId: 42 } as never), { ok: false, reason: "malformed" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: "", sessionId: 42 } as never), { ok: false, reason: "malformed" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ sessionId: "" }), { ok: false, reason: "malformed" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: 42 } as never), { ok: false, reason: "malformed" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: "", sessionId: "" }), { ok: false, reason: "malformed" });
+    assert.deepEqual(readUnambiguousSessionStartNativeId({ session_id: " root ", sessionId: "root" }), { ok: true, value: "root" });
+    const cwd = resolve("/tmp/omx-3284-root-context");
+    const baseState = { session_id: "canonical", native_session_id: "root", cwd, pid: process.pid, started_at: "2026-07-23T00:00:00.000Z" } as any;
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "root" }, null), { ok: false, reason: "pointer_not_usable" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "root" }, { ...baseState, cwd: "" }), { ok: false, reason: "pointer_cwd_missing" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "root" }, { ...baseState, session_id: "" }), { ok: false, reason: "pointer_session_missing" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "root" }, { ...baseState, native_session_id: "" }), { ok: false, reason: "pointer_native_root_missing" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "root" }, { ...baseState, cwd: resolve("/tmp/foreign") }), { ok: false, reason: "pointer_cwd_mismatch" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "", { session_id: "root" }, baseState), { ok: false, reason: "selected_canonical_missing" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "foreign", { session_id: "root" }, baseState), { ok: false, reason: "canonical_mismatch" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", {}, baseState), { ok: false, reason: "event_native_missing" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "" }, baseState), { ok: false, reason: "event_native_malformed" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "other" }, baseState), { ok: false, reason: "native_root_mismatch" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "root" }, baseState), { ok: true, sessionId: "canonical", rootNativeSessionId: "root" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "root", sessionId: "foreign" }, baseState), { ok: false, reason: "event_native_conflict" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "root", sessionId: "foreign" }, null), { ok: false, reason: "pointer_not_usable" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "foreign", {}, baseState), { ok: false, reason: "canonical_mismatch" });
+    assert.deepEqual(resolvePersistedReopenRootContext(cwd, "canonical", { session_id: "root" }, { ...baseState, owner_omx_session_id: "foreign", owner_codex_session_id: "foreign", codex_session_id: "foreign", previous_native_session_id: "foreign" }), { ok: true, sessionId: "canonical", rootNativeSessionId: "root" });
+  });
+
+  it("issue #3284 withholds authority when transcript and hook child identities disagree", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-3284-child-mismatch-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-3284-child-mismatch";
+      const rootNativeSessionId = "root-3284-child-mismatch";
+      const hookChildId = "hook-child-3284";
+      await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+      const cachedThread = { thread_id: hookChildId, kind: "subagent", provenance_kind: "native_subagent", direct_child_root_id: rootNativeSessionId, direct_child_parent_id: rootNativeSessionId, status: "available", first_seen_at: "2026-07-23T00:00:00.000Z", last_seen_at: "2026-07-23T00:00:00.000Z", turn_count: 1 };
+      await writeJson(join(stateDir, "subagent-tracking.json"), { schemaVersion: 1, sessions: {
+        [canonicalSessionId]: { session_id: canonicalSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: { [hookChildId]: cachedThread } },
+        [rootNativeSessionId]: { session_id: rootNativeSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: { [hookChildId]: cachedThread } },
+      } });
+      const transcriptPath = join(cwd, "child-mismatch.jsonl");
+      await writeFile(transcriptPath, `${JSON.stringify({ type: "session_meta", payload: { id: "transcript-child-3284", source: { subagent: { thread_spawn: { parent_thread_id: rootNativeSessionId } } } } })}\n`);
+      await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: hookChildId, sessionId: hookChildId, transcript_path: transcriptPath }, { cwd, sessionOwnerPid: process.pid });
+      const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+      const child = tracking.sessions[canonicalSessionId].threads[hookChildId];
+      assert.equal(child.kind, "subagent");
+      assert.equal(child.reopen_authority_revoked, true);
+      const rootResume = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: rootNativeSessionId, source: "resume" }, { cwd, sessionOwnerPid: process.pid });
+      const context = String((rootResume.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+      assert.equal(context.includes(`resume_agent(${JSON.stringify(hookChildId)})`), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #3284 revokes cached authority across conflicting child aliases", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-3284-child-alias-revoke-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-3284-child-alias-revoke";
+      const rootNativeSessionId = "root-3284-child-alias-revoke";
+      const realChildId = "real-child-3284";
+      const fakeChildId = "fake-child-3284";
+      await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+      const cachedThread = { thread_id: realChildId, kind: "subagent", provenance_kind: "native_subagent", direct_child_root_id: rootNativeSessionId, direct_child_parent_id: rootNativeSessionId, status: "available", first_seen_at: "2026-07-23T00:00:00.000Z", last_seen_at: "2026-07-23T00:00:00.000Z", turn_count: 1 };
+      await writeJson(join(stateDir, "subagent-tracking.json"), { schemaVersion: 1, sessions: {
+        [canonicalSessionId]: { session_id: canonicalSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: { [realChildId]: cachedThread } },
+        [rootNativeSessionId]: { session_id: rootNativeSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: { [realChildId]: cachedThread } },
+      } });
+      const transcriptPath = join(cwd, "child-alias-revoke.jsonl");
+      await writeFile(transcriptPath, `${JSON.stringify({ type: "session_meta", payload: { id: realChildId, source: { subagent: { thread_spawn: { parent_thread_id: rootNativeSessionId } } } } })}\n`);
+      await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: fakeChildId, sessionId: realChildId, transcript_path: transcriptPath }, { cwd, sessionOwnerPid: process.pid });
+      const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+      assert.equal(tracking.sessions[canonicalSessionId].threads[realChildId].reopen_authority_revoked, true);
+      const rootResume = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: rootNativeSessionId, source: "resume" }, { cwd, sessionOwnerPid: process.pid });
+      const context = String((rootResume.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+      assert.equal(context.includes(`resume_agent(${JSON.stringify(realChildId)})`), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("issue #3284 revokes cached authority when the child reappears under a foreign parent", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-3284-foreign-parent-revoke-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const canonicalSessionId = "omx-3284-foreign-parent-revoke";
+      const rootNativeSessionId = "root-3284-foreign-parent-revoke";
+      const childId = "child-3284-foreign-parent";
+      await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+      const cachedThread = { thread_id: childId, kind: "subagent", provenance_kind: "native_subagent", direct_child_root_id: rootNativeSessionId, direct_child_parent_id: rootNativeSessionId, status: "available", first_seen_at: "2026-07-23T00:00:00.000Z", last_seen_at: "2026-07-23T00:00:00.000Z", turn_count: 1 };
+      await writeJson(join(stateDir, "subagent-tracking.json"), { schemaVersion: 1, sessions: {
+        [canonicalSessionId]: { session_id: canonicalSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: { [childId]: cachedThread } },
+        [rootNativeSessionId]: { session_id: rootNativeSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: { [childId]: cachedThread } },
+      } });
+      const transcriptPath = join(cwd, "foreign-parent-revoke.jsonl");
+      await writeFile(transcriptPath, `${JSON.stringify({ type: "session_meta", payload: { id: childId, source: { subagent: { thread_spawn: { parent_thread_id: "foreign-parent" } } } } })}\n`);
+      await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: childId, sessionId: childId, transcript_path: transcriptPath }, { cwd, sessionOwnerPid: process.pid });
+      const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+      assert.equal(tracking.sessions[canonicalSessionId].threads[childId].reopen_authority_revoked, true);
+      const rootResume = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: rootNativeSessionId, source: "resume" }, { cwd, sessionOwnerPid: process.pid });
+      const context = String((rootResume.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+      assert.equal(context.includes(`resume_agent(${JSON.stringify(childId)})`), false);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  for (const malformedFirstAlias of ["", 42] as const) {
+    it(`issue #3284 revokes cached authority when the first child alias is ${JSON.stringify(malformedFirstAlias)}`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), "omx-3284-child-malformed-first-"));
+      try {
+        const stateDir = join(cwd, ".omx", "state");
+        const canonicalSessionId = "omx-3284-child-malformed-first";
+        const rootNativeSessionId = "root-3284-child-malformed-first";
+        const childId = "child-3284-malformed-first";
+        await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+        const cachedThread = { thread_id: childId, kind: "subagent", provenance_kind: "native_subagent", direct_child_root_id: rootNativeSessionId, direct_child_parent_id: rootNativeSessionId, status: "available", first_seen_at: "2026-07-23T00:00:00.000Z", last_seen_at: "2026-07-23T00:00:00.000Z", turn_count: 1 };
+        await writeJson(join(stateDir, "subagent-tracking.json"), { schemaVersion: 1, sessions: {
+          [canonicalSessionId]: { session_id: canonicalSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: { [childId]: cachedThread } },
+          [rootNativeSessionId]: { session_id: rootNativeSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: { [childId]: cachedThread } },
+        } });
+        const transcriptPath = join(cwd, "child-malformed-first.jsonl");
+        await writeFile(transcriptPath, `${JSON.stringify({ type: "session_meta", payload: { id: childId, source: { subagent: { thread_spawn: { parent_thread_id: rootNativeSessionId } } } } })}\n`);
+        await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: malformedFirstAlias, sessionId: childId, transcript_path: transcriptPath } as never, { cwd, sessionOwnerPid: process.pid });
+        const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+        assert.equal(tracking.sessions[canonicalSessionId].threads[childId].reopen_authority_revoked, true);
+        const rootResume = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: rootNativeSessionId, source: "resume" }, { cwd, sessionOwnerPid: process.pid });
+        const context = String((rootResume.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+        assert.equal(context.includes(`resume_agent(${JSON.stringify(childId)})`), false);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+
+  for (const scenario of [
+    { name: "valid-first-blank-second", aliases: { session_id: "child-3284-no-candidate", sessionId: "" } },
+    { name: "both-blank", aliases: { session_id: "", sessionId: "" } },
+    { name: "both-non-string", aliases: { session_id: 42, sessionId: false } },
+    { name: "both-absent", aliases: {} },
+  ] as const) {
+    it(`issue #3284 revokes transcript-identified cached authority for ${scenario.name}`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-3284-no-candidate-${scenario.name}-`));
+      try {
+        const stateDir = join(cwd, ".omx", "state");
+        const canonicalSessionId = `omx-3284-no-candidate-${scenario.name}`;
+        const rootNativeSessionId = `root-3284-no-candidate-${scenario.name}`;
+        const childId = "child-3284-no-candidate";
+        await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+        const cachedThread = { thread_id: childId, kind: "subagent", provenance_kind: "native_subagent", direct_child_root_id: rootNativeSessionId, direct_child_parent_id: rootNativeSessionId, status: "available", first_seen_at: "2026-07-23T00:00:00.000Z", last_seen_at: "2026-07-23T00:00:00.000Z", turn_count: 1 };
+        await writeJson(join(stateDir, "subagent-tracking.json"), { schemaVersion: 1, sessions: {
+          [canonicalSessionId]: { session_id: canonicalSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: { [childId]: cachedThread } },
+          [rootNativeSessionId]: { session_id: rootNativeSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: { [childId]: cachedThread } },
+        } });
+        const transcriptPath = join(cwd, `no-candidate-${scenario.name}.jsonl`);
+        await writeFile(transcriptPath, `${JSON.stringify({ type: "session_meta", payload: { id: childId, source: { subagent: { thread_spawn: { parent_thread_id: rootNativeSessionId } } } } })}\n`);
+        await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, ...scenario.aliases, transcript_path: transcriptPath } as never, { cwd, sessionOwnerPid: process.pid });
+        const tracking = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+        assert.equal(tracking.sessions[canonicalSessionId].threads[childId].reopen_authority_revoked, true);
+        const rootResume = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: rootNativeSessionId, source: "resume" }, { cwd, sessionOwnerPid: process.pid });
+        const context = String((rootResume.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+        assert.equal(context.includes(`resume_agent(${JSON.stringify(childId)})`), false);
+        const afterRootResume = JSON.parse(await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"));
+        assert.equal(afterRootResume.sessions[canonicalSessionId].threads[childId].resume_requested_at, undefined);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("issue #3284 preserves ordinary transcript-bearing SessionStart when native aliases are unusable", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-3284-ordinary-transcript-"));
+    try {
+      const canonicalSessionId = "omx-3284-ordinary-transcript";
+      const rootNativeSessionId = "root-3284-ordinary-transcript";
+      await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: rootNativeSessionId, pid: process.pid });
+      const sessionPath = join(cwd, ".omx", "state", "session.json");
+      const before = await readFile(sessionPath, "utf-8");
+      const transcriptPath = join(cwd, "ordinary-root.jsonl");
+      await writeFile(transcriptPath, `${JSON.stringify({ type: "session_meta", payload: { id: rootNativeSessionId, source: "user" } })}\n`);
+      await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: "", sessionId: 42, transcript_path: transcriptPath } as never, { cwd, sessionOwnerPid: process.pid });
+      assert.equal(await readFile(sessionPath, "utf-8"), before);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it("issue #3284 fresh-reads the pointer created by root SessionStart reconciliation", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-3284-fresh-pointer-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const rootNativeSessionId = "root-3284-fresh-pointer";
+      const childId = "child-3284-fresh-pointer";
+      await writeJson(join(stateDir, "subagent-tracking.json"), { schemaVersion: 1, sessions: {
+        [rootNativeSessionId]: { session_id: rootNativeSessionId, updated_at: "2026-07-23T00:00:00.000Z", threads: {
+          [childId]: { thread_id: childId, kind: "subagent", provenance_kind: "native_subagent", direct_child_root_id: rootNativeSessionId, direct_child_parent_id: rootNativeSessionId, status: "available", first_seen_at: "2026-07-23T00:00:00.000Z", last_seen_at: "2026-07-23T00:00:00.000Z", turn_count: 1 },
+        } },
+      } });
+      const result = await dispatchCodexNativeHook({ hook_event_name: "SessionStart", cwd, session_id: rootNativeSessionId, source: "resume" }, { cwd, sessionOwnerPid: process.pid });
+      const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+      assert.equal(context.includes(`resume_agent(${JSON.stringify(childId)})`), true);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("does not suggest duplicate same-role subagent spawns when reopen ids exist", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-subagent-no-duplicates-"));
     try {
@@ -4009,6 +4839,9 @@ PY`,
                 role: "critic",
                 lane_id: "risk-review",
                 status: "closed",
+                provenance_kind: "native_subagent",
+                direct_child_root_id: "codex-leader-reuse",
+                direct_child_parent_id: "codex-leader-reuse",
               },
             },
           },
@@ -4069,6 +4902,9 @@ PY`,
                 status: "unavailable",
                 resume_failed_at: "2026-07-09T00:02:00.000Z",
                 resume_failure_reason: "Codex reported missing thread id",
+                provenance_kind: "native_subagent",
+                direct_child_root_id: "codex-leader-warning",
+                direct_child_parent_id: "codex-leader-warning",
               },
             },
           },
@@ -4242,7 +5078,7 @@ PY`,
       assert.notEqual(terminalWrite.isError, true);
       assert.equal(
         (terminalWrite.payload as { path?: string }).path,
-        join(stateDir, "sessions", canonicalSessionId, "deep-interview-state.json"),
+        join(realpathSync(stateDir), "sessions", canonicalSessionId, "deep-interview-state.json"),
       );
       assert.equal(existsSync(join(stateDir, "sessions", ownerSessionId, "deep-interview-state.json")), false);
 
@@ -4263,16 +5099,19 @@ PY`,
       });
       process.env.OMX_SESSION_ID = replacementCandidate;
       await setOwnerEvidence(replacementCandidate);
-      await dispatchCodexNativeHook(
+      const replacementStart = await dispatchCodexNativeHook(
         { hook_event_name: "SessionStart", cwd: replacementCwd, session_id: "native-after-new-3138" },
         { cwd: replacementCwd, sessionOwnerPid: process.pid },
       );
+      assert.equal(replacementStart.outputJson, null);
       const replacementPointer = JSON.parse(await readFile(join(replacementStateDir, "session.json"), "utf-8")) as {
         session_id?: string;
+        native_session_id?: string;
         owner_omx_session_id?: string;
       };
-      assert.equal(replacementPointer.session_id, "native-after-new-3138");
-      assert.equal(replacementPointer.owner_omx_session_id, replacementOwner);
+      assert.equal(replacementPointer.session_id, replacementOwner);
+      assert.equal(replacementPointer.native_session_id, "native-before-new-3138");
+      assert.equal(replacementPointer.owner_omx_session_id, undefined);
       assert.notEqual(replacementPointer.owner_omx_session_id, replacementCandidate);
 
       const nativeOnlyCwd = join(root, "native-only");
@@ -4372,22 +5211,33 @@ PY`,
       assert.equal(existsSync(join(foreignCwd, ".omx", "state", "sessions", "native-unmatched-foreign-3138")), false);
       assert.equal(existsSync(join(foreignCwd, ".omx", "state", "skill-active-state.json")), false);
 
-      const foreignStop = await dispatchCodexNativeHook({
-        hook_event_name: "Stop",
+      const foreignStopPayload = {
+        hook_event_name: "Stop" as const,
         cwd: foreignCwd,
         session_id: "native-foreign-3138",
+      };
+      const foreignStop = await dispatchCodexNativeHook(foreignStopPayload, { cwd: foreignCwd });
+      assert.equal(foreignStop.outputJson, null);
+      const foreignReplay = await dispatchCodexNativeHook({
+        ...foreignStopPayload,
+        stop_hook_active: true,
       }, { cwd: foreignCwd });
-      assert.equal(foreignStop.outputJson?.decision, "block");
-      assert.equal(foreignStop.outputJson?.stopReason, "session_pointer_unusable");
+      assert.equal(foreignReplay.outputJson, null);
       assert.equal(existsSync(join(foreignCwd, ".omx", "state", "native-stop-state.json")), false);
 
-      const unmatchedStop = await dispatchCodexNativeHook({
-        hook_event_name: "Stop",
+      const unmatchedStopPayload = {
+        hook_event_name: "Stop" as const,
         cwd: conflictingCwd,
         session_id: "native-unmatched-stop-3138",
-      }, { cwd: conflictingCwd });
-      assert.equal(unmatchedStop.outputJson?.decision, "block");
-      assert.equal(unmatchedStop.outputJson?.stopReason, "session_scope_unmatched");
+      };
+      const unmatchedOutputs = await Promise.all(
+        Array.from({ length: 3 }, () => dispatchCodexNativeHook(unmatchedStopPayload, { cwd: conflictingCwd })),
+      );
+      assert.deepEqual(unmatchedOutputs.map((result) => result.outputJson), [null, null, null]);
+      const unmatchedCliResult = runNativeHookCliResult(unmatchedStopPayload, { cwd: conflictingCwd });
+      assert.equal(unmatchedCliResult.status, 0, unmatchedCliResult.stderr || unmatchedCliResult.stdout);
+      assert.equal(unmatchedCliResult.stderr, "");
+      assert.deepEqual(parseSingleJsonStdout(unmatchedCliResult.stdout), {});
       assert.equal(existsSync(join(conflictingCwd, ".omx", "state", "native-stop-state.json")), false);
     } finally {
       if (typeof previousSessionId === "string") process.env.OMX_SESSION_ID = previousSessionId;
@@ -4399,6 +5249,248 @@ PY`,
       if (typeof previousPath === "string") process.env.PATH = previousPath;
       else delete process.env.PATH;
       await rm(root, { recursive: true, force: true });
+    }
+  });
+
+  it("authorizes a live unmatched Stop from its exact session owner sidecar without changing the selected pointer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-sidecar-stop-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const selectedSessionId = "native-selected-owner";
+      const independentSessionId = "native-independent-owner";
+      await writeSessionStart(cwd, selectedSessionId, {
+        nativeSessionId: selectedSessionId,
+        pid: process.pid,
+      });
+      await writeLiveNativeSessionOwnerSidecar(cwd, stateDir, independentSessionId);
+      const pointerBefore = await readFile(join(stateDir, "session.json"), "utf-8");
+      const rootGoalPath = join(cwd, ".omx", "ultragoal", "goals.json");
+      await writeJson(rootGoalPath, {
+        version: 1,
+        aggregateCompletion: {
+          status: "complete",
+          completedAt: "2026-05-20T00:00:00.000Z",
+        },
+        goals: [{ id: "G001-done", status: "complete", objective: "Done" }],
+      });
+      const rootGoalBefore = await readFile(rootGoalPath, "utf-8");
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: independentSessionId,
+          thread_id: independentSessionId,
+          last_user_message:
+            "get_goal reports a completed Codex goal still attached to this thread; do not call create_goal until cleanup is explicit.",
+          last_assistant_message:
+            "I am starting another run now; create_goal payload follows.",
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson, null);
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), pointerBefore);
+      assert.equal(await readFile(rootGoalPath, "utf-8"), rootGoalBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("uses the unmatched sidecar session workflow as the Stop blocker", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-sidecar-skill-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const selectedSessionId = "native-selected-skill";
+      const independentSessionId = "native-independent-skill";
+      await writeSessionStart(cwd, selectedSessionId, {
+        nativeSessionId: selectedSessionId,
+        pid: process.pid,
+      });
+      await writeLiveNativeSessionOwnerSidecar(cwd, stateDir, independentSessionId);
+      await writeSessionSkillActiveState(stateDir, independentSessionId, "ralplan", "planning");
+      await writeJson(
+        join(stateDir, "sessions", independentSessionId, "ralplan-state.json"),
+        {
+          active: true,
+          current_phase: "planning",
+          session_id: independentSessionId,
+          workingDirectory: cwd,
+        },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: independentSessionId,
+          thread_id: independentSessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.match(String(result.outputJson?.stopReason ?? ""), /^skill_ralplan_planning_/);
+      assert.notEqual(result.outputJson?.stopReason, "session_scope_unmatched");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  for (const mode of ["autopilot", "ultrawork", "ultraqa"] as const) {
+    it(`uses the unmatched sidecar ${mode} state as the Stop blocker`, async () => {
+      await withIndependentNativeSession(mode, async ({
+        cwd,
+        stateDir,
+        sessionId,
+        pointerBefore,
+      }) => {
+        await writeJson(
+          join(stateDir, "sessions", sessionId, `${mode}-state.json`),
+          {
+            active: true,
+            mode,
+            current_phase: "executing",
+            session_id: sessionId,
+            workingDirectory: cwd,
+          },
+        );
+
+        const result = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "Stop",
+            cwd,
+            session_id: sessionId,
+            thread_id: sessionId,
+          },
+          { cwd },
+        );
+
+        assert.equal(result.outputJson?.decision, "block");
+        assert.match(String(result.outputJson?.stopReason ?? ""), new RegExp(`^${mode}_`));
+        assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), pointerBefore);
+        assert.equal(existsSync(join(stateDir, "native-stop-state.json")), false);
+      });
+    });
+  }
+
+  it("uses the unmatched sidecar team state as the Stop blocker", async () => {
+    await withIndependentNativeSession("team", async ({
+      cwd,
+      stateDir,
+      sessionId,
+      pointerBefore,
+    }) => {
+      await writeJson(
+        join(stateDir, "sessions", sessionId, "team-state.json"),
+        {
+          active: true,
+          mode: "team",
+          team_name: "sidecar-team",
+          current_phase: "team-exec",
+          session_id: sessionId,
+          owner_codex_thread_id: sessionId,
+        },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: sessionId,
+          thread_id: sessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(result.outputJson?.stopReason, "team_team-exec");
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), pointerBefore);
+      assert.equal(existsSync(join(stateDir, "native-stop-state.json")), false);
+    });
+  });
+
+  it("uses the unmatched sidecar deep-interview question state as the Stop blocker", async () => {
+    await withIndependentNativeSession("deep-interview", async ({
+      cwd,
+      stateDir,
+      sessionId,
+      pointerBefore,
+    }) => {
+      await writeSessionSkillActiveState(
+        stateDir,
+        sessionId,
+        "deep-interview",
+        "intent-first",
+      );
+      await writeJson(
+        join(stateDir, "sessions", sessionId, "deep-interview-state.json"),
+        {
+          active: true,
+          mode: "deep-interview",
+          current_phase: "intent-first",
+          session_id: sessionId,
+          thread_id: sessionId,
+          question_enforcement: {
+            obligation_id: "sidecar-question",
+            source: "omx-question",
+            status: "pending",
+            requested_at: "2026-07-18T00:00:00.000Z",
+          },
+        },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: sessionId,
+          thread_id: sessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(result.outputJson?.stopReason, "deep_interview_question_required");
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), pointerBefore);
+      assert.equal(existsSync(join(stateDir, "native-stop-state.json")), false);
+    });
+  });
+
+  it("uses a live parent sidecar when a nested selected pointer is stale-dead", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-sidecar-stale-root-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const parentSessionId = "native-live-parent";
+      await writeSessionStart(cwd, parentSessionId, {
+        nativeSessionId: parentSessionId,
+        pid: process.pid,
+      });
+      await writeLiveNativeSessionOwnerSidecar(cwd, stateDir, parentSessionId);
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: "native-dead-nested",
+        native_session_id: "native-dead-nested",
+        started_at: "2026-01-01T00:00:00.000Z",
+        cwd,
+        pid: 999_999,
+        platform: process.platform,
+      });
+      const pointerBefore = await readFile(join(stateDir, "session.json"), "utf-8");
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "Stop",
+          cwd,
+          session_id: parentSessionId,
+          thread_id: parentSessionId,
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson, null);
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), pointerBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
     }
   });
 
@@ -4499,15 +5591,24 @@ PY`,
       ) as {
         sessions?: Record<string, {
           leader_thread_id?: string;
-          threads?: Record<string, { kind?: string; mode?: string }>;
+          threads?: Record<string, { kind?: string; mode?: string; direct_child_root_id?: string; direct_child_parent_id?: string }>;
         }>;
       };
       assert.equal(tracking.sessions?.[canonicalSessionId]?.leader_thread_id, leaderNativeSessionId);
       assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.kind, "subagent");
       assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.mode, "critic");
+      assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.direct_child_root_id, leaderNativeSessionId);
+      assert.equal(tracking.sessions?.[canonicalSessionId]?.threads?.[childNativeSessionId]?.direct_child_parent_id, leaderNativeSessionId);
       assert.equal(tracking.sessions?.[leaderNativeSessionId]?.leader_thread_id, leaderNativeSessionId);
       assert.equal(tracking.sessions?.[leaderNativeSessionId]?.threads?.[childNativeSessionId]?.kind, "subagent");
       assert.equal(tracking.sessions?.[leaderNativeSessionId]?.threads?.[childNativeSessionId]?.mode, "critic");
+      const rootResume = await dispatchCodexNativeHook(
+        { hook_event_name: "SessionStart", cwd, session_id: leaderNativeSessionId, source: "resume" },
+        { cwd, sessionOwnerPid: process.pid },
+      );
+      const rootResumeContext = String((rootResume.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "");
+      assert.equal(rootResumeContext.includes(`resume_agent(${JSON.stringify(childNativeSessionId)})`), true);
+      await rm(join(cwd, "hook-events.jsonl"), { force: true });
 
       await dispatchCodexNativeHook(
         {
@@ -4530,6 +5631,367 @@ PY`,
       } else {
         process.env.CODEX_HOME = originalCodexHome;
       }
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps an authoritative Team worker lifecycle scoped without replacing the live leader pointer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-pointer-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await writeSessionStart(cwd, "leader-session", {
+        nativeSessionId: "leader-native",
+        pid: process.pid,
+      });
+      await configureAuthoritativeTeamWorker(cwd, "pointer-team");
+      const leaderPointerBefore = await readFile(join(stateDir, "session.json"), "utf-8");
+      const leaderRalphPath = join(stateDir, "sessions", "leader-session", "ralph-state.json");
+      await writeJson(leaderRalphPath, {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        session_id: "leader-session",
+        owner_codex_session_id: "leader-native",
+      });
+      const leaderRalphBeforeWorkerStop = await readFile(leaderRalphPath, "utf-8");
+      const rootNativeStopPath = join(stateDir, "native-stop-state.json");
+      assert.equal(existsSync(rootNativeStopPath), false);
+
+      await dispatchCodexNativeHook({
+        hook_event_name: "SessionStart",
+        cwd,
+        session_id: "",
+        sessionId: "worker-native",
+      }, { cwd, sessionOwnerPid: process.pid });
+
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), leaderPointerBefore);
+
+      const workerStop = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "worker-native",
+        thread_id: "worker-native",
+        turn_id: "worker-stop-turn",
+      }, { cwd });
+      assert.notEqual(workerStop.outputJson?.stopReason, "session_scope_unmatched");
+      assert.notEqual(workerStop.outputJson?.stopReason, "session_pointer_unusable");
+      assert.equal(await readFile(leaderRalphPath, "utf-8"), leaderRalphBeforeWorkerStop);
+      assert.equal(existsSync(rootNativeStopPath), false);
+
+      delete process.env.OMX_TEAM_INTERNAL_WORKER;
+      delete process.env.OMX_TEAM_WORKER;
+      process.env.TMUX_PANE = "%42";
+      const leaderStop = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "leader-native",
+        thread_id: "leader-native",
+        turn_id: "leader-stop-turn",
+      }, { cwd });
+      assert.notEqual(leaderStop.outputJson?.stopReason, "session_scope_unmatched");
+      assert.equal(await readFile(join(stateDir, "session.json"), "utf-8"), leaderPointerBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("rejects leader aliases from foreign-cwd pointer evidence in a worker worktree", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-foreign-alias-"));
+    try {
+      await writeSessionStart(cwd, "foreign-alias-leader", {
+        nativeSessionId: "foreign-alias-leader-native",
+        pid: process.pid,
+      });
+      await configureAuthoritativeTeamWorker(cwd, "foreign-alias-team");
+      const pointerPath = join(cwd, ".omx", "state", "session.json");
+      const pointer = JSON.parse(await readFile(pointerPath, "utf-8")) as Record<string, unknown>;
+      pointer.cwd = join(cwd, "leader-worktree");
+      await writeJson(pointerPath, pointer);
+      const pointerBefore = await readFile(pointerPath, "utf-8");
+
+      for (const sessionId of ["foreign-alias-leader", "foreign-alias-leader-native"]) {
+        await dispatchCodexNativeHook({
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: sessionId,
+        }, { cwd, sessionOwnerPid: process.pid });
+        assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+        assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", sessionId)), false);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps declared Team workers fail closed before startup authority is materialized", async () => {
+    for (const pointerKind of ["absent", "live"] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-team-worker-race-${pointerKind}-`));
+      try {
+        const pointerPath = join(cwd, ".omx", "state", "session.json");
+        if (pointerKind === "live") {
+          await writeSessionStart(cwd, "race-leader-session", {
+            nativeSessionId: "race-leader-native",
+            pid: process.pid,
+          });
+        }
+        const pointerBefore = existsSync(pointerPath) ? await readFile(pointerPath, "utf-8") : null;
+        process.env.OMX_TEAM_WORKER = "race-team/worker-1";
+        process.env.OMX_TEAM_INTERNAL_WORKER = "race-team/worker-1";
+        process.env.TMUX = "1";
+        process.env.TMUX_PANE = "%10";
+
+        await dispatchCodexNativeHook({
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: "race-worker-native",
+        }, { cwd, sessionOwnerPid: process.pid });
+        assert.equal(existsSync(pointerPath), pointerBefore !== null);
+        if (pointerBefore !== null) assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+
+        for (const declaration of [
+          { internal: "malformed", external: "" },
+          { internal: "race-team/worker-1", external: "other-team/worker-1" },
+        ]) {
+          process.env.OMX_TEAM_INTERNAL_WORKER = declaration.internal;
+          process.env.OMX_TEAM_WORKER = declaration.external;
+          await dispatchCodexNativeHook({
+            hook_event_name: "SessionStart",
+            cwd,
+            session_id: "race-worker-malformed-native",
+          }, { cwd, sessionOwnerPid: process.pid });
+          assert.equal(existsSync(pointerPath), pointerBefore !== null);
+          if (pointerBefore !== null) assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+        }
+
+        const stop = await dispatchCodexNativeHook({
+          hook_event_name: "Stop",
+          cwd,
+          session_id: "race-worker-native",
+          thread_id: "race-worker-native",
+          turn_id: "race-worker-stop",
+        }, { cwd });
+        assert.match(String(stop.outputJson?.stopReason ?? ""), /^team_worker_/);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("fails closed for invalid Team worker lifecycle identity across pointer states", async () => {
+    for (const pointerKind of ["absent", "live", "stale", "malformed"] as const) {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-team-worker-invalid-${pointerKind}-`));
+      try {
+        delete process.env.OMX_TEAM_INTERNAL_WORKER;
+        delete process.env.OMX_TEAM_WORKER;
+        delete process.env.OMX_TEAM_STATE_ROOT;
+        delete process.env.OMX_TEAM_LEADER_CWD;
+        delete process.env.OMX_SESSION_ID;
+        delete process.env.TMUX;
+        delete process.env.TMUX_PANE;
+        const pointerPath = join(cwd, ".omx", "state", "session.json");
+        await configureAuthoritativeTeamWorker(cwd, "invalid-identity-team");
+        if (pointerKind === "live" || pointerKind === "stale") {
+          await writeSessionStart(cwd, "leader-session", {
+            nativeSessionId: "invalid-test-leader-native",
+            pid: pointerKind === "live" ? process.pid : 2_147_483_647,
+          });
+        } else if (pointerKind === "malformed") {
+          await mkdir(dirname(pointerPath), { recursive: true });
+          await writeFile(pointerPath, "{ malformed missing-identity evidence", "utf-8");
+        }
+        if (pointerKind === "live") {
+          await writeJson(join(cwd, ".omx", "state", "subagent-tracking.json"), {
+            schemaVersion: 1,
+            sessions: {
+              "leader-session": {
+                session_id: "leader-session",
+                leader_thread_id: "invalid-test-leader-native",
+                threads: {
+                  "invalid-test-leader-native": { thread_id: "invalid-test-leader-native", kind: "leader" },
+                  "invalid-worker-thread": { thread_id: "invalid-worker-thread", kind: "subagent" },
+                },
+              },
+            },
+          });
+        }
+        const pointerBefore = existsSync(pointerPath) ? await readFile(pointerPath, "utf-8") : null;
+
+        const payloads: Array<Record<string, unknown>> = [
+          {},
+          { session_id: "" },
+          { session_id: "../escape" },
+          { session_id: "worker-one", sessionId: "worker-two" },
+          ...(pointerKind === "live"
+            ? [{ session_id: "leader-session" }, { session_id: "invalid-test-leader-native" }]
+            : []),
+        ];
+        for (const payload of payloads) {
+          await dispatchCodexNativeHook({
+            hook_event_name: "SessionStart",
+            cwd,
+            ...payload,
+          }, { cwd, sessionOwnerPid: process.pid });
+          assert.equal(existsSync(pointerPath), pointerBefore !== null);
+          if (pointerBefore !== null) assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+
+          const stop = await dispatchCodexNativeHook({
+            hook_event_name: "Stop",
+            cwd,
+            ...payload,
+            thread_id: "invalid-worker-thread",
+            turn_id: `invalid-worker-${pointerKind}-stop`,
+          }, { cwd });
+          assert.match(String(stop.outputJson?.stopReason ?? ""), /^team_worker_/);
+          assert.equal(existsSync(pointerPath), pointerBefore !== null);
+          if (pointerBefore !== null) assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+        }
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("keeps authoritative worker payload scope independent of malformed selected-pointer evidence", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-malformed-pointer-"));
+    try {
+      await configureAuthoritativeTeamWorker(cwd, "malformed-team");
+      const pointerPath = join(cwd, ".omx", "state", "session.json");
+      await writeFile(pointerPath, "{ malformed leader evidence", "utf-8");
+
+      await dispatchCodexNativeHook({
+        hook_event_name: "SessionStart",
+        cwd,
+        session_id: "worker-malformed-native",
+      }, { cwd, sessionOwnerPid: process.pid });
+      assert.equal(await readFile(pointerPath, "utf-8"), "{ malformed leader evidence");
+
+      const stop = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "worker-malformed-native",
+        thread_id: "worker-malformed-native",
+        turn_id: "worker-malformed-stop",
+      }, { cwd });
+      assert.notEqual(stop.outputJson?.stopReason, "session_pointer_unusable");
+      assert.notEqual(stop.outputJson?.stopReason, "session_scope_unmatched");
+      assert.equal(await readFile(pointerPath, "utf-8"), "{ malformed leader evidence");
+
+      for (const payload of [
+        { session_id: "../escape" },
+        { session_id: "worker-one", sessionId: "worker-two" },
+      ]) {
+        const rejected = await dispatchCodexNativeHook({
+          hook_event_name: "SessionStart",
+          cwd,
+          ...payload,
+        }, { cwd, sessionOwnerPid: process.pid });
+        assert.equal(rejected.outputJson, null);
+        assert.equal(await readFile(pointerPath, "utf-8"), "{ malformed leader evidence");
+        assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", "escape")), false);
+        assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", "worker-one")), false);
+        assert.equal(existsSync(join(cwd, ".omx", "state", "sessions", "worker-two")), false);
+      }
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  for (const [name, mutate] of [
+    ["foreign", async (cwd: string) => {
+      process.env.OMX_TEAM_STATE_ROOT = join(cwd, "foreign-state");
+    }],
+    ["nested", async (cwd: string) => {
+      process.env.OMX_TEAM_INTERNAL_WORKER = "other-team/worker-1";
+    }],
+    ["non-Team", async () => {
+      delete process.env.OMX_TEAM_INTERNAL_WORKER;
+      delete process.env.OMX_TEAM_WORKER;
+    }],
+  ] as const) {
+    it(`does not grant the Team worker pointer bypass to ${name} hook context`, async () => {
+      const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-${name}-pointer-`));
+      try {
+        await configureAuthoritativeTeamWorker(cwd, "boundary-team");
+        await mutate(cwd);
+        const pointerPath = join(cwd, ".omx", "state", "session.json");
+        await writeFile(pointerPath, "{ malformed boundary evidence", "utf-8");
+
+        await dispatchCodexNativeHook({
+          hook_event_name: "SessionStart",
+          cwd,
+          session_id: "boundary-native",
+        }, { cwd, sessionOwnerPid: process.pid });
+        assert.equal(await readFile(pointerPath, "utf-8"), "{ malformed boundary evidence");
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    });
+  }
+
+  it("does not let a Team worker adopt a stale leader-selected pointer", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-stale-leader-"));
+    try {
+      await writeSessionStart(cwd, "stale-leader-session", {
+        nativeSessionId: "stale-leader-native",
+        pid: 2_147_483_647,
+      });
+      await configureAuthoritativeTeamWorker(cwd, "stale-leader-team");
+      const pointerPath = join(cwd, ".omx", "state", "session.json");
+      const pointerBefore = await readFile(pointerPath, "utf-8");
+
+      await dispatchCodexNativeHook({
+        hook_event_name: "SessionStart",
+        cwd,
+        session_id: "worker-after-stale-leader",
+      }, { cwd, sessionOwnerPid: process.pid });
+
+      assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+
+      const stop = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "worker-after-stale-leader",
+        thread_id: "worker-after-stale-leader",
+        turn_id: "worker-after-stale-stop",
+      }, { cwd });
+      assert.notEqual(stop.outputJson?.stopReason, "session_pointer_unusable");
+      assert.notEqual(stop.outputJson?.stopReason, "session_scope_unmatched");
+      assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves leader pointer ownership through the packed native-hook entrypoint", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-team-worker-packed-"));
+    try {
+      await writeSessionStart(cwd, "leader-session", {
+        nativeSessionId: "packed-leader-native",
+        pid: process.pid,
+      });
+      await configureAuthoritativeTeamWorker(cwd, "packed-team");
+      const pointerPath = join(cwd, ".omx", "state", "session.json");
+      const pointerBefore = await readFile(pointerPath, "utf-8");
+      const env = { ...process.env };
+
+      parseSingleJsonStdout(runNativeHookCli({
+        hook_event_name: "SessionStart",
+        cwd,
+        session_id: "packed-worker-native",
+      }, { cwd, env }));
+      assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+
+      const stopOutput = parseSingleJsonStdout(runNativeHookCli({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: "packed-worker-native",
+        thread_id: "packed-worker-native",
+        turn_id: "packed-worker-stop",
+      }, { cwd, env }));
+      assert.notEqual(stopOutput.stopReason, "session_scope_unmatched");
+      assert.notEqual(stopOutput.stopReason, "session_pointer_unusable");
+      assert.equal(await readFile(pointerPath, "utf-8"), pointerBefore);
+    } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -5101,7 +6563,7 @@ PY`,
     }
   });
 
-  it("prefers the OMX owner session id when a native new session revives HUD", async () => {
+  it("preserves the OMX owner HUD session when an unrelated native SessionStart is rejected", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-hud-owner-session-revive-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -5131,17 +6593,17 @@ PY`,
         previous_native_session_id?: string;
         owner_omx_session_id?: string;
       };
-      assert.equal(sessionState.session_id, nativeSessionId);
-      assert.equal(sessionState.native_session_id, nativeSessionId);
-      assert.equal(sessionState.previous_native_session_id, oldNativeSessionId);
-      assert.equal(sessionState.owner_omx_session_id, ownerSessionId);
+      assert.equal(sessionState.session_id, ownerSessionId);
+      assert.equal(sessionState.native_session_id, oldNativeSessionId);
+      assert.equal(sessionState.previous_native_session_id, undefined);
+      assert.equal(sessionState.owner_omx_session_id, undefined);
 
       let reconcileCall: { cwd: string; sessionId?: string; sessionIds?: string[] } | null = null;
       const promptResult = await dispatchCodexNativeHook(
         {
           hook_event_name: "UserPromptSubmit",
           cwd,
-          session_id: nativeSessionId,
+          session_id: ownerSessionId,
           thread_id: "thread-hud-owner",
           turn_id: "turn-hud-owner",
           prompt: "$ralplan fix native new hud owner handoff",
@@ -5159,7 +6621,7 @@ PY`,
       assert.deepEqual(reconcileCall, {
         cwd,
         sessionId: ownerSessionId,
-        sessionIds: [ownerSessionId, nativeSessionId],
+        sessionIds: [ownerSessionId, oldNativeSessionId],
       });
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -5485,6 +6947,7 @@ PY`,
       await mkdir(join(stateDir, "sessions", priorSessionId), { recursive: true });
       await writeSessionStart(cwd, priorSessionId, {
         nativeSessionId: "codex-native-old",
+        pid: 999_999_999,
       });
       await writeJson(join(stateDir, "sessions", priorSessionId, "ralph-state.json"), {
         active: true,
@@ -5804,6 +7267,32 @@ PY`,
     });
 
     assert.equal(resolved, 1100);
+  });
+
+  it("resolves the Codex owner from Windows process lineage without Unix ps", () => {
+    const resolved = resolveSessionOwnerPidFromAncestry(1700, {
+      platform: "win32",
+      readProcessLineage: () => [
+        {
+          pid: 1700,
+          name: "powershell.exe",
+          command: 'powershell.exe -File "C:\\Users\\user\\.codex\\hooks\\omx-native-hook-windows-shim.ps1"',
+        },
+        {
+          pid: 19072,
+          name: "pwsh.exe",
+          command: 'pwsh.exe -Command "verify expected codex.exe owner"',
+        },
+        {
+          pid: 14440,
+          name: "codex.exe",
+          command: '"C:\\Users\\user\\AppData\\Roaming\\npm\\node_modules\\@openai\\codex\\codex.exe"',
+        },
+        { pid: 14400, name: "node.exe", command: "node.exe codex.js" },
+      ],
+    });
+
+    assert.equal(resolved, 14440);
   });
 
   it("records keyword activation from UserPromptSubmit payloads", async () => {
@@ -7014,6 +8503,41 @@ standardMaxRounds = 15
 			);
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("gives finite Stop guidance for paused ultragoals", async () => {
+		for (const status of ["review_blocked", "needs_user_decision"]) {
+			const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-ultragoal-${status}-stop-`));
+			try {
+				await writeJson(join(cwd, ".omx", "ultragoal", "goals.json"), {
+					version: 1,
+					activeGoalId: "G001-paused",
+					goals: [{ id: "G001-paused", status, objective: "Paused goal" }],
+				});
+				const payload = {
+					hook_event_name: "Stop",
+					cwd,
+					session_id: `sess-ultragoal-${status}-stop`,
+					thread_id: `thread-ultragoal-${status}-stop`,
+					turn_id: `turn-ultragoal-${status}-stop`,
+					last_assistant_message: "Goal complete.",
+				};
+
+				const first = await dispatchCodexNativeHook(payload, { cwd });
+				assert.equal(first.outputJson?.decision, "block");
+				assert.equal(first.outputJson?.stopReason, "ultragoal_paused");
+				assert.match(String(first.outputJson?.systemMessage), new RegExp(`status ${status}`));
+				assert.doesNotMatch(JSON.stringify(first.outputJson), /ultragoal checkpoint/);
+
+				const replayed = await dispatchCodexNativeHook(
+					{ ...payload, stop_hook_active: true },
+					{ cwd },
+				);
+				assert.equal(replayed.outputJson, null);
+			} finally {
+				await rm(cwd, { recursive: true, force: true });
+			}
 		}
 	});
 
@@ -8252,7 +9776,7 @@ standardMaxRounds = 15
 		}
 	});
 
-	it("injects autopilot ralplan consensus gate guidance on prompt activation", async () => {
+	it("denies fresh autopilot activation at host-receipt preflight before protocol guidance", async () => {
 		const cwd = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-autopilot-ralplan-gate-"),
 		);
@@ -8272,6 +9796,10 @@ standardMaxRounds = 15
 
 			assert.equal(result.omxEventName, "keyword-detector");
 			assert.equal(result.skillState?.skill, "autopilot");
+			assert.equal(result.skillState?.active, false);
+			assert.equal(result.skillState?.phase, "failed");
+			assert.equal(result.skillState?.error, "documented_host_consensus_receipt_unavailable");
+			assert.deepEqual(result.skillState?.active_skills, []);
 			const message = String(
 				(
 					result.outputJson as {
@@ -8279,77 +9807,23 @@ standardMaxRounds = 15
 					}
 				)?.hookSpecificOutput?.additionalContext || "",
 			);
-			assert.match(message, /Autopilot protocol:/);
-			assert.match(
-				message,
-				/deep-interview -> ralplan -> ultragoal -> code-review -> ultraqa/,
-			);
-			assert.match(
-				message,
-				/structured question chain, not a one-question gate/,
-			);
-			assert.match(message, /re-score ambiguity against the active threshold/);
-			assert.match(message, /max_rounds as a cap/);
-			assert.match(
-				message,
-				/Do not advance from deep-interview to ralplan merely because the first question was answered/,
-			);
-			assert.match(
-				message,
-				/Planner output has been reviewed sequentially by Architect and then Critic/,
-			);
-			assert.match(
-				message,
-				/do not hand off to Ultragoal or implementation until .*ralplan_architect_review.*ralplan_critic_review/,
-			);
-			assert.match(message, /Conductor mode contract:/);
-			assert.match(
-				message,
-				/Golden Rule: When the Main agent is acting in Conductor mode/,
-			);
-			assert.match(message, /Conductor reuse and ledger guidance:/);
-			assert.match(message, /typed subagents never receive this block/);
-
+			assert.match(message, /documented_host_consensus_receipt_unavailable/);
+			assert.doesNotMatch(message, /Autopilot protocol:|deep-interview -> ralplan -> ultragoal/);
+			const sessionDir = join(cwd, ".omx", "state", "sessions", "sess-autopilot-ralplan-gate");
 			const autopilotState = JSON.parse(
-				await readFile(
-					join(
-						cwd,
-						".omx",
-						"state",
-						"sessions",
-						"sess-autopilot-ralplan-gate",
-						"autopilot-state.json",
-					),
-					"utf-8",
-				),
-			) as {
-				state?: { handoff_artifacts?: { context_snapshot_path?: string } };
-			};
-			const snapshotPath =
-				autopilotState.state?.handoff_artifacts?.context_snapshot_path ?? "";
-			assert.match(
-				snapshotPath,
-				/^\.omx\/context\/implement-issue-2430-\d{8}T\d{6}Z\.md$/,
-			);
-			const snapshot = await readFile(join(cwd, snapshotPath), "utf-8");
-			assert.match(
-				snapshot,
-				/activation prompt \/ task seed: \$autopilot implement issue #2430/,
-			);
-			assert.match(
-				snapshot,
-				/scope note: this seed captures the Autopilot activation prompt/,
-			);
-			assert.match(
-				snapshot,
-				/constraints: follow deep-interview -> ralplan -> ultragoal -> code-review -> ultraqa/,
-			);
+				await readFile(join(sessionDir, "autopilot-state.json"), "utf-8"),
+			) as { active?: boolean; current_phase?: string; error?: string };
+			assert.equal(autopilotState.active, false);
+			assert.equal(autopilotState.current_phase, "failed");
+			assert.equal(autopilotState.error, "documented_host_consensus_receipt_unavailable");
+			assert.equal(existsSync(join(sessionDir, "deep-interview-state.json")), false);
+			assert.equal(existsSync(join(sessionDir, "ultragoal-state.json")), false);
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
 
-	it("keeps conductor guidance on autopilot activation after capacity-only native subagent evidence", async () => {
+	it("denies fresh autopilot activation after capacity-only native subagent evidence", async () => {
 		const cwd = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-autopilot-capacity-native-"),
 		);
@@ -8384,6 +9858,9 @@ standardMaxRounds = 15
 
 			assert.equal(result.omxEventName, "keyword-detector");
 			assert.equal(result.skillState?.skill, "autopilot");
+			assert.equal(result.skillState?.active, false);
+			assert.equal(result.skillState?.phase, "failed");
+			assert.equal(result.skillState?.error, "documented_host_consensus_receipt_unavailable");
 			const message = String(
 				(
 					result.outputJson as {
@@ -8391,24 +9868,17 @@ standardMaxRounds = 15
 					}
 				)?.hookSpecificOutput?.additionalContext || "",
 			);
-			assert.match(message, /Autopilot protocol:/);
-			assert.match(message, /Conductor mode contract:/);
-			assert.match(
-				message,
-				/Golden Rule: When the Main agent is acting in Conductor mode/,
-			);
-			assert.match(message, /Conductor reuse and ledger guidance:/);
-			assert.doesNotMatch(
-				message,
-				/Native subagent support is unavailable in this environment/,
-			);
-			assert.doesNotMatch(message, /Reason: agent_thread_limit_reached/);
+			assert.match(message, /documented_host_consensus_receipt_unavailable/);
+			assert.doesNotMatch(message, /Autopilot protocol:|Conductor mode contract:|deep-interview -> ralplan -> ultragoal/);
+			const sessionDir = join(cwd, ".omx", "state", "sessions", "sess-autopilot-capacity-native");
+			assert.equal(existsSync(join(sessionDir, "deep-interview-state.json")), false);
+			assert.equal(existsSync(join(sessionDir, "ultragoal-state.json")), false);
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
 
-	it("omits conductor block and emits unsupported native guidance for unsupported autopilot first-run payload", async () => {
+	it("denies unsupported fresh autopilot activation at host-receipt preflight", async () => {
 		const cwd = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-autopilot-unsupported-native-"),
 		);
@@ -8427,6 +9897,10 @@ standardMaxRounds = 15
 				{ cwd },
 			);
 
+			assert.equal(result.skillState?.skill, "autopilot");
+			assert.equal(result.skillState?.active, false);
+			assert.equal(result.skillState?.phase, "failed");
+			assert.equal(result.skillState?.error, "documented_host_consensus_receipt_unavailable");
 			const message = String(
 				(
 					result.outputJson as {
@@ -8434,15 +9908,11 @@ standardMaxRounds = 15
 					}
 				)?.hookSpecificOutput?.additionalContext || "",
 			);
-			assert.match(message, /Autopilot protocol:/);
-			assert.doesNotMatch(message, /Conductor mode contract:/);
-			assert.doesNotMatch(message, /Conductor reuse and ledger guidance:/);
-			assert.match(
-				message,
-				/Native subagent support is unavailable in this environment/,
-			);
-			assert.match(message, /Reason: native_subagents_unsupported/);
-			assert.match(message, /Do not call multi_agent_v1\.close_agent/);
+			assert.match(message, /documented_host_consensus_receipt_unavailable/);
+			assert.doesNotMatch(message, /Autopilot protocol:|Conductor mode contract:|deep-interview -> ralplan -> ultragoal/);
+			const sessionDir = join(cwd, ".omx", "state", "sessions", "sess-autopilot-unsupported-native");
+			assert.equal(existsSync(join(sessionDir, "deep-interview-state.json")), false);
+			assert.equal(existsSync(join(sessionDir, "ultragoal-state.json")), false);
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
@@ -9956,7 +11426,7 @@ export async function onHookEvent(event) {
     }
   });
 
-  it("activates leading direct workflow invocations on native and CLI prompt submits", async () => {
+  it("denies fresh leading Autopilot invocations on native and CLI prompt submits", async () => {
     for (const source of ["codex-app", "cli"] as const) {
       const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-direct-${source}-`));
       const sessionId = `sess-direct-${source}`;
@@ -9975,10 +11445,16 @@ export async function onHookEvent(event) {
         );
 
         assert.equal(result.skillState?.skill, "autopilot");
-        assert.equal(result.skillState?.active, true);
+        assert.equal(result.skillState?.active, false);
+        assert.equal(result.skillState?.phase, "failed");
+        assert.equal(result.skillState?.error, "documented_host_consensus_receipt_unavailable");
         assert.equal(
           existsSync(join(cwd, ".omx", "state", "sessions", sessionId, "autopilot-state.json")),
           true,
+        );
+        assert.equal(
+          existsSync(join(cwd, ".omx", "state", "sessions", sessionId, "deep-interview-state.json")),
+          false,
         );
       } finally {
         await rm(cwd, { recursive: true, force: true });
@@ -10701,25 +12177,77 @@ export async function onHookEvent(event) {
 			const tmuxLog = join(cwd, "tmux.log");
 			await writeFile(
 				join(binDir, "tmux"),
-				`#!/usr/bin/env bash
+`#!/usr/bin/env bash
 set -euo pipefail
-printf '%s\\n' "$*" >> ${JSON.stringify(tmuxLog)}
+printf '%s\n' "$*" >> ${JSON.stringify(tmuxLog)}
+options_file=${JSON.stringify(join(cwd, "tmux-options"))}
+state_file=${JSON.stringify(join(cwd, "tmux-state"))}
+if [[ -f "$state_file" ]]; then
+  IFS=$'\t' read -r panes marker < "$state_file"
+else
+  panes='%1'
+  marker=''
+fi
 case "$1" in
   list-panes)
-    printf '%%1\\tcodex\\tcodex\\n'
+    if [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then
+      printf '%%1 0 200\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9 0 201\n'
+    elif [[ "$*" == *'pane_start_command'* ]]; then
+      printf '%%1\t/bin/codex\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9\tOMX_TMUX_SPLIT_OPERATION_MARKER='"'"'"$marker'"'"'; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n'
+    elif [[ "$panes" == *'%9'* ]]; then
+      printf '%%1\n%%9\n'
+    else
+      printf '%%1\n'
+    fi
     ;;
   display-message)
-    printf '200\\t60\\n'
+    if [[ "$*" == *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*'#{session_id}'*'#{window_id}'* ]]; then
+      printf '%%1\t0\t200\t$1\t@1\n'
+    elif [[ "$*" == *'#{session_id}'*'#{window_id}'* ]]; then
+      printf '$1\t@1\n'
+    else
+      printf '200\t60\n'
+    fi
     ;;
-  split-window)
-    printf '%%9\\n'
+  set-option)
+    printf '%s\t%s\n' "$3" "$4" >> "$options_file"
+    ;;
+  show-options)
+    value=''
+    if [[ -f "$options_file" ]]; then
+      while IFS=$'\t' read -r key stored; do
+        [[ "$key" == "$4" ]] && value="$stored"
+      done < "$options_file"
+    fi
+    printf '%s\n' "$value"
+    ;;
+  if-shell)
+    success="$6"
+    if [[ "$success" == *'split-window'* ]]; then
+      if [[ "$success" =~ OMX_TMUX_SPLIT_OPERATION_MARKER=\\'([^\\']+)\\' ]]; then
+        marker="\${BASH_REMATCH[1]}"
+      fi
+panes='%1 %9'
+printf '%s\t%s\n' "$panes" "$marker" > "$state_file"
+    fi
+    receipt="\${success#*display-message -p }"
+    if [[ "$receipt" != "$success" ]]; then
+      receipt="\${receipt%%[[:space:]]*}"
+      printf '%s\n' "$receipt"
+    fi
     ;;
   resize-pane)
     ;;
 esac
-`,
+`
 			);
 			await chmod(join(binDir, "tmux"), 0o755);
+			const tmuxSyntax = spawnSync("bash", ["-n", join(binDir, "tmux")], {
+				encoding: "utf-8",
+			});
+			assert.equal(tmuxSyntax.status, 0, tmuxSyntax.stderr);
 			process.env.PATH = `${binDir}:${originalPath}`;
 			process.argv = [originalArgv[0] || "node", "/tmp/codex-host-binary"];
 
@@ -10738,15 +12266,11 @@ esac
 			assert.match(tmuxCalls, /list-panes -t %1 -F/);
 			assert.match(
 				tmuxCalls,
-				new RegExp(`split-window -v -l ${HUD_TMUX_HEIGHT_LINES} -d -t %1 -c`),
+				new RegExp(`if-shell -F -t %1 [^\\n]*#\\{pane_pid\\},200[^\\n]*#\\{session_id\\},\\$1[^\\n]*#\\{window_id\\},@1[^\\n]*split-window -v -l ${HUD_TMUX_HEIGHT_LINES} -d -t %1 [^\\n]*display-message -p __omx_hud_split_`),
 			);
 			assert.match(
 				tmuxCalls,
-				new RegExp(`resize-pane -t %9 -y ${HUD_TMUX_HEIGHT_LINES}`),
-			);
-			assert.match(
-				tmuxCalls,
-				/dist\/cli\/omx\.js' hud --watch --preset=focused/,
+				/dist\/cli\/omx\.js' hud --watch '--preset=focused'/,
 			);
 			assert.doesNotMatch(tmuxCalls, /\/tmp\/codex-host-binary' hud --watch/);
 		} finally {
@@ -10845,26 +12369,78 @@ esac
 			const tmuxLog = join(cwd, "tmux.log");
 			await writeFile(
 				join(binDir, "tmux"),
-				`#!/usr/bin/env bash
+`#!/usr/bin/env bash
 set -euo pipefail
 printf '%s\n' "$*" >> ${JSON.stringify(tmuxLog)}
+options_file=${JSON.stringify(join(cwd, "tmux-options"))}
+state_file=${JSON.stringify(join(cwd, "tmux-state"))}
+if [[ -f "$state_file" ]]; then
+  IFS=$'\t' read -r panes marker < "$state_file"
+else
+  panes='%1 %2'
+  marker=''
+fi
 case "$1" in
   list-panes)
-    printf '%%1\tcodex\tcodex\n'
-    printf '%%2\tnode\texec env OMX_TMUX_HUD_OWNER='"'"'1'"'"' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='"'"'%%1'"'"' /node /omx.js hud --watch\n'
+    if [[ "$*" == *'#{pane_id} #{pane_dead} #{pane_pid}'* ]]; then
+      printf '%%1 0 200\n%%2 0 201\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9 0 202\n'
+    elif [[ "$*" == *'pane_start_command'* ]]; then
+      printf '%%1\t/bin/codex\n'
+      printf '%%2\texec env OMX_TMUX_HUD_OWNER='"'"'"1'"'"' ${OMX_TMUX_HUD_LEADER_PANE_ENV}='"'"'"%%1'"'"' /node /omx.js hud --watch\n'
+      [[ "$panes" == *'%9'* ]] && printf '%%9\tOMX_TMUX_SPLIT_OPERATION_MARKER='"'"'"$marker'"'"'; export OMX_TMUX_SPLIT_OPERATION_MARKER; node dist/cli/omx.js hud --watch\n'
+    elif [[ "$panes" == *'%9'* ]]; then
+      printf '%%1\n%%2\n%%9\n'
+    else
+      printf '%%1\n%%2\n'
+    fi
     ;;
   display-message)
-    printf '200\t60\n'
+    if [[ "$*" == *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*'#{session_id}'*'#{window_id}'* ]]; then
+      printf '%%1\t0\t200\t$1\t@1\n'
+    elif [[ "$*" == *'#{session_id}'*'#{window_id}'* ]]; then
+      printf '$1\t@1\n'
+    else
+      printf '200\t60\n'
+    fi
+    ;;
+  set-option)
+    printf '%s\t%s\n' "$3" "$4" >> "$options_file"
+    ;;
+  show-options)
+    value=''
+    if [[ -f "$options_file" ]]; then
+      while IFS=$'\t' read -r key stored; do
+        [[ "$key" == "$4" ]] && value="$stored"
+      done < "$options_file"
+    fi
+    printf '%s\n' "$value"
+    ;;
+  if-shell)
+    success="$6"
+    if [[ "$success" == *'split-window'* ]]; then
+      if [[ "$success" =~ OMX_TMUX_SPLIT_OPERATION_MARKER=\\'([^\\']+)\\' ]]; then
+        marker="\${BASH_REMATCH[1]}"
+      fi
+panes='%1 %2 %9'
+printf '%s\t%s\n' "$panes" "$marker" > "$state_file"
+    fi
+    receipt="\${success#*display-message -p }"
+    if [[ "$receipt" != "$success" ]]; then
+      receipt="\${receipt%%[[:space:]]*}"
+      printf '%s\n' "$receipt"
+    fi
     ;;
   resize-pane)
     ;;
-  split-window)
-    printf '%%9\n'
-    ;;
 esac
-`,
+`
 			);
 			await chmod(join(binDir, "tmux"), 0o755);
+			const tmuxSyntax = spawnSync("bash", ["-n", join(binDir, "tmux")], {
+				encoding: "utf-8",
+			});
+			assert.equal(tmuxSyntax.status, 0, tmuxSyntax.stderr);
 			process.env.PATH = `${binDir}:${originalPath}`;
 
 			const result = await dispatchCodexNativeHook(
@@ -10882,10 +12458,9 @@ esac
 			assert.equal(result.omxEventName, "keyword-detector");
 			const tmuxCalls = await readFile(tmuxLog, "utf-8");
 			assert.match(tmuxCalls, /list-panes -t %1 -F/);
-			assert.match(tmuxCalls, /split-window/);
 			assert.match(
 				tmuxCalls,
-				new RegExp(`resize-pane -t %9 -y ${HUD_TMUX_HEIGHT_LINES}`),
+				/if-shell -F -t %1 [^\n]*#\{pane_pid\},200[^\n]*#\{session_id\},\$1[^\n]*#\{window_id\},@1[^\n]*split-window [^\n]*display-message -p __omx_hud_split_/,
 			);
 			assert.equal(
 				existsSync(
@@ -11734,7 +13309,243 @@ exit 0
 		}
 	});
 
-	it("allows only the canonical leader's authenticated standalone deep-interview complete terminal state write", async () => {
+
+	it("issue #3239 permits command-specific safe operations during Autopilot deep-interview without relaxing mutation guards", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-issue-3239-deep-interview-"));
+		const originalQuestionReturnPane = process.env.OMX_QUESTION_RETURN_PANE;
+		const originalTmuxPane = process.env.TMUX_PANE;
+		try {
+			const sessionId = "sess-issue-3239";
+			const threadId = "thread-issue-3239";
+			const childThreadId = "thread-issue-3239-child";
+			await writeIssue3239ActiveAutopilotDeepInterviewState(cwd, sessionId, threadId);
+			await writeJson(join(cwd, ".omx", "state", "subagent-tracking.json"), {
+				schemaVersion: 1,
+				sessions: {
+					[sessionId]: {
+						session_id: sessionId,
+						leader_thread_id: threadId,
+						threads: {
+							[threadId]: { thread_id: threadId, kind: "leader" },
+							[childThreadId]: { thread_id: childThreadId, kind: "subagent", parent_thread_id: threadId },
+						},
+					},
+				},
+			});
+			await mkdir(join(cwd, "src"), { recursive: true });
+			await writeFile(join(cwd, "src", "runtime.ts"), "export const runtime = true;\n");
+			process.env.TMUX_PANE = "%42";
+			delete process.env.OMX_QUESTION_RETURN_PANE;
+
+			const dispatch = (toolName: string, toolInput: Record<string, unknown>, toolUseId: string) => dispatchCodexNativeHook({
+				hook_event_name: "PreToolUse",
+				cwd,
+				session_id: sessionId,
+				thread_id: threadId,
+				agent_id: threadId,
+				tool_name: toolName,
+				tool_use_id: toolUseId,
+				tool_input: toolInput,
+			}, { cwd });
+			const bash = (command: string, label: string) => dispatch("Bash", { command }, `tool-issue-3239-${label}`);
+			const assertAllowed = async (label: string, result: Awaited<ReturnType<typeof dispatchCodexNativeHook>>) => {
+				assert.equal(result.omxEventName, "pre-tool-use", label);
+				assert.equal(result.outputJson, null, label);
+			};
+			const assertDenied = async (label: string, result: Awaited<ReturnType<typeof dispatchCodexNativeHook>>, pattern?: RegExp) => {
+				assert.equal(result.omxEventName, "pre-tool-use", label);
+				assert.equal(result.outputJson?.decision, "block", label);
+				if (pattern) assert.match(JSON.stringify(result.outputJson), pattern, label);
+			};
+
+			await assertAllowed("valid attached-tmux omx question bridge", await bash(
+				`OMX_QUESTION_RETURN_PANE=%42 omx question --input '{"question":"Question?","type":"single-answerable","options":[{"label":"A","value":"a"}],"allow_other":false,"source":"deep-interview"}' --json`,
+				"omx-question-bridged",
+			));
+			for (const [label, command] of [
+				["bridged question chained write", `OMX_QUESTION_RETURN_PANE=%42 omx question --input '{"question":"Question?","options":["A"],"allow_other":false}' --json && printf x > src/generated.ts`],
+				["bridged question redirected", `OMX_QUESTION_RETURN_PANE=%42 omx question --input '{"question":"Question?","options":["A"],"allow_other":false}' --json > .omx/context/question.json`],
+				["bridged question command substitution", `OMX_QUESTION_RETURN_PANE=%42 omx question --input "$(cat .omx/state/session.json)" --json`],
+				["bridged question process substitution", `OMX_QUESTION_RETURN_PANE=%42 omx question --input <(printf '{}') --json`],
+				["bridged question script execution", `OMX_QUESTION_RETURN_PANE=%42 bash -c 'omx question --input "{}" --json'`],
+				["bridged question state mutation", `OMX_QUESTION_RETURN_PANE=%42 omx question --input '{"question":"Question?","options":["A"],"allow_other":false}' --json; omx state write --input '{"mode":"deep-interview","active":false}' --json`],
+			] as const) {
+				await assertDenied(label, await bash(command, label), /omx question|Deep-interview is active|src\/generated\.ts|write intent|state/);
+			}
+			await assertDenied("missing omx question bridge keeps bridge-specific denial", await bash(
+				`omx question --input '{"question":"Question?","options":["A"],"allow_other":false}' --json`,
+				"omx-question-missing-bridge",
+			), /OMX_QUESTION_RETURN_PANE=\$TMUX_PANE/);
+			await assertDenied("invalid inherited bridge keeps bridge-specific denial", await (async () => {
+				process.env.OMX_QUESTION_RETURN_PANE = "not-a-pane";
+				try {
+					return await bash(`omx question --input '{"question":"Question?","options":["A"],"allow_other":false}' --json`, "omx-question-invalid-bridge");
+				} finally {
+					delete process.env.OMX_QUESTION_RETURN_PANE;
+				}
+			})(), /OMX_QUESTION_RETURN_PANE=\$TMUX_PANE/);
+			await assertDenied("malformed inline bridge overrides inherited valid bridge", await (async () => {
+				process.env.OMX_QUESTION_RETURN_PANE = "%42";
+				try {
+					return await bash(`OMX_QUESTION_RETURN_PANE=not-a-pane omx question --input '{"question":"Question?","options":["A"],"allow_other":false}' --json`, "omx-question-inline-invalid-overrides-inherited");
+				} finally {
+					delete process.env.OMX_QUESTION_RETURN_PANE;
+				}
+			})(), /OMX_QUESTION_RETURN_PANE=\$TMUX_PANE/);
+			// Issue #3293 IR2 makes bare cancellation hook-owned only for active
+			// Autopilot deep-interview; the external OMX command is not executed.
+			// Issue #3280: inherited NODE_EXTRA_CA_CERTS must not poison that recovery path,
+			// and must not bypass the force-cancel denial for Deep Interview.
+			const directCancelResults = await withCleanRunnerNodeEnvironment(async () => {
+				const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+				const trustedBinDir = await mkdtemp(join(tmpdir(), "omx-di-trusted-bin-"));
+				await symlink(workspacePackageCli, join(trustedBinDir, "omx"));
+				const inheritedPath = process.env.PATH;
+				const previousCaCerts = process.env.NODE_EXTRA_CA_CERTS;
+				process.env.PATH = `${trustedBinDir}:${dirname(process.execPath)}`;
+				try {
+					const plain = await bash("omx cancel", "omx-cancel");
+					const plainAutopilotPhase = JSON.parse(await readFile(join(cwd, ".omx", "state", "sessions", sessionId, "autopilot-state.json"), "utf8")).current_phase;
+					const plainSkillActive = JSON.parse(await readFile(join(cwd, ".omx", "state", "sessions", sessionId, "skill-active-state.json"), "utf8")).active;
+					await writeIssue3239ActiveAutopilotDeepInterviewState(cwd, sessionId, threadId);
+					process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
+					const caPlain = await bash("omx cancel", "omx-cancel-ca");
+					await writeIssue3239ActiveAutopilotDeepInterviewState(cwd, sessionId, threadId);
+					const caForce = await bash("omx cancel --force", "omx-cancel-ca-force");
+					return { plain, caPlain, caForce, plainAutopilotPhase, plainSkillActive };
+				} finally {
+					if (inheritedPath === undefined) delete process.env.PATH;
+					else process.env.PATH = inheritedPath;
+					if (previousCaCerts === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+					else process.env.NODE_EXTRA_CA_CERTS = previousCaCerts;
+					await rm(trustedBinDir, { recursive: true, force: true });
+				}
+			});
+			assert.match(JSON.stringify(directCancelResults.plain.outputJson), /cancelled_exact_session/);
+			assert.equal(directCancelResults.plainAutopilotPhase, "cancelled");
+			assert.equal(directCancelResults.plainSkillActive, false);
+			assert.match(JSON.stringify(directCancelResults.caPlain.outputJson), /cancelled_exact_session/);
+			await assertDenied("inherited CA does not bypass Deep Interview force cancellation guard", directCancelResults.caForce, /Deep-interview is active|write intent|handoff|direct/);
+			await writeIssue3239ActiveAutopilotDeepInterviewState(cwd, sessionId, threadId);
+			await assertDenied("chained cancellation is not documented direct cancellation", await bash("printf ready && omx cancel", "omx-cancel-chained"), /Deep-interview is active|write intent|handoff|direct/);
+			await assertDenied("force cancellation is ralplan/conductor-only", await bash("omx cancel --force", "omx-cancel-force"), /Deep-interview is active|write intent|handoff|direct/);
+			await assertDenied("bom lookalike is not direct cancellation", await bash("\ufeffomx cancel", "omx-cancel-bom"), /Deep-interview is active|write intent|handoff|direct/);
+			await assertDenied("inherited bash startup poisons direct cancellation", await (async () => {
+				const previousBashEnv = process.env.BASH_ENV;
+				process.env.BASH_ENV = "/tmp/prelude.sh";
+				try {
+					return await bash("omx cancel", "omx-cancel-bash-env");
+				} finally {
+					if (previousBashEnv === undefined) delete process.env.BASH_ENV;
+					else process.env.BASH_ENV = previousBashEnv;
+				}
+			})(), /Deep-interview is active|write intent|handoff|direct/);
+			await writeIssue3239ActiveAutopilotDeepInterviewState(cwd, sessionId, threadId);
+
+			await assertDenied("inherited node coverage output poisons direct cancellation", await (async () => {
+				const previousCoverage = process.env.NODE_V8_COVERAGE;
+				process.env.NODE_V8_COVERAGE = "/tmp/coverage-out";
+				try {
+					return await bash("omx cancel", "omx-cancel-coverage");
+				} finally {
+					if (previousCoverage === undefined) delete process.env.NODE_V8_COVERAGE;
+					else process.env.NODE_V8_COVERAGE = previousCoverage;
+				}
+			})(), /Deep-interview is active|write intent|handoff|direct/);
+			await writeIssue3239ActiveAutopilotDeepInterviewState(cwd, sessionId, threadId);
+
+			{
+				// The read-only allowlist requires the same trusted-package-CLI
+				// execution-context proof the direct-cancel path uses (#3313/#3314
+				// hardening), so these assertions need `omx` to resolve to this
+				// worktree's own canonical CLI rather than relying on whatever
+				// ambient PATH the test runner happens to inherit.
+				const readOnlyTrustedBinDir = await mkdtemp(join(tmpdir(), "omx-issue-3239-readonly-trusted-bin-"));
+				const workspacePackageCliForReadOnly = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+				await symlink(workspacePackageCliForReadOnly, join(readOnlyTrustedBinDir, "omx"));
+				const inheritedReadOnlyPath = process.env.PATH;
+				const unsafeRuntimeEnvNames = [
+					"NODE_OPTIONS",
+					"OPENSSL_CONF",
+					"NODE_V8_COVERAGE",
+					"NODE_COMPILE_CACHE",
+					"NODE_REDIRECT_WARNINGS",
+					"NODE_REPORT_DIRECTORY",
+					"NODE_REPORT_FILENAME",
+				] as const;
+				const inheritedReadOnlyRuntimeEnvironment = Object.fromEntries(
+					unsafeRuntimeEnvNames.map((name) => [name, process.env[name]]),
+				);
+				process.env.PATH = `${readOnlyTrustedBinDir}:${inheritedReadOnlyPath ?? ""}`;
+				for (const name of unsafeRuntimeEnvNames) delete process.env[name];
+				try {
+					for (const [label, command] of [
+						["omx-help", "omx --help"],
+						["omx-state-read", "omx state read --json"],
+						["omx-cleanup-dry-run", "omx cleanup --dry-run"],
+						["gh-issue-list", "gh issue list --repo Yeachan-Heo/oh-my-codex"],
+						["rtk-version", "rtk --version"],
+						["omx-help-benign-locale-env", "LANG=C omx --help"],
+					] as const) {
+						await assertAllowed(label, await bash(command, label));
+					}
+				} finally {
+					if (inheritedReadOnlyPath === undefined) delete process.env.PATH;
+					else process.env.PATH = inheritedReadOnlyPath;
+					for (const name of unsafeRuntimeEnvNames) {
+						if (inheritedReadOnlyRuntimeEnvironment[name] === undefined) delete process.env[name];
+						else process.env[name] = inheritedReadOnlyRuntimeEnvironment[name];
+					}
+					await rm(readOnlyTrustedBinDir, { recursive: true, force: true });
+				}
+			}
+
+			for (const [label, command, pattern] of [
+				["chained mutation", "omx --help && printf x > src/generated.ts", /src\/generated\.ts|Deep-interview is active/],
+				["command substitution mutation", "omx --help $(printf x > src/generated.ts)", /src\/generated\.ts|Deep-interview is active/],
+				["process substitution mutation", "cat <(printf x > src/generated.ts)", /src\/generated\.ts|Deep-interview is active/],
+				["omx help with node preload", "NODE_OPTIONS='--require ./preload.cjs' omx --help", /NODE_OPTIONS|Deep-interview is active|preload|write intent/],
+				["omx state read with node import", "NODE_OPTIONS='--import ./preload.mjs' omx state read --json", /NODE_OPTIONS|Deep-interview is active|preload|write intent/],
+				["rtk version with node preload", "NODE_OPTIONS='--require ./preload.cjs' rtk --version", /NODE_OPTIONS|Deep-interview is active|preload|write intent/],
+				["omx help with PATH resolution override", "PATH=/attacker/bin omx --help", /PATH|Deep-interview is active|write intent/],
+				["rtk version with PATH resolution override", "PATH=/attacker/bin rtk --version", /PATH|Deep-interview is active|write intent/],
+				["omx state read with PATHEXT resolution override", "PATHEXT=.EVIL omx state read --json", /PATHEXT|Deep-interview is active|write intent/],
+				["omx help with dynamic env assignment", "OMX_QUESTION_RETURN_PANE=$(printf %42) omx --help", /Deep-interview is active|write intent|OMX_QUESTION_RETURN_PANE/],
+				["gh web launcher", "gh pr view 3240 --repo Yeachan-Heo/oh-my-codex --web", /gh|Deep-interview is active|write intent/],
+				["gh run watch polling", "gh run watch 123 --repo Yeachan-Heo/oh-my-codex", /gh|Deep-interview is active|write intent/],
+				["gh alias execution surface", "gh alias list", /gh|Deep-interview is active|write intent/],
+				["gh mutation variant", "gh pr checkout 3240 --repo Yeachan-Heo/oh-my-codex", /gh|Deep-interview is active|write intent/],
+				["gh dynamic repo value", "gh pr view 3240 --repo $(printf Yeachan-Heo/oh-my-codex)", /gh|Deep-interview is active|write intent/],
+				["gh output redirection", "gh pr view 3240 --repo Yeachan-Heo/oh-my-codex > .omx/context/pr.json", /gh|Deep-interview is active|write intent|.omx\/context/],
+				["wrapper smuggling", `env node --require ./preload.js dist/cli/omx.js state write --input '${JSON.stringify({ mode: "deep-interview", active: false, current_phase: "complete", session_id: "sess-issue-3239", workingDirectory: cwd })}' --json`, /runtime wrapper|Deep-interview is active|write intent/],
+				["generated tmp script", "cat > .omx/tmp/run.sh <<'EOF'\necho unsafe\nEOF\nbash .omx/tmp/run.sh", /.omx\/tmp|generated-script|Deep-interview is active/],
+			] as const) {
+				await assertDenied(label, await bash(command, label), pattern);
+			}
+
+			await assertDenied("native-child mutation", await dispatchCodexNativeHook({
+				hook_event_name: "PreToolUse",
+				cwd,
+				session_id: sessionId,
+				thread_id: childThreadId,
+				agent_id: childThreadId,
+				tool_name: "Bash",
+				tool_use_id: "tool-issue-3239-native-child",
+				tool_input: { command: "printf x > .omx/context/native-child.md" },
+			}, { cwd }), /OWNER_CONFIRMATION_REQUIRED|native child/);
+			await assertDenied("protected state raw write", await dispatch("Write", { file_path: ".omx/state/session.json", content: "{}\n" }, "tool-issue-3239-protected-state"), /Protected workflow state|Deep-interview is active/);
+			await assertDenied("implementation write", await dispatch("Edit", { file_path: "src/runtime.ts", old_string: "true", new_string: "false" }, "tool-issue-3239-implementation-write"), /Deep-interview is active .*implementation\/write tools are blocked/i);
+			await assertDenied("unknown tool", await dispatch("mcp__unknown__mutate", { path: ".omx/context/unknown.md" }, "tool-issue-3239-unknown-tool"), /not a recognized read-only or explicitly authorized deep-interview mutation transport/);
+		} finally {
+			if (originalQuestionReturnPane === undefined) delete process.env.OMX_QUESTION_RETURN_PANE;
+			else process.env.OMX_QUESTION_RETURN_PANE = originalQuestionReturnPane;
+			if (originalTmuxPane === undefined) delete process.env.TMUX_PANE;
+			else process.env.TMUX_PANE = originalTmuxPane;
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("allows only the canonical leader's authenticated standalone deep-interview complete terminal state write", async () => withCleanAmbientNodeRuntimeEnvironment(async () => {
 		const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-deep-interview-terminal-write-"));
 		try {
 			const stateDir = join(cwd, ".omx", "state");
@@ -11917,6 +13728,534 @@ exit 0
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
+	}));
+	it("issue #3313/#3314 permits standalone deep-interview lifecycle reachability and read-only discovery without relaxing write guards", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-issue-3313-3314-di-"));
+		try {
+			const stateDir = join(cwd, ".omx", "state");
+			const sessionId = "sess-issue-3313-3314-di";
+			const threadId = "thread-issue-3313-3314-di";
+			const sessionDir = join(stateDir, "sessions", sessionId);
+			await mkdir(sessionDir, { recursive: true });
+			await writeJson(join(stateDir, "session.json"), { session_id: sessionId, cwd, leader_thread_id: threadId });
+			await writeJson(join(stateDir, "subagent-tracking.json"), {
+				schemaVersion: 1,
+				sessions: {
+					[sessionId]: {
+						session_id: sessionId,
+						leader_thread_id: threadId,
+						threads: { [threadId]: { thread_id: threadId, kind: "leader" } },
+					},
+				},
+			});
+			await writeJson(join(sessionDir, "skill-active-state.json"), {
+				active: true,
+				skill: "deep-interview",
+				phase: "planning",
+				session_id: sessionId,
+				thread_id: threadId,
+				active_skills: [{
+					skill: "deep-interview",
+					phase: "planning",
+					active: true,
+					session_id: sessionId,
+					thread_id: threadId,
+				}],
+			});
+			const activeWrite = await executeStateOperation("state_write", {
+				mode: "deep-interview",
+				active: true,
+				current_phase: "intent-first",
+				session_id: sessionId,
+				thread_id: threadId,
+				workingDirectory: cwd,
+			});
+			assert.notEqual(activeWrite.isError, true);
+			await writeFile(join(cwd, "README.md"), "foo bar\n");
+
+			// Payload-realistic regression for #3314's reported live-runtime
+			// discrepancy: exercise the actual PreToolUse dispatch path against a
+			// process-wide trusted PATH (not an inline `PATH=... omx` assignment,
+			// and not a manually short-circuited fixture) so the omx CLI resolves
+			// exactly the way a live Codex session resolves it.
+			const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+			const trustedBinDir = await mkdtemp(join(tmpdir(), "omx-issue-3313-3314-trusted-bin-"));
+			await symlink(workspacePackageCli, join(trustedBinDir, "omx"));
+			const inheritedPath = process.env.PATH;
+			process.env.PATH = `${trustedBinDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
+			const unsafeRuntimeEnvironmentNames = [
+				"NODE_OPTIONS",
+				"OPENSSL_CONF",
+				"NODE_V8_COVERAGE",
+				"NODE_COMPILE_CACHE",
+				"NODE_REDIRECT_WARNINGS",
+				"NODE_REPORT_DIRECTORY",
+				"NODE_REPORT_FILENAME",
+			] as const;
+			const inheritedUnsafeRuntimeEnvironment = Object.fromEntries(
+				unsafeRuntimeEnvironmentNames.map((name) => [name, process.env[name]]),
+			);
+			for (const name of unsafeRuntimeEnvironmentNames) delete process.env[name];
+			const sparkshellImplementationEnvironmentNames = [
+				"OMX_SPARKSHELL_BIN",
+				"OMX_NATIVE_CACHE_DIR",
+				"OMX_NATIVE_MANIFEST_URL",
+				"OMX_NATIVE_RELEASE_BASE_URL",
+				"OMX_NATIVE_AUTO_FETCH",
+				"XDG_CACHE_HOME",
+				"LOCALAPPDATA",
+			] as const;
+			const inheritedSparkshellImplementationEnvironment = Object.fromEntries(
+				sparkshellImplementationEnvironmentNames.map((name) => [name, process.env[name]]),
+			);
+			for (const name of sparkshellImplementationEnvironmentNames) delete process.env[name];
+
+			const preToolUse = (command: string) => dispatchCodexNativeHook({
+				hook_event_name: "PreToolUse",
+				cwd,
+				session_id: sessionId,
+				thread_id: threadId,
+				agent_id: threadId,
+				tool_name: "Bash",
+				tool_use_id: `tool-issue-3313-3314-di-${Math.random()}`,
+				tool_input: { command },
+			}, { cwd });
+			const assertAllowed = async (label: string, command: string) => {
+				const result = await preToolUse(command);
+				assert.equal(result.outputJson, null, `${label}: ${JSON.stringify(result.outputJson)}`);
+			};
+			const assertBlocked = async (label: string, command: string, pattern?: RegExp) => {
+				const result = await preToolUse(command);
+				assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block", label);
+				if (pattern) assert.match(JSON.stringify(result.outputJson), pattern, label);
+			};
+
+			try {
+				// #3314: plain, non-omx-wrapped read-only discovery must already stay allowed.
+				// Use coreutils/git only (guaranteed present and root-owned on every CI
+				// runner); ripgrep is not part of the standard test image, so asserting
+				// on it here would make this hermetic classifier test depend on ambient
+				// package installation rather than on the fix under test.
+				await assertAllowed("plain git status", "git status --short --branch");
+				await assertAllowed("plain find", "find . -maxdepth 3 -type d");
+
+				// Direct plain `rg` must also stay read-only when it is genuinely
+				// available on this host's real PATH (a user-managed external
+				// executable, not one this repo controls). ripgrep is not part of
+				// the base OS image or this lane's installed toolset, so this check
+				// is best-effort/skip-when-absent rather than hermetic -- it proves
+				// the classifier's generic non-omx/gjc read-only path for a real,
+				// externally-resolved `rg` wherever one happens to exist, without
+				// making the suite depend on ripgrep being installed everywhere.
+				{
+					const { execFileSync } = await import("node:child_process");
+					let realRgPath: string | null = null;
+					try {
+						realRgPath = execFileSync("/bin/sh", ["-c", "command -v rg"], { encoding: "utf-8" }).trim() || null;
+					} catch {
+						realRgPath = null;
+					}
+					if (realRgPath) {
+						await assertAllowed("plain rg (real, externally-resolved binary)", `rg -n -i "foo" README.md`);
+					}
+				}
+
+				// #3313/#3314: omx/gjc help/version/status/read must not be misclassified as writes.
+				await assertAllowed("omx --help", "omx --help");
+				await assertAllowed("omx ralplan --help", "omx ralplan --help");
+				await assertAllowed("omx state read (bare)", "omx state read --json");
+				await assertAllowed("omx state read --mode deep-interview --json", "omx state read --mode deep-interview --json");
+				await assertAllowed("omx state get-status --mode=deep-interview --json", "omx state get-status --mode=deep-interview --json");
+				await assertAllowed("omx state read nested help", "omx state read --help");
+				await assertAllowed("omx auth nested help", "omx auth --help");
+				await assertBlocked("invalid state status spelling stays blocked", "omx state status --mode=deep-interview --json");
+
+				// #3314: sparkshell-wrapped read-only discovery must not be misclassified as a write.
+				await assertAllowed("sparkshell wrapped git status", "omx sparkshell -- git status --short --branch");
+				await assertAllowed("sparkshell nested help", "omx sparkshell --help");
+				await assertAllowed("sparkshell wrapped find", "omx sparkshell -- find . -maxdepth 1 -type f");
+				await assertAllowed("sparkshell json-flagged wrapped git status", "omx sparkshell --json -- git status --short --branch");
+
+				// #3313: deep-interview's own structured lifecycle stays reachable.
+				await assertAllowed("omx cancel", "omx cancel");
+
+				// The read-only allowlist authorizes the *outer* omx/gjc invocation, not
+				// just the wrapped argv shape, so it must require the same trusted-package-CLI
+				// execution-context proof the direct-cancel path already uses. An impostor
+				// binary (PATH-prefix override or path-qualified) must never reach the
+				// allow-return for --help, state read, or sparkshell, regardless of what its
+				// wrapped argv looks like.
+				{
+					const impostorBinDir = await mkdtemp(join(tmpdir(), "omx-impostor-bin-"));
+					await writeFile(join(impostorBinDir, "omx"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(impostorBinDir, "omx"), 0o755);
+					try {
+						await assertBlocked("PATH-prefix impostor omx --help stays blocked", `PATH="${impostorBinDir}" omx --help`);
+						await assertBlocked(
+							"PATH-prefix impostor omx state read stays blocked",
+							`PATH="${impostorBinDir}" omx state read --mode deep-interview --json`,
+						);
+						await assertBlocked(
+							"PATH-prefix impostor omx sparkshell stays blocked",
+							`PATH="${impostorBinDir}" omx sparkshell -- git status --short --branch`,
+						);
+					await assertBlocked(
+						"path-qualified impostor omx sparkshell stays blocked",
+						`${join(impostorBinDir, "omx")} sparkshell -- git status --short --branch`,
+					);
+					} finally {
+						await rm(impostorBinDir, { recursive: true, force: true });
+					}
+				}
+
+				// A relative-path impostor `./omx` resolves via the current directory,
+				// never via PATH, so it must stay blocked even when a legitimate
+				// trusted `omx` also exists on PATH -- basename-only trust would be
+				// fooled by the unrelated trusted PATH entry.
+				{
+					await writeFile(join(cwd, "omx"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(cwd, "omx"), 0o755);
+					try {
+						await assertBlocked(
+							"relative-path impostor ./omx sparkshell stays blocked with a legitimate trusted omx also on PATH",
+							"./omx sparkshell -- git status --short --branch",
+						);
+					} finally {
+						await rm(join(cwd, "omx"), { force: true });
+					}
+				}
+
+				// An inherited BASH_FUNC_omx%% shell-function shadow must stay blocked
+				// even against a trusted PATH resolution for the real binary.
+				{
+					const previousBashFuncOmx = process.env["BASH_FUNC_omx%%"];
+					process.env["BASH_FUNC_omx%%"] = "() { echo shadowed; }";
+					try {
+						await assertBlocked("inherited BASH_FUNC_omx%% shadow stays blocked", "omx --help");
+					} finally {
+						if (previousBashFuncOmx === undefined) delete process.env["BASH_FUNC_omx%%"];
+						else process.env["BASH_FUNC_omx%%"] = previousBashFuncOmx;
+					}
+				}
+
+
+				// gjc is a first-class alias of the same canonical package CLI; a trusted
+				// gjc shim must get the same read-only discovery allowance omx does.
+				{
+					const gjcTrustedBinDir = await mkdtemp(join(tmpdir(), "omx-gjc-trusted-bin-"));
+					await symlink(workspacePackageCli, join(gjcTrustedBinDir, "gjc"));
+					const previousGjcPath = process.env.PATH;
+					process.env.PATH = `${gjcTrustedBinDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
+					try {
+						await assertAllowed("trusted gjc --help", "gjc --help");
+						await assertAllowed("trusted gjc sparkshell wrapped git status", "gjc sparkshell -- git status --short --branch");
+					} finally {
+						if (previousGjcPath === undefined) delete process.env.PATH; else process.env.PATH = previousGjcPath;
+						await rm(gjcTrustedBinDir, { recursive: true, force: true });
+					}
+				}
+
+				// Lexical-boundary mismatches between our tokenizer/analysis and the
+				// actual shell that will execute the command must not let a
+				// differently-named executable borrow this trust: a wrapper
+				// (env/command/time) around an impostor, a non-ASCII whitespace
+				// character embedded mid-command, and a leading BOM stripped by
+				// ECMAScript trim() must all still resolve to denial.
+				{
+					const lexicalAttackerDir = await mkdtemp(join(tmpdir(), "omx-lexical-attacker-"));
+					await writeFile(join(lexicalAttackerDir, "omx"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(lexicalAttackerDir, "omx"), 0o755);
+					// A file literally named "omx<NBSP>--help" (single word to the real
+					// shell, since Bash does not treat U+00A0 as a blank).
+					await writeFile(join(lexicalAttackerDir, "omx\u00A0--help"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(lexicalAttackerDir, "omx\u00A0--help"), 0o755);
+					// A file literally named "\uFEFFomx" (leading BOM preserved by Bash).
+					await writeFile(join(lexicalAttackerDir, "\uFEFFomx"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(lexicalAttackerDir, "\uFEFFomx"), 0o755);
+					// Files literally named "omx<VT>--help" / "omx<FF>--help" (single
+					// words to the real shell -- Bash does not treat U+000B/U+000C as
+					// blanks either, only ASCII space/tab/newline).
+					await writeFile(join(lexicalAttackerDir, "omx\v--help"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(lexicalAttackerDir, "omx\v--help"), 0o755);
+					await writeFile(join(lexicalAttackerDir, "omx\f--help"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(lexicalAttackerDir, "omx\f--help"), 0o755);
+					const previousLexicalPath = process.env.PATH;
+					// Attacker directory first, then the legitimate trusted CLI later on PATH.
+					process.env.PATH = `${lexicalAttackerDir}:${trustedBinDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
+					try {
+						await assertBlocked("env-wrapped omx --help stays blocked", "env omx --help");
+						await assertBlocked("command-wrapped omx --help stays blocked", "command omx --help");
+						await assertBlocked("time-wrapped omx --help stays blocked", "time omx --help");
+						await assertBlocked(
+							"embedded NBSP between omx and --help stays blocked",
+							"omx\u00A0--help",
+						);
+						await assertBlocked(
+							"leading BOM before omx --help stays blocked",
+							"\uFEFFomx --help",
+						);
+						await assertBlocked(
+							"embedded vertical tab between omx and --help stays blocked",
+							"omx\v--help",
+						);
+						await assertBlocked(
+							"embedded form feed between omx and --help stays blocked",
+							"omx\f--help",
+						);
+					} finally {
+						if (previousLexicalPath === undefined) delete process.env.PATH; else process.env.PATH = previousLexicalPath;
+						await rm(lexicalAttackerDir, { recursive: true, force: true });
+					}
+				}
+
+				// Guards that must NOT relax: unsafe sparkshell modes, mutation-shaped
+				// wrapped argv, raw redirects into own session state, active-state
+				// overrides, and PATH-prefix smuggling on `omx cancel`. Nested help is
+				// allowed only in parser positions that short-circuit before side effects;
+				// trailing help on mutators must remain blocked. A `--help` meant for a
+				// sparkshell-wrapped script must not short-circuit scrutiny of that
+				// wrapped script, and every inherited or leading sidecar/cache identity
+				// override must deny the sparkshell allowance entirely.
+				await assertBlocked("sparkshell --shell mode stays scrutinized", "omx sparkshell --shell 'git status --short --branch'");
+				await assertBlocked("sparkshell tmux-pane mode stays scrutinized", "omx sparkshell --tmux-pane %42");
+				await assertBlocked("sparkshell trailing help does not short-circuit shell mode", "omx sparkshell --shell 'git status --short --branch' --help");
+				await assertBlocked("auth trailing help does not short-circuit slot mutation", "omx auth use slot --help");
+				await assertBlocked(
+					"workflow mutator trailing help does not short-circuit execution",
+					"omx performance-goal create --objective x --evaluator-command true --evaluator-contract x --help",
+				);
+				await assertBlocked("sparkshell wrapped write stays blocked", `omx sparkshell -- bash -c 'echo x > src/generated.ts'`);
+				await assertBlocked("omx cleanup --version stays blocked (not a bare top-level probe)", "omx cleanup --version");
+				await assertBlocked("omx cleanup -v stays blocked (not a bare top-level probe)", "omx cleanup -v");
+				await assertBlocked(
+					"sparkshell-wrapped --help meant for the wrapped script stays scrutinized",
+					"omx sparkshell -- ./mutate.sh --help",
+				);
+				for (const [name, value] of [
+					["OMX_SPARKSHELL_BIN", "/tmp/attacker-sidecar"],
+					["OMX_NATIVE_CACHE_DIR", "/tmp/attacker-native-cache"],
+					["OMX_NATIVE_MANIFEST_URL", "https://attacker.invalid/manifest.json"],
+					["OMX_NATIVE_RELEASE_BASE_URL", "https://attacker.invalid/releases"],
+					["OMX_NATIVE_AUTO_FETCH", "0"],
+					["XDG_CACHE_HOME", "/tmp/attacker-xdg-cache"],
+					["LOCALAPPDATA", "/tmp/attacker-localappdata"],
+				] as const) {
+					const previous = process.env[name];
+					process.env[name] = value;
+					try {
+						await assertBlocked(`inherited ${name} override denies the sparkshell allowance`, "omx sparkshell -- git status --short --branch");
+					} finally {
+						if (previous === undefined) delete process.env[name];
+						else process.env[name] = previous;
+					}
+					await assertBlocked(`leading ${name} override denies the sparkshell allowance`, `${name}=${JSON.stringify(value)} omx sparkshell -- git status --short --branch`);
+					await assertBlocked(`env-wrapper ${name} override denies the sparkshell allowance`, `env ${name}=${JSON.stringify(value)} omx sparkshell -- git status --short --branch`);
+				}
+				await assertBlocked(
+					"raw redirect into own session state",
+					`echo '{}' > ${join(sessionDir, "deep-interview-state.json")}`,
+					/is not under allowed deep-interview artifact/,
+				);
+				await assertBlocked(
+					"active-state override via omx state write stays blocked",
+					`omx state write --input '${JSON.stringify({ mode: "deep-interview", active: true, current_phase: "planning", session_id: sessionId, workingDirectory: cwd })}' --json`,
+				);
+				await assertBlocked("PATH-prefix smuggled omx cancel stays blocked", `PATH="${trustedBinDir}" omx cancel`, /PATH|write intent/);
+			} finally {
+				if (inheritedPath === undefined) delete process.env.PATH; else process.env.PATH = inheritedPath;
+				for (const name of unsafeRuntimeEnvironmentNames) {
+					if (inheritedUnsafeRuntimeEnvironment[name] === undefined) delete process.env[name];
+					else process.env[name] = inheritedUnsafeRuntimeEnvironment[name];
+				}
+				for (const name of sparkshellImplementationEnvironmentNames) {
+					const previous = (inheritedSparkshellImplementationEnvironment as Record<string, string | undefined>)[name];
+					if (previous === undefined) delete process.env[name];
+					else process.env[name] = previous;
+				}
+				await rm(trustedBinDir, { recursive: true, force: true });
+			}
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("issue #3314 permits ralplan planning read-only discovery without relaxing write guards", async () => {
+		const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-issue-3314-ralplan-"));
+		try {
+			const stateDir = join(cwd, ".omx", "state");
+			const sessionId = "sess-issue-3314-ralplan";
+			const threadId = "thread-issue-3314-ralplan";
+			const sessionDir = join(stateDir, "sessions", sessionId);
+			await mkdir(sessionDir, { recursive: true });
+			await writeJson(join(stateDir, "session.json"), { session_id: sessionId, cwd, leader_thread_id: threadId });
+			await writeJson(join(stateDir, "subagent-tracking.json"), {
+				schemaVersion: 1,
+				sessions: {
+					[sessionId]: {
+						session_id: sessionId,
+						leader_thread_id: threadId,
+						threads: { [threadId]: { thread_id: threadId, kind: "leader" } },
+					},
+				},
+			});
+			await writeJson(join(sessionDir, "skill-active-state.json"), {
+				version: 1,
+				active: true,
+				skill: "ralplan",
+				phase: "planning",
+				session_id: sessionId,
+				active_skills: [{ skill: "ralplan", phase: "planning", active: true, session_id: sessionId }],
+			});
+			await writeJson(join(sessionDir, "ralplan-state.json"), {
+				active: true,
+				mode: "ralplan",
+				current_phase: "planning",
+				session_id: sessionId,
+			});
+			await writeFile(join(cwd, "README.md"), "foo bar\n");
+
+			const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+			const trustedBinDir = await mkdtemp(join(tmpdir(), "omx-issue-3314-ralplan-trusted-bin-"));
+			await symlink(workspacePackageCli, join(trustedBinDir, "omx"));
+			const inheritedPath = process.env.PATH;
+			process.env.PATH = `${trustedBinDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
+			const unsafeRuntimeEnvironmentNames = [
+				"NODE_OPTIONS",
+				"OPENSSL_CONF",
+				"NODE_V8_COVERAGE",
+				"NODE_COMPILE_CACHE",
+				"NODE_REDIRECT_WARNINGS",
+				"NODE_REPORT_DIRECTORY",
+				"NODE_REPORT_FILENAME",
+			] as const;
+			const inheritedUnsafeRuntimeEnvironment = Object.fromEntries(
+				unsafeRuntimeEnvironmentNames.map((name) => [name, process.env[name]]),
+			);
+			for (const name of unsafeRuntimeEnvironmentNames) delete process.env[name];
+			const sparkshellImplementationEnvironmentNames = [
+				"OMX_SPARKSHELL_BIN",
+				"OMX_NATIVE_CACHE_DIR",
+				"OMX_NATIVE_MANIFEST_URL",
+				"OMX_NATIVE_RELEASE_BASE_URL",
+				"OMX_NATIVE_AUTO_FETCH",
+				"XDG_CACHE_HOME",
+				"LOCALAPPDATA",
+			] as const;
+			const inheritedSparkshellImplementationEnvironment = Object.fromEntries(
+				sparkshellImplementationEnvironmentNames.map((name) => [name, process.env[name]]),
+			);
+			for (const name of sparkshellImplementationEnvironmentNames) delete process.env[name];
+
+			const preToolUse = (command: string) => dispatchCodexNativeHook({
+				hook_event_name: "PreToolUse",
+				cwd,
+				session_id: sessionId,
+				thread_id: threadId,
+				agent_id: threadId,
+				tool_name: "Bash",
+				tool_use_id: `tool-issue-3314-ralplan-${Math.random()}`,
+				tool_input: { command },
+			}, { cwd });
+			const assertAllowed = async (label: string, command: string) => {
+				const result = await preToolUse(command);
+				assert.equal(result.outputJson, null, `${label}: ${JSON.stringify(result.outputJson)}`);
+			};
+			const assertBlocked = async (label: string, command: string) => {
+				const result = await preToolUse(command);
+				assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block", label);
+			};
+
+			try {
+				await assertAllowed("plain git status", "git status --short --branch");
+				await assertAllowed("plain find", "find . -maxdepth 3 -type d");
+				await assertAllowed("omx --help", "omx --help");
+				await assertAllowed("omx ralplan --help", "omx ralplan --help");
+				await assertAllowed("omx state read --mode ralplan --json", "omx state read --mode ralplan --json");
+				await assertAllowed("omx state get-status --mode ralplan --json", "omx state get-status --mode ralplan --json");
+				await assertBlocked("invalid state status spelling stays blocked", "omx state status --mode ralplan --json");
+				await assertAllowed("sparkshell wrapped git status", "omx sparkshell -- git status --short --branch");
+
+				{
+					const impostorBinDir = await mkdtemp(join(tmpdir(), "omx-impostor-bin-ralplan-"));
+					await writeFile(join(impostorBinDir, "omx"), "#!/bin/sh\necho pwned\n");
+					await chmod(join(impostorBinDir, "omx"), 0o755);
+					try {
+						await assertBlocked("PATH-prefix impostor omx --help stays blocked", `PATH="${impostorBinDir}" omx --help`);
+						await assertBlocked(
+							"PATH-prefix impostor omx sparkshell stays blocked",
+							`PATH="${impostorBinDir}" omx sparkshell -- git status --short --branch`,
+						);
+					} finally {
+						await rm(impostorBinDir, { recursive: true, force: true });
+					}
+				}
+
+				{
+					const gjcTrustedBinDir = await mkdtemp(join(tmpdir(), "omx-gjc-trusted-bin-ralplan-"));
+					await symlink(workspacePackageCli, join(gjcTrustedBinDir, "gjc"));
+					const previousGjcPath = process.env.PATH;
+					process.env.PATH = `${gjcTrustedBinDir}:${dirname(process.execPath)}:/usr/bin:/bin`;
+					try {
+						await assertAllowed("trusted gjc --help", "gjc --help");
+					} finally {
+						if (previousGjcPath === undefined) delete process.env.PATH; else process.env.PATH = previousGjcPath;
+						await rm(gjcTrustedBinDir, { recursive: true, force: true });
+					}
+				}
+
+				await assertBlocked("sparkshell --shell mode stays scrutinized", "omx sparkshell --shell 'git status --short --branch'");
+				await assertBlocked("sparkshell tmux-pane mode stays scrutinized", "omx sparkshell --tmux-pane %42");
+				await assertBlocked("sparkshell trailing help does not short-circuit shell mode", "omx sparkshell --shell 'git status --short --branch' --help");
+				await assertBlocked("auth trailing help does not short-circuit slot mutation", "omx auth use slot --help");
+				await assertBlocked(
+					"workflow mutator trailing help does not short-circuit execution",
+					"omx performance-goal create --objective x --evaluator-command true --evaluator-contract x --help",
+				);
+				await assertBlocked("sparkshell wrapped write stays blocked", `omx sparkshell -- bash -c 'echo x > src/generated.ts'`);
+				await assertBlocked("omx cleanup --version stays blocked (not a bare top-level probe)", "omx cleanup --version");
+				await assertBlocked(
+					"sparkshell-wrapped --help meant for the wrapped script stays scrutinized",
+					"omx sparkshell -- ./mutate.sh --help",
+				);
+				for (const [name, value] of [
+					["OMX_SPARKSHELL_BIN", "/tmp/attacker-sidecar"],
+					["OMX_NATIVE_CACHE_DIR", "/tmp/attacker-native-cache"],
+					["OMX_NATIVE_MANIFEST_URL", "https://attacker.invalid/manifest.json"],
+					["OMX_NATIVE_RELEASE_BASE_URL", "https://attacker.invalid/releases"],
+					["OMX_NATIVE_AUTO_FETCH", "0"],
+					["XDG_CACHE_HOME", "/tmp/attacker-xdg-cache"],
+					["LOCALAPPDATA", "/tmp/attacker-localappdata"],
+				] as const) {
+					const previous = process.env[name];
+					process.env[name] = value;
+					try {
+						await assertBlocked(`inherited ${name} override denies the sparkshell allowance`, "omx sparkshell -- git status --short --branch");
+					} finally {
+						if (previous === undefined) delete process.env[name];
+						else process.env[name] = previous;
+					}
+					await assertBlocked(`leading ${name} override denies the sparkshell allowance`, `${name}=${JSON.stringify(value)} omx sparkshell -- git status --short --branch`);
+				}
+				await assertBlocked(
+					"raw redirect into own session state",
+					`echo '{}' > ${join(sessionDir, "ralplan-state.json")}`,
+				);
+			} finally {
+				if (inheritedPath === undefined) delete process.env.PATH; else process.env.PATH = inheritedPath;
+				for (const name of unsafeRuntimeEnvironmentNames) {
+					if (inheritedUnsafeRuntimeEnvironment[name] === undefined) delete process.env[name];
+					else process.env[name] = inheritedUnsafeRuntimeEnvironment[name];
+				}
+				for (const name of sparkshellImplementationEnvironmentNames) {
+					const previous = (inheritedSparkshellImplementationEnvironment as Record<string, string | undefined>)[name];
+					if (previous === undefined) delete process.env[name];
+					else process.env[name] = previous;
+				}
+				await rm(trustedBinDir, { recursive: true, force: true });
+			}
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
 	});
 
 	it("does not protect matching state basenames outside the canonical state root", async () => {
@@ -11968,10 +14307,10 @@ exit 0
 			await rm(cwd, { recursive: true, force: true });
 		}
 	});
-	it("allows canonical leader deep-interview artifact and state writes while blocking implementation Bash writes", async () => {
-		const cwd = await mkdtemp(
+	it("allows canonical leader deep-interview artifact and state writes while blocking implementation Bash writes", async () => withCleanAmbientNodeRuntimeEnvironment(async () => {
+		const cwd = realpathSync(await mkdtemp(
 			join(tmpdir(), "omx-native-hook-pretool-deep-interview-artifact-"),
-		);
+		));
 		try {
 			const stateDir = join(cwd, ".omx", "state");
 			const sessionDir = join(stateDir, "sessions", "sess-di-artifact");
@@ -11981,6 +14320,9 @@ exit 0
 				cwd,
 				leader_thread_id: "thread-di-artifact",
 				native_session_id: "native-di-artifact",
+				owner_omx_session_id: "owner-omx-di-artifact",
+				owner_codex_session_id: "owner-codex-di-artifact",
+				codex_session_id: "codex-di-artifact",
 			});
 			const threadId = "thread-di-artifact";
 			await writeJson(join(stateDir, "subagent-tracking.json"), {
@@ -12341,12 +14683,16 @@ exit 0
 				["missing session", { mode: "deep-interview", active: true, workingDirectory: cwd }],
 				["missing cwd", { mode: "deep-interview", active: true, session_id: "sess-di-artifact" }],
 				["foreign session", { mode: "deep-interview", active: true, session_id: "foreign", workingDirectory: cwd }],
+				["dynamic session", { mode: "deep-interview", active: true, session_id: "$CODEX_THREAD_ID", workingDirectory: cwd }],
+				["conflicting owner alias", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", owner_codex_session_id: "foreign", workingDirectory: cwd }],
+				["persisted verified owner alias", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", owner_codex_session_id: "owner-codex-di-artifact", workingDirectory: cwd }],
 				["foreign cwd", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: join(cwd, "src") }],
-				["nested foreign session", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: cwd, state: { session_id: "native-di-artifact" } }],
+				["nested foreign session", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: cwd, state: { session_id: "foreign" } }],
+				["nested persisted verified session alias", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: cwd, state: { session_id: "native-di-artifact" } }],
 				["nested foreign owner alias", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: cwd, state: { owner_omx_session_id: "foreign" } }],
 				["nested foreign cwd", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: cwd, state: { workingDirectory: join(cwd, "src") } }],
 				["nested conflicting mode", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: cwd, state: { mode: "ralplan" } }],
-				["depth-two foreign session", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: cwd, state: { state: { session_id: "native-di-artifact" } } }],
+				["depth-two foreign session", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: cwd, state: { state: { session_id: "foreign" } } }],
 				["depth-two foreign cwd", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: cwd, state: { state: { workingDirectory: join(cwd, "src") } } }],
 				["depth-two conflicting mode", { mode: "deep-interview", active: true, session_id: "sess-di-artifact", workingDirectory: cwd, state: { state: { mode: "ralplan" } } }],
 			] as const) {
@@ -12362,23 +14708,53 @@ exit 0
 				assert.match(String(invalidPlanningStateWrite.outputJson?.reason ?? ""), /canonical session and workingDirectory scope/);
 			}
 
-			const nativeAliasStateWrite = await dispatchCodexNativeHook({
+			for (const [name, alias] of [
+				["native", "native-di-artifact"],
+				["owner OMX", "owner-omx-di-artifact"],
+				["owner Codex", "owner-codex-di-artifact"],
+				["Codex", "codex-di-artifact"],
+			] as const) {
+				const aliasStateWrite = await dispatchCodexNativeHook({
+					hook_event_name: "PreToolUse",
+					cwd,
+					session_id: alias,
+					thread_id: threadId,
+					agent_id: threadId,
+					tool_name: "mcp__omx_state__state_write",
+					tool_use_id: `tool-di-${name}-alias-state-scope`,
+					tool_input: {
+						mode: "deep-interview",
+						active: true,
+						session_id: alias,
+						workingDirectory: cwd,
+					},
+				}, { cwd });
+				assert.equal(aliasStateWrite.outputJson, null, name);
+			}
+
+			const canonicalOwnershipStateWrite = await preToolUse({
 				hook_event_name: "PreToolUse",
 				cwd,
-				session_id: "native-di-artifact",
-				thread_id: threadId,
-				agent_id: threadId,
+				session_id: "sess-di-artifact",
 				tool_name: "mcp__omx_state__state_write",
-				tool_use_id: "tool-di-native-alias-state-scope",
+				tool_use_id: "tool-di-canonical-ownership-state-scope",
 				tool_input: {
 					mode: "deep-interview",
 					active: true,
-					session_id: "native-di-artifact",
+					session_id: "sess-di-artifact",
+					owner_omx_session_id: "sess-di-artifact",
+					owner_codex_session_id: "sess-di-artifact",
+					codex_session_id: "sess-di-artifact",
 					workingDirectory: cwd,
+					state: {
+						session_id: "sess-di-artifact",
+						owner_omx_session_id: "sess-di-artifact",
+						owner_codex_session_id: "sess-di-artifact",
+						codex_session_id: "sess-di-artifact",
+					},
 				},
-			}, { cwd });
-			assert.equal(nativeAliasStateWrite.outputJson?.decision, "block");
-			assert.match(String(nativeAliasStateWrite.outputJson?.reason ?? ""), /canonical session and workingDirectory scope/);
+			});
+			assert.equal(canonicalOwnershipStateWrite.outputJson, null);
 
 			const blockedReadWriteRedirect = await preToolUse({
 				hook_event_name: "PreToolUse",
@@ -16323,9 +18699,9 @@ exit 0
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}));
 
-	it("allows canonical leader ralplan complete terminal state writes while blocking partial deactivation writes", async () => {
+	it("allows canonical leader ralplan complete terminal state writes while blocking partial deactivation writes", async () => withCleanAmbientNodeRuntimeEnvironment(async () => {
 		const cwd = await mkdtemp(
 			join(tmpdir(), "omx-native-hook-pretool-ralplan-state-input-file-"),
 		);
@@ -16890,7 +19266,7 @@ exit 0
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
-	});
+	}));
 
 	it("emits hook-specific deny ralplan PreToolUse JSON for wrapped implementation writes on the live CLI path", async () => {
 		const cwd = await mkdtemp(
@@ -19691,6 +22067,671 @@ PY`,
       }
     }
   });
+  it("#3316: allows a registered child to message its owning leader via collaboration.send_message during active deep-interview", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3316-di-send-message-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3316-di-send-message";
+      const leaderThreadId = "thread-3316-di-leader";
+      const childThreadId = "thread-3316-di-child";
+      const foreignSessionId = "sess-3316-di-foreign";
+      const foreignLeaderThreadId = "thread-3316-di-foreign-leader";
+      const foreignChildThreadId = "thread-3316-di-foreign-child";
+      const unrelatedThreadId = "thread-3316-di-unrelated";
+      const sessionDir = join(stateDir, "sessions", sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: sessionId,
+        cwd,
+        leader_thread_id: leaderThreadId,
+        native_session_id: "native-3316-di",
+      });
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: leaderThreadId,
+            threads: {
+              [leaderThreadId]: { thread_id: leaderThreadId, kind: "leader" },
+              [childThreadId]: { thread_id: childThreadId, kind: "subagent", parent_thread_id: leaderThreadId },
+            },
+          },
+          [foreignSessionId]: {
+            session_id: foreignSessionId,
+            leader_thread_id: foreignLeaderThreadId,
+            threads: {
+              [foreignLeaderThreadId]: { thread_id: foreignLeaderThreadId, kind: "leader" },
+              [foreignChildThreadId]: { thread_id: foreignChildThreadId, kind: "subagent", parent_thread_id: foreignLeaderThreadId },
+            },
+          },
+        },
+      });
+      await writeJson(join(sessionDir, "skill-active-state.json"), {
+        version: 1,
+        active: true,
+        skill: "deep-interview",
+        phase: "planning",
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        active_skills: [{ skill: "deep-interview", phase: "planning", active: true, session_id: sessionId, thread_id: leaderThreadId }],
+      });
+      await writeJson(join(sessionDir, "deep-interview-state.json"), {
+        active: true,
+        mode: "deep-interview",
+        current_phase: "intent-first",
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+      });
+
+      const sendMessage = (
+        threadId: string,
+        agentId: string,
+        targetAgentId: unknown,
+        overrides: Record<string, unknown> = {},
+      ) => dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: threadId,
+          agent_id: agentId,
+          tool_name: "collaboration.send_message",
+          tool_input: { agent_id: targetAgentId, message: "status update" },
+          ...overrides,
+        },
+        { cwd },
+      );
+
+      // Registered leader -> registered child: already allowed today (main-root actor bypasses the gate).
+      const leaderToChild = await sendMessage(leaderThreadId, leaderThreadId, childThreadId);
+      assert.equal(leaderToChild.outputJson, null, "leader-to-child");
+
+      // Registered child -> its owning leader, same authoritative session, target relation proven: now allowed.
+      const childToLeader = await sendMessage(childThreadId, childThreadId, leaderThreadId);
+      assert.equal(childToLeader.outputJson, null, "child-to-leader");
+
+      // The flattened Codex CLI tool-name form must canonicalize identically.
+      const flattenedChildToLeader = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: childThreadId,
+          agent_id: childThreadId,
+          tool_name: "collaborationsend_message",
+          tool_input: { agent_id: leaderThreadId, message: "status update" },
+        },
+        { cwd },
+      );
+      assert.equal(flattenedChildToLeader.outputJson, null, "flattened-child-to-leader");
+
+      // spawn/close/interrupt/followup/wait remain gated for the same registered child: no namespace-wide loosening.
+      for (const toolName of [
+        "collaboration.spawn_agent",
+        "collaboration.close_agent",
+        "collaboration.interrupt_agent",
+        "collaboration.followup_task",
+        "collaboration.wait_agent",
+      ]) {
+        const result = await dispatchCodexNativeHook(
+          {
+            hook_event_name: "PreToolUse",
+            cwd,
+            session_id: sessionId,
+            thread_id: childThreadId,
+            agent_id: childThreadId,
+            tool_name: toolName,
+            tool_input: { agent_id: leaderThreadId, message: "status update" },
+          },
+          { cwd },
+        );
+        assert.equal(result.outputJson?.decision, "block", toolName);
+        assert.match(String(result.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, toolName);
+      }
+
+      // Cold-start leader (a genuine leader thread that has not yet been recorded as this
+      // session's leader_thread_id in subagent-tracking.json) must not be silently treated as
+      // an arbitrary authorized child; it resolves to native-child and stays fail-closed and denied.
+      const coldStartUnregisteredThreadId = "thread-3316-di-cold-start-leader";
+      const coldStartLeader = await sendMessage(coldStartUnregisteredThreadId, coldStartUnregisteredThreadId, leaderThreadId);
+      assert.equal(coldStartLeader.outputJson?.decision, "block", "cold-start-leader");
+      assert.match(String(coldStartLeader.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "cold-start-leader");
+
+      // Foreign session: a child registered under a different session_id's tracking record stays denied.
+      const foreignSessionChild = await sendMessage(foreignChildThreadId, foreignChildThreadId, leaderThreadId);
+      assert.equal(foreignSessionChild.outputJson?.decision, "block", "foreign-session-child");
+      assert.match(String(foreignSessionChild.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "foreign-session-child");
+
+      // Unrelated cross-child: a same-session child messaging an arbitrary thread that is not the
+      // registered leader (only leader<->registered-child pairs are admitted).
+      const unrelatedCrossChild = await sendMessage(childThreadId, childThreadId, unrelatedThreadId);
+      assert.equal(unrelatedCrossChild.outputJson?.decision, "block", "unrelated-cross-child");
+      assert.match(String(unrelatedCrossChild.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "unrelated-cross-child");
+
+      // Wrong-parent/session: a child claims a target agent_id pointing at a leader thread from a
+      // DIFFERENT session; session-scoped target relation must not resolve across sessions.
+      const wrongParentSession = await sendMessage(childThreadId, childThreadId, foreignLeaderThreadId);
+      assert.equal(wrongParentSession.outputJson?.decision, "block", "wrong-parent-session");
+      assert.match(String(wrongParentSession.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "wrong-parent-session");
+
+      // Malformed / empty / non-string target agent_id stays denied (fail-closed).
+      for (const [label, malformedTarget] of [
+        ["missing", undefined],
+        ["empty", ""],
+        ["whitespace", "   "],
+        ["number", 42],
+        ["object", { thread_id: leaderThreadId }],
+        ["array", [leaderThreadId]],
+        ["null", null],
+      ] as const) {
+        const malformed = await sendMessage(childThreadId, childThreadId, malformedTarget as unknown);
+        assert.equal(malformed.outputJson?.decision, "block", `malformed-target-${label}`);
+        assert.match(String(malformed.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, `malformed-target-${label}`);
+      }
+
+      // No command/path execution rides along on message content: shell-metacharacter-laden
+      // message text from the registered child to its owning leader stays inert and allowed.
+      const messageWithShellPayload = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: childThreadId,
+          agent_id: childThreadId,
+          tool_name: "collaboration.send_message",
+          tool_input: { agent_id: leaderThreadId, message: "; rm -rf / #`touch /tmp/pwned`$(id)" },
+        },
+        { cwd },
+      );
+      assert.equal(messageWithShellPayload.outputJson, null, "shell-payload-message-content");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("#3316: allows a registered child to message its owning leader via collaboration.send_message during active ralplan", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3316-ralplan-send-message-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3316-ralplan-send-message";
+      const leaderThreadId = "thread-3316-ralplan-leader";
+      const childThreadId = "thread-3316-ralplan-child";
+      const sessionDir = join(stateDir, "sessions", sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: sessionId,
+        cwd,
+        leader_thread_id: leaderThreadId,
+      });
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: leaderThreadId,
+            threads: {
+              [leaderThreadId]: { thread_id: leaderThreadId, kind: "leader" },
+              [childThreadId]: { thread_id: childThreadId, kind: "subagent", parent_thread_id: leaderThreadId },
+            },
+          },
+        },
+      });
+      await writeJson(join(sessionDir, "skill-active-state.json"), {
+        version: 1,
+        active: true,
+        skill: "ralplan",
+        phase: "planning",
+        session_id: sessionId,
+        active_skills: [{ skill: "ralplan", phase: "planning", active: true, session_id: sessionId }],
+      });
+      await writeJson(join(sessionDir, "ralplan-state.json"), {
+        active: true,
+        mode: "ralplan",
+        current_phase: "critic-review",
+        session_id: sessionId,
+      });
+
+      const sendMessage = (threadId: string, targetAgentId: unknown) => dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: threadId,
+          agent_id: threadId,
+          tool_name: "collaboration.send_message",
+          tool_input: { agent_id: targetAgentId, message: "critic feedback ready" },
+        },
+        { cwd },
+      );
+
+      const leaderToChild = await sendMessage(leaderThreadId, childThreadId);
+      assert.equal(leaderToChild.outputJson, null, "ralplan-leader-to-child");
+
+      const childToLeader = await sendMessage(childThreadId, leaderThreadId);
+      assert.equal(childToLeader.outputJson, null, "ralplan-child-to-leader");
+
+      const spawnAgentStillGated = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: childThreadId,
+          agent_id: childThreadId,
+          tool_name: "collaboration.spawn_agent",
+          tool_input: { agent_type: "executor", message: "spawn attempt" },
+        },
+        { cwd },
+      );
+      assert.equal(spawnAgentStillGated.outputJson?.decision, "block", "ralplan-spawn-agent-still-gated");
+      assert.match(String(spawnAgentStillGated.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "ralplan-spawn-agent-still-gated");
+
+      const malformedTarget = await sendMessage(childThreadId, undefined);
+      assert.equal(malformedTarget.outputJson?.decision, "block", "ralplan-malformed-target");
+      assert.match(String(malformedTarget.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "ralplan-malformed-target");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+
+  // Direct-cancel positives must prove behavior in a clean execution context,
+  // but the test runner itself may inherit Node startup/output instrumentation
+  // (e.g. NODE_V8_COVERAGE from the coverage lane). Clear all listed baseline
+  // values, including the tolerated NODE_EXTRA_CA_CERTS, solely to establish a
+  // deterministic baseline; denial cases inject unsafe values explicitly.
+  // The list is a test-environment reset, not the hook's unsafe-env denylist.
+  const RUNNER_BASELINE_NODE_ENV_NAMES = [
+    "NODE_OPTIONS",
+    "NODE_EXTRA_CA_CERTS",
+    "OPENSSL_CONF",
+    "NODE_V8_COVERAGE",
+    "NODE_COMPILE_CACHE",
+    "NODE_REDIRECT_WARNINGS",
+    "NODE_REPORT_DIRECTORY",
+    "NODE_REPORT_FILENAME",
+  ];
+  const withCleanRunnerNodeEnvironment = async <T>(run: () => Promise<T>): Promise<T> => {
+    const previous = new Map<string, string | undefined>();
+    for (const name of RUNNER_BASELINE_NODE_ENV_NAMES) {
+      previous.set(name, process.env[name]);
+      delete process.env[name];
+    }
+    try {
+      return await run();
+    } finally {
+      for (const [name, value] of previous) {
+        if (value === undefined) delete process.env[name];
+        else process.env[name] = value;
+      }
+    }
+  };
+  const writeFlattenedCollaborationRalplanFixture = async (cwd: string) => {
+    const stateDir = join(cwd, ".omx", "state");
+    const sessionId = "sess-flattened-collab-ralplan";
+    const leaderThreadId = "thread-flattened-collab-ralplan-leader";
+    const sessionDir = join(stateDir, "sessions", sessionId);
+    await mkdir(sessionDir, { recursive: true });
+    await writeJson(join(stateDir, "session.json"), {
+      session_id: sessionId,
+      native_session_id: leaderThreadId,
+      cwd,
+    });
+    await writeJson(join(sessionDir, "skill-active-state.json"), {
+      version: 1,
+      active: true,
+      skill: "autopilot",
+      phase: "ralplan",
+      session_id: sessionId,
+      thread_id: leaderThreadId,
+      active_skills: [{
+        skill: "autopilot",
+        phase: "ralplan",
+        active: true,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+      }],
+    });
+    await writeJson(join(sessionDir, "autopilot-state.json"), {
+      active: true,
+      mode: "autopilot",
+      current_phase: "ralplan",
+      started_at: "2026-07-22T00:00:00.000Z",
+      updated_at: "2026-07-22T00:10:00.000Z",
+      session_id: sessionId,
+      thread_id: leaderThreadId,
+    });
+    await writeJson(join(stateDir, "subagent-tracking.json"), {
+      schemaVersion: 1,
+      sessions: {
+        [sessionId]: {
+          session_id: sessionId,
+          leader_thread_id: leaderThreadId,
+          updated_at: "2026-07-22T00:10:00.000Z",
+          threads: {
+            [leaderThreadId]: {
+              thread_id: leaderThreadId,
+              kind: "leader",
+              first_seen_at: "2026-07-22T00:00:00.000Z",
+              last_seen_at: "2026-07-22T00:10:00.000Z",
+              turn_count: 1,
+            },
+          },
+        },
+      },
+    });
+    return { sessionId, leaderThreadId, stateDir };
+  };
+
+  it("allows flattened known collaboration tools under active ralplan while unknown flattened names stay blocked", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-ralplan-"));
+    try {
+      const { sessionId, leaderThreadId } = await writeFlattenedCollaborationRalplanFixture(cwd);
+      for (const [tool_name, tool_input] of [
+        ["collaborationspawn_agent", { agent_type: "planner", message: "draft the plan" }],
+        ["collaborationlist_agents", {}],
+        ["collaborationfollowup_task", {}],
+        ["collaborationwait_agent", {}],
+        ["collaborationsend_message", {}],
+        ["collaborationinterrupt_agent", {}],
+        ["collaborationclose_agent", {}],
+      ] as const) {
+        const result = await dispatchCodexNativeHook({
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: leaderThreadId,
+          tool_name,
+          tool_input,
+        }, { cwd });
+        assert.equal(result.outputJson, null, tool_name);
+      }
+
+      const blocked = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        tool_name: "collaborationbogus_thing",
+        tool_input: {},
+      }, { cwd });
+      assert.equal(blocked.outputJson?.decision, "block");
+      const reason = String(blocked.outputJson?.reason ?? "");
+      assert.match(reason, /not a recognized read-only or explicitly authorized planning mutation transport/);
+      assert.match(reason, /collaborationbogus_thing/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("denies unknown typed roles dispatched through flattened spawn names", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-unknown-role-"));
+    try {
+      const { sessionId, leaderThreadId } = await writeFlattenedCollaborationRalplanFixture(cwd);
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        tool_name: "collaborationspawn_agent",
+        tool_input: { agent_type: "definitely-not-an-installed-role", message: "x" },
+      }, { cwd });
+      assert.equal(result.outputJson?.decision, "block");
+      assert.match(String(result.outputJson?.reason ?? ""), /unknown or not installed/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("records native blockers from flattened collaboration spawn failures with the original tool name", async () => {
+    const capacityCwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-capacity-"));
+    try {
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "PostToolUse",
+        cwd: capacityCwd,
+        session_id: "sess-flattened-capacity",
+        thread_id: "thread-flattened-capacity",
+        turn_id: "turn-flattened-capacity",
+        tool_name: "collaborationspawn_agent",
+        tool_response: "collab spawn failed: agent thread limit reached",
+      }, { cwd: capacityCwd });
+      assert.equal(result.outputJson, null);
+      const blocker = JSON.parse(
+        await readFile(join(capacityCwd, ".omx", "state", "native-subagent-capacity-blocker.json"), "utf-8"),
+      ) as Record<string, unknown>;
+      assert.equal(blocker.tool_name, "collaborationspawn_agent");
+      assert.match(String(blocker.error_summary), /agent thread limit reached/);
+    } finally {
+      await rm(capacityCwd, { recursive: true, force: true });
+    }
+
+    const supportCwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-support-"));
+    try {
+      await dispatchCodexNativeHook({
+        hook_event_name: "PostToolUse",
+        cwd: supportCwd,
+        session_id: "sess-flattened-support",
+        thread_id: "thread-flattened-support",
+        turn_id: "turn-flattened-support",
+        tool_name: "collaborationspawn_agent",
+        tool_response: { error: "unknown tool: collaborationspawn_agent is unavailable" },
+      }, { cwd: supportCwd });
+      const blocker = JSON.parse(
+        await readFile(join(supportCwd, ".omx", "state", "native-subagent-support.json"), "utf-8"),
+      ) as Record<string, unknown>;
+      assert.equal(blocker.tool_name, "collaborationspawn_agent");
+    } finally {
+      await rm(supportCwd, { recursive: true, force: true });
+    }
+  });
+
+  it("does not persist support or capacity poison from successful flattened collaboration child output", async () => {
+    for (const toolName of [
+      "collaborationspawn_agent",
+      "collaborationlist_agents",
+      "collaborationfollowup_task",
+      "collaborationwait_agent",
+    ]) {
+      const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-success-"));
+      try {
+        await dispatchCodexNativeHook({
+          hook_event_name: "PostToolUse",
+          cwd,
+          session_id: "sess-flattened-success",
+          thread_id: "thread-flattened-success",
+          tool_name: toolName,
+          tool_response: {
+            success: true,
+            status: "completed",
+            output: "Child completed. Optional packed plugin was unavailable, unsupported, and not found.",
+          },
+        }, { cwd });
+        const stateDir = join(cwd, ".omx", "state");
+        assert.equal(existsSync(join(stateDir, "native-subagent-support.json")), false, toolName);
+        assert.equal(existsSync(join(stateDir, "native-subagent-capacity-blocker.json")), false, toolName);
+      } finally {
+        await rm(cwd, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("blocks flattened close_agent cleanup after recent native subagent capacity exhaustion", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-capacity-close-block-"));
+    try {
+      await dispatchCodexNativeHook({
+        hook_event_name: "PostToolUse",
+        cwd,
+        session_id: "sess-flattened-capacity-close-block",
+        thread_id: "thread-flattened-capacity-close-block",
+        turn_id: "turn-flattened-capacity-close-block",
+        tool_name: "collaborationspawn_agent",
+        tool_response: "collab spawn failed: agent thread limit reached",
+      }, { cwd });
+
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: "sess-flattened-capacity-close-block",
+        thread_id: "thread-flattened-capacity-close-block",
+        tool_name: "collaborationclose_agent",
+        tool_input: { target: "019ecc36-stale" },
+      }, { cwd });
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.match(JSON.stringify(result.outputJson), /capacity/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows session-scoped omx cancel under active ralplan without weakening state guards", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-ralplan-cancel-"));
+    try {
+      const { sessionId, leaderThreadId } = await writeFlattenedCollaborationRalplanFixture(cwd);
+      const bash = (command: string) => dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: { command },
+      }, { cwd });
+
+      // The exemption also requires the bare `omx` token to resolve to the
+      // hook package's canonical CLI under the inherited PATH, so positives
+      // and impostor denials run under a proven-trusted resolution to stay
+      // discriminating (a denial must not pass merely because the ambient
+      // PATH was untrusted).
+      const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+      const trustedPackageBin = join(cwd, "node_modules", ".bin", "omx");
+      await mkdir(dirname(trustedPackageBin), { recursive: true });
+      await symlink(workspacePackageCli, trustedPackageBin);
+      const trustedPackagePath = `${dirname(trustedPackageBin)}:${dirname(process.execPath)}`;
+      const bashTrusted = async (command: string) => {
+        const inheritedPath = process.env.PATH;
+        process.env.PATH = trustedPackagePath;
+        try {
+          return await bash(command);
+        } finally {
+          if (inheritedPath === undefined) delete process.env.PATH;
+          else process.env.PATH = inheritedPath;
+        }
+      };
+
+      const cleanPositives = await withCleanRunnerNodeEnvironment(async () => ({
+        plain: await bashTrusted("omx cancel"),
+        force: await bashTrusted("omx cancel --force"),
+      }));
+      assert.equal(cleanPositives.plain.outputJson, null);
+      assert.equal(cleanPositives.force.outputJson, null);
+      const inheritedCaPositives = await withCleanRunnerNodeEnvironment(async () => {
+        process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
+        return {
+          plain: await bashTrusted("omx cancel"),
+          force: await bashTrusted("omx cancel --force"),
+        };
+      });
+      assert.equal(inheritedCaPositives.plain.outputJson, null);
+      assert.equal(inheritedCaPositives.force.outputJson, null);
+      assert.equal((await bash("omx cancel")).outputJson?.decision, "block",
+        "ambient non-package omx resolution is not trusted");
+
+      const chained = await bash("omx cancel --force && rm -rf x");
+      assert.equal(chained.outputJson?.decision, "block");
+
+      const unknownFlag = await bash("omx cancel --json");
+      assert.equal(unknownFlag.outputJson?.decision, "block");
+
+      // The direct-cancel grammar admits no leading environment assignments at
+      // all: runtime startup/configuration variables are an open-ended
+      // namespace (PATH, NODE_OPTIONS, OPENSSL_CONF, OMX_* state selectors),
+      // so every prefixed form is denied rather than denylisted one by one.
+      for (const [label, command] of [
+        ["benign-looking env prefix", "FOO=bar omx cancel --force"],
+        ["multi env prefix", "A=1 B=2 omx cancel"],
+        ["openssl config injection", "OPENSSL_CONF=/tmp/evil.cnf omx cancel"],
+        ["path override", "PATH=/tmp/attacker omx cancel"],
+        ["node preload override", "NODE_OPTIONS=--require=./payload.cjs omx cancel"],
+        ["path-qualified impostor", "/tmp/omx cancel --force"],
+        ["relative-path impostor", "./omx cancel"],
+        ["quoted pseudo-assignment", "'X=./payload' omx cancel"],
+        ["escaped pseudo-assignment", "X\\=./payload omx cancel"],
+        ["omx root override", "OMX_ROOT=/tmp/other omx cancel"],
+        ["omx state root override", "OMX_STATE_ROOT=/tmp/other omx cancel"],
+        ["omx team state root override", "OMX_TEAM_STATE_ROOT=/tmp/other omx cancel"],
+        ["omx session override", "OMX_SESSION_ID=other-session omx cancel"],
+        ["quoted executable", "\"omx\" cancel"],
+        ["semicolon operator in assignment", "FOO=bar;./payload omx cancel"],
+        ["command substitution in assignment", "FOO=$(./payload) omx cancel"],
+        ["backtick substitution in assignment", "FOO=`./payload` omx cancel"],
+        ["redirection in assignment", "FOO=bar>src/pwned omx cancel"],
+        ["and-operator in assignment", "FOO=bar&&./payload omx cancel"],
+        ["uppercase executable", "OMX cancel"],
+        ["unicode nbsp separator", "omx\u00a0cancel"],
+        ["newline between words", "omx\ncancel"],
+        // Byte-form lookalikes: the raw payload command is not byte-identical
+        // to the trim-normalized command, so the direct-cancel exemption can
+        // never fire and the omx-mutation analysis denies the command. This
+        // asserts observable denial, not merely failure of one helper.
+        ["byte-order-mark lookalike executable", "\ufeffomx cancel"],
+        ["carriage-return suffix lookalike", "omx cancel\r"],
+      ] as const) {
+        const impostor = await bashTrusted(command);
+        assert.equal(impostor.outputJson?.decision, "block", label);
+      }
+
+      // Inherited execution-context overrides must deny even the byte-exact
+      // command: the exemption proves the text, not the runtime that will
+      // execute it (Bash sources $BASH_ENV first, imported functions shadow
+      // the omx executable, and Node loader env preloads code).
+      for (const [label, envName, envValue] of [
+        ["inherited bash startup file", "BASH_ENV", "/tmp/prelude.sh"],
+        ["imported omx function shadow", "BASH_FUNC_omx%%", "() { printf owned > src/pwned.ts; }"],
+        ["inherited node loader override", "NODE_OPTIONS", "--require=./payload.cjs"],
+        ["inherited openssl config", "OPENSSL_CONF", "/tmp/evil.cnf"],
+        ["inherited dynamic loader preload", "LD_PRELOAD", "/tmp/payload.so"],
+        ["inherited node coverage output", "NODE_V8_COVERAGE", "/tmp/coverage-out"],
+      ] as const) {
+        const previousValue = process.env[envName];
+        const previousCa = process.env.NODE_EXTRA_CA_CERTS;
+        process.env[envName] = envValue;
+        process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
+        try {
+          const poisoned = await bashTrusted("omx cancel");
+          assert.equal(poisoned.outputJson?.decision, "block", `${label} with inherited CA`);
+        } finally {
+          if (previousValue === undefined) delete process.env[envName];
+          else process.env[envName] = previousValue;
+          if (previousCa === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+          else process.env.NODE_EXTRA_CA_CERTS = previousCa;
+        }
+      }
+
+      // A PATH-shadowed omx (a different executable resolving first) is not
+      // the validated cancellation program and must deny even byte-exact text.
+      const shadowBinDir = join(cwd, "shadow-bin");
+      await mkdir(shadowBinDir, { recursive: true });
+      await writeFile(join(shadowBinDir, "omx"), "#!/bin/sh\ntouch src/path-shadow-owned.ts\n", "utf-8");
+      await chmod(join(shadowBinDir, "omx"), 0o755);
+      {
+        const inheritedPath = process.env.PATH;
+        process.env.PATH = `${shadowBinDir}:${trustedPackagePath}`;
+        try {
+          const shadowed = await bash("omx cancel");
+          assert.equal(shadowed.outputJson?.decision, "block", "PATH-shadowed omx executable");
+        } finally {
+          if (inheritedPath === undefined) delete process.env.PATH;
+          else process.env.PATH = inheritedPath;
+        }
+      }
+
+      const stateClear = await bash("omx state clear --force --mode ralplan --json");
+      assert.equal(stateClear.outputJson?.decision, "block");
+      assert.match(String(stateClear.outputJson?.reason ?? ""), /Autopilot planning is active \(phase: ralplan\)/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
 
   it("does not persist native blockers from structured failures on unrelated tools", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-unrelated-structured-failure-"));
@@ -19826,6 +22867,45 @@ PY`,
 
       assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
       assert.match(JSON.stringify(result.outputJson), /Do not call multi_agent_v1\.close_agent/);
+      assert.match(JSON.stringify(result.outputJson), /do not batch close_agent through multi_tool_use\.parallel/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("blocks parallel close_agent cleanup with flattened nested recipients after native capacity exhaustion", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-subagent-capacity-parallel-close-flattened-"));
+    try {
+      await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PostToolUse",
+          cwd,
+          session_id: "sess-subagent-capacity-parallel-close-flattened",
+          thread_id: "thread-subagent-capacity-parallel-close-flattened",
+          tool_name: "collaborationspawn_agent",
+          tool_response: "agent thread limit reached",
+        },
+        { cwd },
+      );
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: "sess-subagent-capacity-parallel-close-flattened",
+          thread_id: "thread-subagent-capacity-parallel-close-flattened",
+          tool_name: "multi_tool_use.parallel",
+          tool_input: {
+            tool_uses: [
+              { recipient_name: "collaborationclose_agent", parameters: { target: "stale-1" } },
+              { recipient_name: "collaborationclose_agent", parameters: { target: "stale-2" } },
+            ],
+          },
+        },
+        { cwd },
+      );
+
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
       assert.match(JSON.stringify(result.outputJson), /do not batch close_agent through multi_tool_use\.parallel/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -20055,6 +23135,432 @@ PY`,
       assert.equal((first.outputJson as { decision?: string } | null)?.decision, "block");
       assert.equal((repeated.outputJson as { decision?: string } | null)?.decision, "block");
       assert.equal((repeated.outputJson as { stopReason?: string } | null)?.stopReason, "sloppy_fallback_diff_audit");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("fails open after repeated identical sloppy fallback findings exceed the repeat cap", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-cap-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+      const payload = { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-cap", turn_id: "turn-cap" };
+
+      const decisions: Array<string | null> = [];
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        const result = await dispatchCodexNativeHook(
+          attempt === 0 ? payload : { ...payload, stop_hook_active: true },
+          { cwd },
+        );
+        decisions.push((result.outputJson as { decision?: string } | null)?.decision ?? null);
+      }
+
+      assert.deepEqual(decisions, ["block", "block", "block", null, null]);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("resets the sloppy fallback repeat cap when findings change", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-cap-reset-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      const sloppySource = (exportName: string) => [
+        `export function ${exportName}() {`,
+        "  // implement a quick hack fallback if it fails",
+        "  return process.env.RUNTIME || 'local';",
+        "}",
+      ].join("\n");
+      await writeFile(join(cwd, "src", "runtime.ts"), sloppySource("loadRuntime"));
+      const payload = { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-cap-reset", turn_id: "turn-cap-reset" };
+
+      for (let attempt = 0; attempt < 5; attempt += 1) {
+        await dispatchCodexNativeHook(
+          attempt === 0 ? payload : { ...payload, stop_hook_active: true },
+          { cwd },
+        );
+      }
+      const allowed = await dispatchCodexNativeHook({ ...payload, stop_hook_active: true }, { cwd });
+      assert.equal(allowed.outputJson, null);
+
+      await writeFile(join(cwd, "src", "other.ts"), sloppySource("loadOther"));
+      const blockedAgain = await dispatchCodexNativeHook({ ...payload, stop_hook_active: true }, { cwd });
+      assert.equal((blockedAgain.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((blockedAgain.outputJson as { stopReason?: string } | null)?.stopReason, "sloppy_fallback_diff_audit");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the repeat count when identical findings move across staging states", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-staging-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+      const payload = { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-staging", turn_id: "turn-staging" };
+      const stop = (attempt: number) =>
+        dispatchCodexNativeHook(attempt === 0 ? payload : { ...payload, stop_hook_active: true }, { cwd });
+
+      const first = await stop(0);
+      execFileSync("git", ["add", "src/runtime.ts"], { cwd, stdio: "ignore" });
+      const staged = await stop(1);
+      execFileSync("git", ["reset", "-q", "--", "src/runtime.ts"], { cwd, stdio: "ignore" });
+      const unstagedAgain = await stop(2);
+      const afterCap = await stop(3);
+
+      assert.equal((first.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((staged.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((unstagedAgain.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal(afterCap.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the repeat count when staging a subset reorders identical findings", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-subset-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      const sloppySource = (exportName: string) => [
+        `export function ${exportName}() {`,
+        "  // implement a quick hack fallback if it fails",
+        "  return process.env.RUNTIME || 'local';",
+        "}",
+      ].join("\n");
+      await writeFile(join(cwd, "src", "alpha.ts"), sloppySource("loadAlpha"));
+      await writeFile(join(cwd, "src", "beta.ts"), sloppySource("loadBeta"));
+      const payload = { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-subset", turn_id: "turn-subset" };
+      const stop = (attempt: number) =>
+        dispatchCodexNativeHook(attempt === 0 ? payload : { ...payload, stop_hook_active: true }, { cwd });
+
+      const first = await stop(0);
+      // Staging only beta reorders the raw finding list (staged findings come
+      // first), but the fingerprint must stay identical for the same set.
+      execFileSync("git", ["add", "src/beta.ts"], { cwd, stdio: "ignore" });
+      const subsetStaged = await stop(1);
+      execFileSync("git", ["add", "src/alpha.ts"], { cwd, stdio: "ignore" });
+      const allStaged = await stop(2);
+      const afterCap = await stop(3);
+
+      assert.equal((first.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((subsetStaged.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((allStaged.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal(afterCap.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("resets the repeat cap when a finding moves to a new line in the same file", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-moveline-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      const sloppySource = (headerLines: string[]) => [
+        ...headerLines,
+        "export function loadRuntime() {",
+        "  // implement a quick hack fallback if it fails",
+        "  return process.env.RUNTIME || 'local';",
+        "}",
+      ].join("\n");
+      await writeFile(join(cwd, "src", "runtime.ts"), sloppySource([]));
+      const payload = { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-moveline", turn_id: "turn-moveline" };
+      const stop = (attempt: number) =>
+        dispatchCodexNativeHook(attempt === 0 ? payload : { ...payload, stop_hook_active: true }, { cwd });
+
+      for (let attempt = 0; attempt < 4; attempt += 1) {
+        await stop(attempt);
+      }
+      const allowed = await dispatchCodexNativeHook({ ...payload, stop_hook_active: true }, { cwd });
+      assert.equal(allowed.outputJson, null);
+
+      // The identical text relocated to another line is a new finding set and
+      // must block again rather than inherit the exhausted repeat cap.
+      await writeFile(join(cwd, "src", "runtime.ts"), sloppySource(["// header comment"]));
+      const blockedAgain = await dispatchCodexNativeHook({ ...payload, stop_hook_active: true }, { cwd });
+      assert.equal((blockedAgain.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((blockedAgain.outputJson as { stopReason?: string } | null)?.stopReason, "sloppy_fallback_diff_audit");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("skips the sloppy fallback diff audit when OMX_NATIVE_STOP_SLOPPY_FALLBACK_AUDIT is off", async () => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-disabled-");
+    const previousValue = process.env.OMX_NATIVE_STOP_SLOPPY_FALLBACK_AUDIT;
+    process.env.OMX_NATIVE_STOP_SLOPPY_FALLBACK_AUDIT = "off";
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-disabled" },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson, null);
+    } finally {
+      if (previousValue === undefined) delete process.env.OMX_NATIVE_STOP_SLOPPY_FALLBACK_AUDIT;
+      else process.env.OMX_NATIVE_STOP_SLOPPY_FALLBACK_AUDIT = previousValue;
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("ignores untracked sloppy fallback files last written before the session transcript", async (t) => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-preexisting-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+      // The file must genuinely predate the session: ctime/birth time cannot
+      // be backdated with utimes, so create the transcript afterwards.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const transcriptPath = join(cwd, "transcript.jsonl");
+      await writeFile(transcriptPath, "{}\n");
+      // A real session appends to its transcript; the append makes the
+      // transcript's ctime newer than its immutable birth time, which is what
+      // lets the audit trust that birth time as the session start.
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await appendFile(transcriptPath, "{}\n");
+      const { birthtimeMs, ctimeMs } = statSync(transcriptPath);
+      if (!(birthtimeMs > 0) || birthtimeMs >= ctimeMs) {
+        t.skip("immutable file birth time is not available on this platform");
+        return;
+      }
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-preexisting", transcript_path: transcriptPath },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson, null);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts only immutable transcript birth times as the sloppy fallback session start", () => {
+    assert.equal(isSloppyFallbackTranscriptStartUsable(50, 100), true);
+    assert.equal(isSloppyFallbackTranscriptStartUsable(100, 100), false);
+    assert.equal(isSloppyFallbackTranscriptStartUsable(0, 100), false);
+    assert.equal(isSloppyFallbackTranscriptStartUsable(100, 50), false);
+    assert.equal(isSloppyFallbackTranscriptStartUsable(Number.NaN, 100), false);
+    assert.equal(isSloppyFallbackTranscriptStartUsable(50, Number.NaN), false);
+  });
+
+  it("audits untracked files when the transcript birth time is indistinguishable from ctime", async (t) => {    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-ctimebacked-");
+    try {
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const transcriptPath = join(cwd, "transcript.jsonl");
+      await writeFile(transcriptPath, "{}\n");
+      // A freshly created transcript has birth time == ctime, mimicking
+      // filesystems where Node reports a mutable ctime fallback as birthtime;
+      // the audit must treat that as unavailable rather than trust it.
+      const { birthtimeMs, ctimeMs } = statSync(transcriptPath);
+      if (!(birthtimeMs > 0) || birthtimeMs < ctimeMs) {
+        t.skip("this platform reports an immutable birth time distinct from ctime");
+        return;
+      }
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-ctimebacked", transcript_path: transcriptPath },
+        { cwd },
+      );
+
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((result.outputJson as { stopReason?: string } | null)?.stopReason, "sloppy_fallback_diff_audit");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("still blocks untracked sloppy fallback files materialized in-session with preserved mtime", async (t) => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-cpreserve-");
+    try {
+      const seedPath = join(cwd, "seed.ts");
+      await writeFile(
+        seedPath,
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+      const oldTime = new Date(Date.now() - 10 * 60_000);
+      await utimes(seedPath, oldTime, oldTime);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const transcriptPath = join(cwd, "transcript.jsonl");
+      await writeFile(transcriptPath, "{}\n");
+      const { birthtimeMs } = statSync(transcriptPath);
+      if (!(birthtimeMs > 0)) {
+        t.skip("file birth time is not available on this platform");
+        return;
+      }
+      await mkdir(join(cwd, "src"), { recursive: true });
+      execFileSync("cp", ["-p", seedPath, join(cwd, "src", "runtime.ts")], { stdio: "ignore" });
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-cpreserve", transcript_path: transcriptPath },
+        { cwd },
+      );
+
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((result.outputJson as { stopReason?: string } | null)?.stopReason, "sloppy_fallback_diff_audit");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("still blocks untracked sloppy fallback files reachable through an in-session symlink to an older target", async (t) => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-symlink-");
+    try {
+      const seedPath = join(cwd, "seed.ts");
+      await writeFile(
+        seedPath,
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+      const oldTime = new Date(Date.now() - 10 * 60_000);
+      await utimes(seedPath, oldTime, oldTime);
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const transcriptPath = join(cwd, "transcript.jsonl");
+      await writeFile(transcriptPath, "{}\n");
+      const { birthtimeMs } = statSync(transcriptPath);
+      if (!(birthtimeMs > 0)) {
+        t.skip("file birth time is not available on this platform");
+        return;
+      }
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await symlink(seedPath, join(cwd, "src", "runtime.ts"));
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-symlink", transcript_path: transcriptPath },
+        { cwd },
+      );
+
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((result.outputJson as { stopReason?: string } | null)?.stopReason, "sloppy_fallback_diff_audit");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("still blocks when a pre-session symlink's target is rewritten during the session", async (t) => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-targetrewrite-");
+    try {
+      // A non-auditable target extension keeps the symlink path as the only
+      // route to the flagged content.
+      const targetPath = join(cwd, "seed-data.txt");
+      await writeFile(targetPath, "export const clean = true;\n");
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await symlink(targetPath, join(cwd, "src", "runtime.ts"));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      const transcriptPath = join(cwd, "transcript.jsonl");
+      await writeFile(transcriptPath, "{}\n");
+      await new Promise((resolve) => setTimeout(resolve, 25));
+      await appendFile(transcriptPath, "{}\n");
+      const { birthtimeMs, ctimeMs } = statSync(transcriptPath);
+      if (!(birthtimeMs > 0) || birthtimeMs >= ctimeMs) {
+        t.skip("immutable file birth time is not available on this platform");
+        return;
+      }
+
+      await writeFile(
+        targetPath,
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-targetrewrite", transcript_path: transcriptPath },
+        { cwd },
+      );
+
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((result.outputJson as { stopReason?: string } | null)?.stopReason, "sloppy_fallback_diff_audit");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("still blocks untracked sloppy fallback files written after the session transcript", async (t) => {
+    const cwd = await initTempGitRepo("omx-native-hook-stop-slop-inturn-");
+    try {
+      const transcriptPath = join(cwd, "transcript.jsonl");
+      await writeFile(transcriptPath, "{}\n");
+      const { birthtimeMs } = statSync(transcriptPath);
+      if (!(birthtimeMs > 0)) {
+        t.skip("file birth time is not available on this platform");
+        return;
+      }
+      await mkdir(join(cwd, "src"), { recursive: true });
+      await writeFile(
+        join(cwd, "src", "runtime.ts"),
+        [
+          "export function loadRuntime() {",
+          "  // implement a quick hack fallback if it fails",
+          "  return process.env.RUNTIME || 'local';",
+          "}",
+        ].join("\n"),
+      );
+
+      const result = await dispatchCodexNativeHook(
+        { hook_event_name: "Stop", cwd, session_id: "sess-stop-slop-inturn", transcript_path: transcriptPath },
+        { cwd },
+      );
+
+      assert.equal((result.outputJson as { decision?: string } | null)?.decision, "block");
+      assert.equal((result.outputJson as { stopReason?: string } | null)?.stopReason, "sloppy_fallback_diff_audit");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -22858,12 +26364,17 @@ PY`,
         { ...payload, stop_hook_active: true },
         { cwd: workerCwd },
       );
+      const camelReplay = await dispatchCodexNativeHook(
+        { ...payload, stopHookActive: true },
+        { cwd: workerCwd },
+      );
 
       assert.equal(
         (result.outputJson as { stopReason?: string } | null)?.stopReason,
         "team_worker_worker-1_1_in_progress",
       );
       assert.equal(replay.outputJson, null);
+      assert.equal(camelReplay.outputJson, null);
     } finally {
       if (typeof prevTeamWorker === "string") process.env.OMX_TEAM_WORKER = prevTeamWorker;
       else delete process.env.OMX_TEAM_WORKER;
@@ -22943,6 +26454,10 @@ PY`,
         { ...basePayload, turn_id: "turn-stop-team-worker-repeat-2", stop_hook_active: true },
         { cwd: workerCwd },
       );
+      const exempt = await dispatchCodexNativeHook(
+        { ...basePayload, turn_id: "turn-stop-team-worker-exempt", stopReason: "context limit" },
+        { cwd: workerCwd },
+      );
 
       await writeJson(taskPath, {
         id: "1",
@@ -22960,6 +26475,7 @@ PY`,
       assert.deepEqual(first.outputJson, expectedInProgress);
       assert.deepEqual(replay.outputJson, expectedInProgress);
       assert.deepEqual(freshTurn.outputJson, expectedInProgress);
+      assert.equal(exempt.outputJson, null);
       assert.deepEqual(stateChanged.outputJson, {
         decision: "block",
         reason:
@@ -23147,8 +26663,8 @@ PY`,
 
       assert.equal(result.outputJson, null);
       const tmuxLog = await readFile(tmuxLogPath, "utf-8");
-      assert.match(tmuxLog, /send-keys -t %42 -l \[OMX\] worker-1 native Stop allowed/);
-      assert.doesNotMatch(tmuxLog, /send-keys -t %42 Tab/);
+      assert.match(tmuxLog, /send-keys -t %42 -l \[omx:team-notice-ledger:[a-f0-9]{24}\] Review current Team notices\./);
+      assert.doesNotMatch(tmuxLog, /send-keys -t %42 -l .*worker-stop-team-busy-leader|send-keys -t %42 Tab/);
       const submits = tmuxLog.match(/send-keys -t %42 C-m/g) || [];
       assert.equal(submits.length, 2, "busy worker-stop nudge should submit directly as steering, not queue via Tab");
       const nudgeState = JSON.parse(await readFile(join(workerDir, "worker-stop-nudge.json"), "utf-8"));
@@ -23344,8 +26860,8 @@ PY`,
 
       assert.equal(result.result, "steered");
       const tmuxLog = await readFile(tmuxLogPath, "utf-8");
-      assert.match(tmuxLog, /send-keys -t %42 -l \[OMX\] worker-2 native Stop allowed/);
-      assert.doesNotMatch(tmuxLog, /send-keys -t %42 Tab/);
+      assert.match(tmuxLog, /send-keys -t %42 -l \[omx:team-notice-ledger:[a-f0-9]{24}\] Review current Team notices\./);
+      assert.doesNotMatch(tmuxLog, /send-keys -t %42 -l .*worker-2 native Stop allowed|send-keys -t %42 Tab/);
       const teamNudgeState = JSON.parse(await readFile(join(teamDir, "worker-stop-nudge.json"), "utf-8"));
       assert.equal(teamNudgeState.worker, "worker-2");
       assert.equal(teamNudgeState.delivery, "steered");
@@ -24420,7 +27936,7 @@ PY`,
     }
   });
 
-  it("fails closed on Stop when a session-scoped team id is not bound to session.json", async () => {
+  it("silently ignores Stop when a session-scoped team id is not bound to session.json", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-team-session-mismatch-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -24450,9 +27966,7 @@ PY`,
       );
 
       assert.equal(result.omxEventName, "stop");
-      assert.equal(result.outputJson?.decision, "block");
-      assert.equal(result.outputJson?.stopReason, "session_scope_unmatched");
-      assert.match(String(result.outputJson?.reason ?? ""), /sess-live-team/);
+      assert.equal(result.outputJson, null);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -24495,7 +28009,7 @@ PY`,
     }
   });
 
-  it("does not block Stop after owner-session ralplan CLI completion writes to native canonical state", async () => {
+  it("blocks Stop release after owner-session ralplan CLI completion when only local lifecycle evidence is available", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-ralplan-owner-alias-complete-"));
     const previousSessionId = process.env.OMX_SESSION_ID;
     try {
@@ -24577,8 +28091,16 @@ PY`,
         workingDirectory: cwd,
       });
 
-      assert.notEqual(writeResult.isError, true);
-      assert.equal(existsSync(join(stateDir, "sessions", ownerSessionId, "ralplan-state.json")), false);
+      assert.equal(writeResult.isError, true);
+      assert.match(
+        String((writeResult.payload as { error?: unknown }).error ?? ""),
+        /documented_host_consensus_receipt_unavailable/,
+      );
+      const preservedRalplan = JSON.parse(
+        await readFile(join(stateDir, "sessions", nativeSessionId, "ralplan-state.json"), "utf-8"),
+      ) as Record<string, unknown>;
+      assert.equal(preservedRalplan.active, true);
+      assert.equal(preservedRalplan.current_phase, "planning");
       const result = await dispatchCodexNativeHook(
         {
           hook_event_name: "Stop",
@@ -24589,7 +28111,15 @@ PY`,
       );
 
       assert.equal(result.omxEventName, "stop");
-      assert.equal(result.outputJson, null);
+      assert.equal(result.outputJson?.decision, "block");
+      assert.equal(
+        result.outputJson?.stopReason,
+        "skill_ralplan_planning_continue_artifact",
+      );
+      assert.match(
+        String(result.outputJson?.reason ?? ""),
+        /ralplan|planning/i,
+      );
     } finally {
       if (typeof previousSessionId === "string") process.env.OMX_SESSION_ID = previousSessionId;
       else delete process.env.OMX_SESSION_ID;
@@ -26350,7 +29880,7 @@ PY`,
     }
   });
 
-  it("fails closed on Stop when a session-scoped Ralph id is not bound to session.json", async () => {
+  it("silently ignores Stop when a session-scoped Ralph id is not bound to session.json", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-ralph-session-mismatch-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -26372,9 +29902,7 @@ PY`,
       );
 
       assert.equal(result.omxEventName, "stop");
-      assert.equal(result.outputJson?.decision, "block");
-      assert.equal(result.outputJson?.stopReason, "session_scope_unmatched");
-      assert.match(String(result.outputJson?.reason ?? ""), /sess-live-ralph/);
+      assert.equal(result.outputJson, null);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -26409,10 +29937,11 @@ PY`,
     }
   });
 
-  it("fails closed on Stop when session.json points to an identity-indeterminate owner", async () => {
+  it("bounds Stop replays when session.json points to an identity-indeterminate owner", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-stale-current-session-ralph-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
+      const nativeStopStatePath = join(stateDir, "native-stop-state.json");
       await mkdir(join(stateDir, "sessions", "sess-dead"), { recursive: true });
       await writeJson(join(stateDir, "session.json"), {
         session_id: "sess-dead",
@@ -26431,7 +29960,7 @@ PY`,
         phase: "team-exec",
         active_skills: [{ skill: "team", phase: "team-exec", active: true, session_id: "sess-dead" }],
       });
-      await writeJson(join(stateDir, "native-stop-state.json"), {
+      await writeJson(nativeStopStatePath, {
         sessions: {
           "sess-dead": {
             last_signature: "ralph-stop|sess-dead|thread-1|no-message|verifying",
@@ -26439,21 +29968,61 @@ PY`,
           },
         },
       });
+      const nativeStopStateBefore = await readFile(nativeStopStatePath, "utf-8");
+      const payload = {
+        hook_event_name: "Stop" as const,
+        cwd,
+        session_id: "sess-dead",
+        thread_id: "thread-1",
+      };
 
-      const result = await dispatchCodexNativeHook(
+      const first = await dispatchCodexNativeHook(payload, { cwd });
+      const replay = await dispatchCodexNativeHook(
         {
-          hook_event_name: "Stop",
-          cwd,
-          session_id: "sess-dead",
-          thread_id: "thread-1",
+          ...payload,
           stop_hook_active: true,
         },
         { cwd },
       );
 
-      assert.equal(result.omxEventName, "stop");
-      assert.equal(result.outputJson?.decision, "block");
-      assert.equal(result.outputJson?.stopReason, "session_pointer_unusable");
+      assert.equal(first.omxEventName, "stop");
+      assert.equal(first.outputJson?.decision, "block");
+      assert.equal(first.outputJson?.stopReason, "session_pointer_unusable");
+      assert.equal(replay.omxEventName, "stop");
+      assert.equal(replay.outputJson, null);
+      assert.equal(await readFile(nativeStopStatePath, "utf-8"), nativeStopStateBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("bounds Stop replays when session.json is malformed", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-malformed-session-pointer-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(join(stateDir, "session.json"), "{not-json");
+      const payload = {
+        hook_event_name: "Stop" as const,
+        cwd,
+        session_id: "sess-current",
+      };
+
+      const first = await dispatchCodexNativeHook(payload, { cwd });
+      const replay = await dispatchCodexNativeHook(
+        {
+          ...payload,
+          stop_hook_active: true,
+        },
+        { cwd },
+      );
+
+      assert.equal(first.omxEventName, "stop");
+      assert.equal(first.outputJson?.decision, "block");
+      assert.equal(first.outputJson?.stopReason, "session_pointer_unusable");
+      assert.equal(replay.omxEventName, "stop");
+      assert.equal(replay.outputJson, null);
+      assert.equal(existsSync(join(stateDir, "native-stop-state.json")), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -27074,7 +30643,7 @@ PY`,
     }
   });
 
-  it("fails closed on Stop when session.json points to another worktree", async () => {
+  it("no-ops Stop when session.json points to another worktree", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-stop-root-fallback-cwd-mismatch-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -27098,8 +30667,8 @@ PY`,
       );
 
       assert.equal(result.omxEventName, "stop");
-      assert.equal(result.outputJson?.decision, "block");
-      assert.equal(result.outputJson?.stopReason, "session_pointer_unusable");
+      assert.equal(result.outputJson, null);
+      assert.equal(existsSync(join(stateDir, "native-stop-state.json")), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -27326,7 +30895,6 @@ PY`,
             },
           },
         },
-        pending_role_intents: [],
       });
 
       const result = await dispatchCodexNativeHook(
@@ -29237,6 +32805,219 @@ PY`,
     }
   });
 
+  it("allows trusted omx state read with structured input under ultragoal conductor planning (#3343)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3343-state-read-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3343-state-read";
+      const leaderThreadId = "thread-3343-state-read";
+      await mkdir(join(cwd, ".git"), { recursive: true });
+      await writeNativeMappedSessionState(cwd, stateDir, sessionId, leaderThreadId, leaderThreadId);
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "planning");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "planning",
+        session_id: sessionId,
+        workingDirectory: cwd,
+      });
+
+      await withCleanAmbientNodeRuntimeEnvironment(async () => {
+        await withTrustedWorkspaceOmxCli(cwd, async (_omxCommand, trustedPath) => {
+          const inheritedPath = process.env.PATH;
+          process.env.PATH = trustedPath;
+          try {
+            const payload = JSON.stringify({ mode: "ultragoal", session_id: sessionId, workingDirectory: cwd });
+            const result = await dispatchCodexNativeHook(
+              {
+                hook_event_name: "PreToolUse",
+                cwd,
+                session_id: sessionId,
+                thread_id: leaderThreadId,
+                agent_id: leaderThreadId,
+                tool_name: "Bash",
+                tool_use_id: "tool-3343-omx-state-read-input",
+                tool_input: {
+                  command: `omx state read --input '${payload}' --json`,
+                },
+              },
+              { cwd },
+            );
+
+            assert.equal(result.outputJson, null);
+          } finally {
+            if (inheritedPath === undefined) delete process.env.PATH;
+            else process.env.PATH = inheritedPath;
+          }
+        });
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+  it("blocks an untrusted omx shim ahead of the trusted workspace CLI on PATH under ultragoal conductor planning (#3343)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3343-untrusted-shim-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3343-untrusted-shim";
+      const leaderThreadId = "thread-3343-untrusted-shim";
+      await mkdir(join(cwd, ".git"), { recursive: true });
+      await writeNativeMappedSessionState(cwd, stateDir, sessionId, leaderThreadId, leaderThreadId);
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "planning");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "planning",
+        session_id: sessionId,
+        workingDirectory: cwd,
+      });
+
+      await withCleanAmbientNodeRuntimeEnvironment(async () => {
+        await withTrustedWorkspaceOmxCli(cwd, async (_omxCommand, trustedPath) => {
+          const attackerDir = await mkdtemp(join(tmpdir(), "omx-3343-untrusted-shim-attacker-"));
+          await writeFile(join(attackerDir, "omx"), "#!/bin/sh\necho pwned\n");
+          await chmod(join(attackerDir, "omx"), 0o755);
+          const inheritedPath = process.env.PATH;
+          // Attacker directory sits ahead of the trusted workspace bin dir on PATH.
+          process.env.PATH = `${attackerDir}:${trustedPath}`;
+          try {
+            const payload = JSON.stringify({ mode: "ultragoal", session_id: sessionId, workingDirectory: cwd });
+            const result = await dispatchCodexNativeHook(
+              {
+                hook_event_name: "PreToolUse",
+                cwd,
+                session_id: sessionId,
+                thread_id: leaderThreadId,
+                agent_id: leaderThreadId,
+                tool_name: "Bash",
+                tool_use_id: "tool-3343-untrusted-shim-state-read-input",
+                tool_input: {
+                  command: `omx state read --input '${payload}' --json`,
+                },
+              },
+              { cwd },
+            );
+
+            assert.notEqual(result.outputJson, null);
+            assert.equal(result.outputJson?.decision, "block");
+            assert.match(JSON.stringify(result.outputJson), /PATH/);
+          } finally {
+            if (inheritedPath === undefined) delete process.env.PATH;
+            else process.env.PATH = inheritedPath;
+            await rm(attackerDir, { recursive: true, force: true });
+          }
+        });
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("diagnoses Autopilot lifecycle and skill-mirror phase mismatches (#3344)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3344-phase-mismatch-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3344-phase-mismatch";
+      const leaderThreadId = "thread-3344-phase-mismatch";
+      await writeNativeMappedSessionState(cwd, stateDir, sessionId, leaderThreadId, leaderThreadId);
+      await writeJson(join(stateDir, "sessions", sessionId, "skill-active-state.json"), {
+        active: true,
+        skill: "autopilot",
+        phase: "planning",
+        session_id: sessionId,
+        active_skills: [{ skill: "autopilot", phase: "planning", active: true, session_id: sessionId }],
+      });
+      await writeJson(join(stateDir, "sessions", sessionId, "autopilot-state.json"), {
+        active: true,
+        mode: "autopilot",
+        current_phase: "deep-interview",
+        session_id: sessionId,
+        workingDirectory: cwd,
+      });
+
+      const result = await dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: leaderThreadId,
+          agent_id: leaderThreadId,
+          tool_name: "Write",
+          tool_use_id: "tool-3344-phase-mismatch-write",
+          tool_input: { file_path: "src/runtime.ts", content: "export {};\n" },
+        },
+        { cwd },
+      );
+
+      assert.equal(result.outputJson?.decision, "block");
+      assert.match(String(result.outputJson?.reason ?? ""), /STATE_PHASE_MISMATCH/);
+      assert.match(String(result.outputJson?.reason ?? ""), /lifecycle phase: deep-interview/);
+      assert.match(String(result.outputJson?.reason ?? ""), /skill mirror phase: planning/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("lets omx cancel terminalize Autopilot deep-interview even when the skill mirror advanced (#3344)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3344-cancel-mismatch-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3344-cancel-mismatch";
+      const leaderThreadId = "thread-3344-cancel-mismatch";
+      await writeNativeMappedSessionState(cwd, stateDir, sessionId, leaderThreadId, leaderThreadId);
+      await writeJson(join(stateDir, "sessions", sessionId, "skill-active-state.json"), {
+        active: true,
+        skill: "autopilot",
+        phase: "planning",
+        session_id: sessionId,
+        active_skills: [{ skill: "autopilot", phase: "planning", active: true, session_id: sessionId }],
+      });
+      await writeJson(join(stateDir, "sessions", sessionId, "autopilot-state.json"), {
+        active: true,
+        mode: "autopilot",
+        current_phase: "deep-interview",
+        session_id: sessionId,
+        workingDirectory: cwd,
+      });
+
+      await withCleanAmbientNodeRuntimeEnvironment(async () => {
+        await withTrustedWorkspaceOmxCli(cwd, async (_omxCommand, trustedPath) => {
+          const inheritedPath = process.env.PATH;
+          process.env.PATH = trustedPath;
+          try {
+            const result = await dispatchCodexNativeHook(
+              {
+                hook_event_name: "PreToolUse",
+                cwd,
+                session_id: sessionId,
+                thread_id: leaderThreadId,
+                agent_id: leaderThreadId,
+                tool_name: "Bash",
+                tool_use_id: "tool-3344-cancel-mismatch",
+                tool_input: { command: "omx cancel" },
+              },
+              { cwd },
+            );
+            assert.equal(result.outputJson?.decision, "block");
+            assert.match(JSON.stringify(result.outputJson), /cancelled_exact_session/);
+          } finally {
+            if (inheritedPath === undefined) delete process.env.PATH;
+            else process.env.PATH = inheritedPath;
+          }
+        });
+      });
+
+      const nextAutopilot = JSON.parse(await readFile(join(stateDir, "sessions", sessionId, "autopilot-state.json"), "utf-8"));
+      const nextSkill = JSON.parse(await readFile(join(stateDir, "sessions", sessionId, "skill-active-state.json"), "utf-8"));
+      assert.equal(nextAutopilot.active, false);
+      assert.equal(nextAutopilot.current_phase, "cancelled");
+      assert.equal(nextSkill.active, false);
+      assert.equal(nextSkill.phase, "cancelled");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("blocks mapped implementation writes when explicit ultragoal conductor handoff is active", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralplan-native-map-handoff-"));
     try {
@@ -29903,6 +33684,307 @@ PY`,
     }
   });
 
+  it("allows the exact installed omx CLI by absolute path for Main-root read-only commands (#3333)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-absolute-cli-readonly-"));
+    const installRoot = await mkdtemp(join(tmpdir(), "omx-native-hook-user-install-"));
+    const originalOmxEnvironment = Object.fromEntries(
+      Object.entries(process.env).filter(([name]) => /^(?:OMX|GJC)_/.test(name)),
+    );
+    const originalPath = process.env.PATH;
+    const originalBashEnv = process.env.BASH_ENV;
+    try {
+      for (const name of Object.keys(process.env)) {
+        if (/^(?:OMX|GJC)_/.test(name)) delete process.env[name];
+      }
+      process.env.OMX_ROOT = cwd;
+      process.env.PATH = `${dirname(process.execPath)}:/usr/bin:/bin`;
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-conductor-absolute-cli-readonly";
+      const leaderThreadId = "thread-conductor-absolute-cli-readonly-leader";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      await writeCanonicalLeaderFixture(stateDir, sessionId, leaderThreadId, cwd);
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "executing");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "executing",
+        session_id: sessionId,
+      });
+      const absoluteOmx = join(installRoot, "bin", "omx");
+      await mkdir(dirname(absoluteOmx), { recursive: true });
+      await symlink(realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js")), absoluteOmx);
+
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: { command: `${absoluteOmx} ultragoal status --json` },
+      }, { cwd });
+
+      assert.equal(result.outputJson, null);
+
+      process.env.BASH_ENV = join(installRoot, "inherited-bash-env");
+      const checkpoint = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: {
+          command: `${absoluteOmx} ultragoal checkpoint --goal-id G001-ship --status complete --evidence 'G001 complete verified by tests reviews deployment .omx/ultragoal/goals.json .omx/ultragoal/ledger.jsonl' --codex-goal-json .omx/ultragoal/g001-codex-goal-complete.json --quality-gate-json .omx/ultragoal/g001-quality-gate.json --json`,
+        },
+      }, { cwd });
+      assert.equal(checkpoint.outputJson, null);
+
+      const lookalikeOmx = join(installRoot, "lookalike", "bin", "omx");
+      await mkdir(dirname(lookalikeOmx), { recursive: true });
+      await writeFile(lookalikeOmx, "#!/usr/bin/env node\n", "utf-8");
+      await chmod(lookalikeOmx, 0o755);
+      const lookalike = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: { command: `${lookalikeOmx} ultragoal status --json` },
+      }, { cwd });
+      assert.equal(lookalike.outputJson?.decision, "block");
+
+      const nested = await dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: { command: `bash -c '${absoluteOmx} ultragoal checkpoint --goal-id G001-ship --status complete --evidence done --codex-goal-json goal.json --quality-gate-json gate.json --json'` },
+      }, { cwd });
+      assert.equal(nested.outputJson?.decision, "block");
+    } finally {
+      for (const name of Object.keys(process.env)) {
+        if (/^(?:OMX|GJC)_/.test(name)) delete process.env[name];
+      }
+      Object.assign(process.env, originalOmxEnvironment);
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+      if (originalBashEnv === undefined) delete process.env.BASH_ENV;
+      else process.env.BASH_ENV = originalBashEnv;
+      await rm(cwd, { recursive: true, force: true });
+      await rm(installRoot, { recursive: true, force: true });
+    }
+  });
+
+  it("allows finite Codex goal tools under Main-root Ultragoal checkpointing while near-misses stay unknown-denied (#3300)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3300-goal-tool-transport-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3300-goal-tool-transport";
+      const leaderThreadId = "thread-3300-goal-tool-transport";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: sessionId,
+        native_session_id: leaderThreadId,
+        cwd,
+      });
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: leaderThreadId,
+            threads: { [leaderThreadId]: { thread_id: leaderThreadId, kind: "leader" } },
+          },
+        },
+      });
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "checkpointing");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "checkpointing",
+        session_id: sessionId,
+      });
+
+      const dispatch = (tool_name: string, tool_input: Record<string, unknown> = {}) =>
+        dispatchCodexNativeHook({
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: leaderThreadId,
+          agent_id: leaderThreadId,
+          tool_name,
+          tool_input,
+        }, { cwd });
+
+      for (const [tool_name, tool_input] of [
+        ["Read", { file_path: "README.md" }],
+        ["get_goal", {}],
+        ["functions.get_goal", {}],
+        ["functionsget_goal", {}],
+        ["create_goal", { objective: "complete the ultragoal plan" }],
+        ["update_goal", { status: "complete" }],
+        ["functions.create_goal", { objective: "complete the ultragoal plan" }],
+        ["functions.update_goal", { status: "complete" }],
+        ["functionscreate_goal", { objective: "complete the ultragoal plan" }],
+        ["functionsupdate_goal", { status: "complete" }],
+      ] as const) {
+        const result = await dispatch(tool_name, tool_input);
+        assert.equal(result.outputJson, null, tool_name);
+      }
+
+      for (const tool_name of ["getgoal", "get_goals", "updateGoal", "createGoal", "functions.get_goals"]) {
+        const blocked = await dispatch(tool_name, {});
+        assert.equal(blocked.outputJson?.decision, "block", tool_name);
+        const reason = String(blocked.outputJson?.reason ?? "");
+        assert.match(reason, /Main-root Conductor mode is active \(ultragoal phase: checkpointing\)/);
+        assert.match(reason, /not a recognized read-only or explicitly authorized Conductor mutation transport/);
+        assert.match(reason, new RegExp(tool_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+      }
+
+      // Stop reconciliation must be able to require a fresh get_goal without PreToolUse self-block.
+      const stop = await dispatchCodexNativeHook({
+        hook_event_name: "Stop",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+      }, { cwd });
+      const stopMessage = JSON.stringify(stop.outputJson ?? {});
+      // Stop may still emit guidance, but must not claim get_goal is an unrecognized Conductor transport.
+      assert.doesNotMatch(stopMessage, /get_goal is not a recognized read-only or explicitly authorized Conductor mutation transport/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows session-scoped omx cancel under active ultragoal conductor while impostors stay blocked", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ultragoal-conductor-cancel-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-ultragoal-conductor-cancel";
+      const leaderThreadId = "thread-ultragoal-conductor-cancel";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      await writeJson(join(stateDir, "session.json"), {
+        session_id: sessionId,
+        native_session_id: leaderThreadId,
+      });
+      await writeJson(join(stateDir, "subagent-tracking.json"), { schemaVersion: 1, sessions: { [sessionId]: { session_id: sessionId, leader_thread_id: leaderThreadId, threads: { [leaderThreadId]: { thread_id: leaderThreadId, kind: "leader" } } } } });
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "planning");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "planning",
+        session_id: sessionId,
+      });
+
+      const bash = (command: string) => dispatchCodexNativeHook({
+        hook_event_name: "PreToolUse",
+        cwd,
+        session_id: sessionId,
+        thread_id: leaderThreadId,
+        agent_id: leaderThreadId,
+        tool_name: "Bash",
+        tool_input: { command },
+      }, { cwd });
+
+      const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
+      const trustedPackageBin = join(cwd, "node_modules", ".bin", "omx");
+      await mkdir(dirname(trustedPackageBin), { recursive: true });
+      await symlink(workspacePackageCli, trustedPackageBin);
+      const trustedPackagePath = `${dirname(trustedPackageBin)}:${dirname(process.execPath)}`;
+      const bashTrusted = async (command: string) => {
+        const inheritedPath = process.env.PATH;
+        process.env.PATH = trustedPackagePath;
+        try {
+          return await bash(command);
+        } finally {
+          if (inheritedPath === undefined) delete process.env.PATH;
+          else process.env.PATH = inheritedPath;
+        }
+      };
+
+      const cleanPositives = await withCleanRunnerNodeEnvironment(async () => ({
+        plain: await bashTrusted("omx cancel"),
+        force: await bashTrusted("omx cancel --force"),
+      }));
+      assert.equal(cleanPositives.plain.outputJson, null);
+      assert.equal(cleanPositives.force.outputJson, null);
+      const inheritedCaPositives = await withCleanRunnerNodeEnvironment(async () => {
+        process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
+        return {
+          plain: await bashTrusted("omx cancel"),
+          force: await bashTrusted("omx cancel --force"),
+        };
+      });
+      assert.equal(inheritedCaPositives.plain.outputJson, null);
+      assert.equal(inheritedCaPositives.force.outputJson, null);
+      assert.equal((await bash("omx cancel")).outputJson?.decision, "block",
+        "ambient non-package omx resolution is not trusted");
+
+      for (const [label, command] of [
+        ["openssl config injection", "OPENSSL_CONF=/tmp/evil.cnf omx cancel"],
+        ["path override", "PATH=/tmp/attacker omx cancel"],
+        ["path-qualified impostor", "/tmp/omx cancel --force"],
+        ["chained cancellation", "omx cancel --force && rm -rf x"],
+        ["omx root override", "OMX_ROOT=/tmp/other omx cancel"],
+        ["byte-order-mark lookalike executable", "\ufeffomx cancel"],
+        ["carriage-return suffix lookalike", "omx cancel\r"],
+        ["unicode nbsp separator", "omx\u00a0cancel"],
+      ] as const) {
+        const impostor = await bashTrusted(command);
+        assert.equal(impostor.outputJson?.decision, "block", label);
+      }
+
+      for (const [label, envName, envValue] of [
+        ["inherited bash startup file", "BASH_ENV", "/tmp/prelude.sh"],
+        ["imported omx function shadow", "BASH_FUNC_omx%%", "() { printf owned > src/pwned.ts; }"],
+        ["inherited node loader override", "NODE_OPTIONS", "--require=./payload.cjs"],
+        ["inherited openssl config", "OPENSSL_CONF", "/tmp/evil.cnf"],
+        ["inherited dynamic loader preload", "LD_PRELOAD", "/tmp/payload.so"],
+        ["inherited node coverage output", "NODE_V8_COVERAGE", "/tmp/coverage-out"],
+      ] as const) {
+        const previousValue = process.env[envName];
+        process.env[envName] = envValue;
+        const previousCa = process.env.NODE_EXTRA_CA_CERTS;
+        process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
+        try {
+          const poisoned = await bashTrusted("omx cancel");
+          assert.equal(poisoned.outputJson?.decision, "block", `${label} with inherited CA`);
+        } finally {
+          if (previousValue === undefined) delete process.env[envName];
+          else process.env[envName] = previousValue;
+          if (previousCa === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
+          else process.env.NODE_EXTRA_CA_CERTS = previousCa;
+        }
+      }
+
+      const shadowBinDir = join(cwd, "shadow-bin");
+      await mkdir(shadowBinDir, { recursive: true });
+      await writeFile(join(shadowBinDir, "omx"), "#!/bin/sh\ntouch src/path-shadow-owned.ts\n", "utf-8");
+      await chmod(join(shadowBinDir, "omx"), 0o755);
+      {
+        const inheritedPath = process.env.PATH;
+        process.env.PATH = `${shadowBinDir}:${trustedPackagePath}`;
+        try {
+          const shadowed = await bash("omx cancel");
+          assert.equal(shadowed.outputJson?.decision, "block", "PATH-shadowed omx executable");
+        } finally {
+          if (inheritedPath === undefined) delete process.env.PATH;
+          else process.env.PATH = inheritedPath;
+        }
+      }
+
+      const stateClear = await bash("omx state clear --force --mode ultragoal --json");
+      assert.equal(stateClear.outputJson?.decision, "block");
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("blocks unsupported active conductor source edits with native delegation recovery guidance", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-unsupported-conductor-source-"));
     try {
@@ -30333,7 +34415,7 @@ PY`,
     }
   });
 
-  it("uses hook-native agent_id as child provenance without borrowing Team or legacy identity", async () => {
+  it("uses hook-native agent_id as child provenance without borrowing Team or legacy identity", async () => withCleanAmbientNodeRuntimeEnvironment(async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-conductor-agent-id-"));
     const originalTeamWorker = process.env.OMX_TEAM_WORKER;
     const originalInternalTeamWorker = process.env.OMX_TEAM_INTERNAL_WORKER;
@@ -31049,7 +35131,7 @@ PY`,
       else process.env.GJC_SESSION_ID = originalGjcSessionId;
       await rm(cwd, { recursive: true, force: true });
     }
-  });
+  }));
 
   it("keeps active Ralph starting phase behind the PreToolUse write guard", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ralph-starting-pretool-"));
@@ -31707,7 +35789,7 @@ PY`,
         },
       });
 
-      // A tracked descendant has same-session provenance but no assigned write authority.
+      // A tracked descendant has same-session provenance but no product-write authority.
       const trackedDescendant = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
@@ -31723,7 +35805,7 @@ PY`,
       assert.match(String(trackedDescendant.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/);
       assert.doesNotMatch(String(trackedDescendant.outputJson?.reason ?? ""), /Main-root/);
 
-      // A runtime-proven descendant has same-session provenance but no assigned write authority.
+      // A runtime-proven descendant has same-session provenance but no product-write authority.
       const chainedDescendant = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
@@ -32378,7 +36460,20 @@ PY`,
 
   it("blocks non-shell direct writes in Main-root conductor states", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-conductor-bash-mutations-"));
+    const previousPath = process.env.PATH;
+    const unsafeRuntimeEnvNames = [
+      "NODE_OPTIONS",
+      "OPENSSL_CONF",
+      "NODE_V8_COVERAGE",
+      "NODE_COMPILE_CACHE",
+      "NODE_REDIRECT_WARNINGS",
+      "NODE_REPORT_DIRECTORY",
+      "NODE_REPORT_FILENAME",
+    ] as const;
+    const previousRuntimeEnv = Object.fromEntries(unsafeRuntimeEnvNames.map((name) => [name, process.env[name]]));
     try {
+      process.env.PATH = `${dirname(process.execPath)}:/usr/bin:/bin`;
+      for (const name of unsafeRuntimeEnvNames) delete process.env[name];
       const stateDir = join(cwd, ".omx", "state");
       const sessionId = "sess-conductor-bash-mutations";
       await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
@@ -32469,6 +36564,12 @@ PY`,
         assert.equal(result.outputJson, null, command);
       }
     } finally {
+      if (typeof previousPath === "string") process.env.PATH = previousPath;
+      else delete process.env.PATH;
+      for (const name of unsafeRuntimeEnvNames) {
+        if (previousRuntimeEnv[name] === undefined) delete process.env[name];
+        else process.env[name] = previousRuntimeEnv[name];
+      }
       await rm(cwd, { recursive: true, force: true });
     }
   });
@@ -33381,85 +37482,7 @@ describe("#3118 native role contract", () => {
 		}
 	}
 
-	type TaskNameCarrier = "thread_spawn" | "subagent" | "payload";
 
-	async function startUntypedNativeChild(
-		cwd: string,
-		input: {
-			childSessionId: string;
-			parentThreadId: string;
-			agentNickname?: string;
-			taskName?: string;
-			taskNameCarrier?: TaskNameCarrier;
-			taskNames?: Partial<Record<TaskNameCarrier, unknown>>;
-			camelTaskNames?: Partial<Record<TaskNameCarrier, unknown>>;
-		},
-	): Promise<void> {
-		const taskNameCarrier = input.taskNameCarrier ?? "payload";
-		const taskNameField = (carrier: TaskNameCarrier): Record<string, unknown> => {
-			if (input.taskNames && Object.prototype.hasOwnProperty.call(input.taskNames, carrier)) {
-				return { task_name: input.taskNames[carrier] };
-			}
-			return input.taskName && taskNameCarrier === carrier ? { task_name: input.taskName } : {};
-		};
-		const camelTaskNameField = (carrier: TaskNameCarrier): Record<string, unknown> => (
-			input.camelTaskNames && Object.prototype.hasOwnProperty.call(input.camelTaskNames, carrier)
-				? { taskName: input.camelTaskNames[carrier] }
-				: {}
-		);
-		const transcriptPath = join(cwd, `${input.childSessionId}-rollout.jsonl`);
-		await writeFile(
-			transcriptPath,
-			`${JSON.stringify({
-				type: "session_meta",
-				payload: {
-					id: input.childSessionId,
-					...taskNameField("payload"),
-					...camelTaskNameField("payload"),
-					source: {
-						subagent: {
-							...taskNameField("subagent"),
-							...camelTaskNameField("subagent"),
-							thread_spawn: {
-								parent_thread_id: input.parentThreadId,
-								depth: 1,
-								...taskNameField("thread_spawn"),
-								...camelTaskNameField("thread_spawn"),
-								...(input.agentNickname
-									? { agent_nickname: input.agentNickname }
-									: {}),
-							},
-						},
-					},
-				},
-			})}\n`,
-		);
-		await dispatchCodexNativeHook(
-			{
-				hook_event_name: "SessionStart",
-				cwd,
-				session_id: input.childSessionId,
-				transcript_path: transcriptPath,
-			},
-			{ cwd, sessionOwnerPid: process.pid },
-		);
-	}
-
-	async function readNativeRoleChild(
-		stateDir: string,
-		canonicalSessionId: string,
-		childSessionId: string,
-	): Promise<{ mode?: string; role?: string; provenance_kind?: string } | undefined> {
-		const tracking = JSON.parse(
-			await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"),
-		) as {
-			sessions?: Record<
-				string,
-				{ threads?: Record<string, { mode?: string; role?: string; provenance_kind?: string }> }
-			>;
-		};
-		return tracking.sessions?.[canonicalSessionId]?.threads?.[childSessionId];
-	}
 
 
 	it("denies an unknown agent_type on collaboration.spawn_agent before dispatch (#3118)", async () => {
@@ -33476,6 +37499,14 @@ describe("#3118 native role contract", () => {
 
 			assert.equal(result.outputJson?.decision, "block");
 			assert.equal(result.outputJson?.reason, unknownRoleReason);
+			const additionalContext = String(
+				(result.outputJson?.hookSpecificOutput as { additionalContext?: string } | undefined)?.additionalContext ?? "",
+			);
+			assert.match(additionalContext, /When the surface reports role_routing_unavailable and adapted Ralplan authority is requested/i);
+			assert.match(additionalContext, /omx ralplan preflight --json/);
+			assert.match(additionalContext, /unsupported_documented_leader_proof/);
+			assert.match(additionalContext, /Ordinary work remains under its own workflow gates/i);
+			assert.doesNotMatch(additionalContext, /before Ralplan planning, state, HUD, runtime, or delegation work/i);
 		});
 	});
 
@@ -33517,182 +37548,6 @@ describe("#3118 native role contract", () => {
 		});
 	});
 
-	it("does not revive adapted roles from App task_name carriers or pending intents (#3118, #3194)", async () => {
-		for (const taskNameCarrier of ["thread_spawn", "subagent", "payload"] as const) {
-			await withIsolatedNativeRoleState(`adapted-disabled-${taskNameCarrier}`, async (cwd, stateDir) => {
-				const canonicalSessionId = `sess-3194-adapted-disabled-${taskNameCarrier}`;
-				const parentThreadId = `thread-3194-adapted-parent-${taskNameCarrier}`;
-				const childSessionId = `thread-3194-adapted-child-${taskNameCarrier}`;
-				const correlationToken = "11111111111111111111111100003194";
-				await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-				await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: parentThreadId });
-				assert.equal(recordPendingRoleIntent(cwd, {
-					role: "architect",
-					sessionId: canonicalSessionId,
-					parentThreadId,
-					correlationToken,
-				}).ok, true);
-
-				await startUntypedNativeChild(cwd, {
-					childSessionId,
-					parentThreadId,
-					taskName: buildRoleIntentSpawnTaskName(correlationToken),
-					taskNameCarrier,
-				});
-
-				const child = await readNativeRoleChild(stateDir, canonicalSessionId, childSessionId);
-				assert.equal(child?.role, undefined, taskNameCarrier);
-				assert.equal(child?.provenance_kind, undefined, taskNameCarrier);
-				assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents.length, 1, taskNameCarrier);
-				assert.equal(existsSync(join(stateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE)), false, taskNameCarrier);
-			});
-		}
-	});
-
-	it("fails closed on a present non-marker task_name without falling back to agent_nickname (#3118)", async () => {
-		await withIsolatedNativeRoleState("unbound-task-name-mismatch", async (cwd, stateDir) => {
-			const canonicalSessionId = "sess-3118-unbound-task-name-mismatch";
-			const parentThreadId = "thread-3118-unbound-task-name-mismatch-parent";
-			const childSessionId = "thread-3118-unbound-task-name-mismatch-child";
-			const correlationToken = "55555555555555555555555500003118";
-			await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-			await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: parentThreadId });
-			assert.equal(
-				recordPendingRoleIntent(cwd, {
-					role: "architect",
-					sessionId: canonicalSessionId,
-					parentThreadId,
-					correlationToken,
-				}).ok,
-				true,
-			);
-
-			await startUntypedNativeChild(cwd, {
-				childSessionId,
-				parentThreadId,
-				taskName: "not_a_marker",
-				agentNickname: buildRoleIntentSpawnTaskName(correlationToken),
-			});
-
-			const child = await readNativeRoleChild(stateDir, canonicalSessionId, childSessionId);
-			assert.equal(child?.mode, undefined);
-			assert.equal(child?.role, undefined);
-			assert.equal(child?.provenance_kind, undefined);
-			assert.equal(existsSync(join(stateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE)), false);
-			assert.equal(
-				readRoleRoutingMarker(stateDir, { cwd, sessionId: canonicalSessionId, parentThreadId }),
-				null,
-			);
-			assert.equal(
-				(await readSubagentTrackingState(cwd)).pending_role_intents[0]?.correlation_token,
-				correlationToken,
-			);
-		});
-	});
-
-	it("leaves an unmarked App child untyped and unconsumed without first-arrival binding (#3118)", async () => {
-		await withIsolatedNativeRoleState("unbound-no-app-marker", async (cwd, stateDir) => {
-			const canonicalSessionId = "sess-3118-unbound-no-app-marker";
-			const parentThreadId = "thread-3118-unbound-no-app-marker-parent";
-			const childSessionId = "thread-3118-unbound-no-app-marker-child";
-			const correlationToken = "66666666666666666666666600003118";
-			await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-			await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: parentThreadId });
-			assert.equal(
-				recordPendingRoleIntent(cwd, {
-					role: "architect",
-					sessionId: canonicalSessionId,
-					parentThreadId,
-					correlationToken,
-				}).ok,
-				true,
-			);
-
-			await startUntypedNativeChild(cwd, { childSessionId, parentThreadId });
-
-			const child = await readNativeRoleChild(stateDir, canonicalSessionId, childSessionId);
-			assert.equal(child?.mode, undefined);
-			assert.equal(child?.role, undefined);
-			assert.equal(child?.provenance_kind, undefined);
-			assert.equal(existsSync(join(stateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE)), false);
-			assert.equal(
-				readRoleRoutingMarker(stateDir, { cwd, sessionId: canonicalSessionId, parentThreadId }),
-				null,
-			);
-			assert.equal(
-				(await readSubagentTrackingState(cwd)).pending_role_intents[0]?.correlation_token,
-				correlationToken,
-			);
-		});
-	});
-
-	it("does not authenticate an agent_nickname role-intent marker without task_name (#3118)", async () => {
-		await withIsolatedNativeRoleState("adapted-agent-nickname-fallback", async (cwd, stateDir) => {
-			const canonicalSessionId = "sess-3118-adapted-agent-nickname-fallback";
-			const parentThreadId = "thread-3118-adapted-agent-nickname-fallback-parent";
-			const childSessionId = "thread-3118-adapted-agent-nickname-fallback-child";
-			const correlationToken = "77777777777777777777777700003118";
-			await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-			await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: parentThreadId });
-			assert.equal(
-				recordPendingRoleIntent(cwd, {
-					role: "architect",
-					sessionId: canonicalSessionId,
-					parentThreadId,
-					correlationToken,
-				}).ok,
-				true,
-			);
-
-			await startUntypedNativeChild(cwd, {
-				childSessionId,
-				parentThreadId,
-				agentNickname: buildRoleIntentSpawnTaskName(correlationToken),
-			});
-
-			const child = await readNativeRoleChild(stateDir, canonicalSessionId, childSessionId);
-			assert.equal(child?.mode, undefined);
-			assert.equal(child?.role, undefined);
-			assert.equal(child?.provenance_kind, undefined);
-			assert.equal(existsSync(join(stateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE)), false);
-			assert.equal(readRoleRoutingMarker(stateDir, { cwd, sessionId: canonicalSessionId, parentThreadId }), null);
-			assert.equal(
-				(await readSubagentTrackingState(cwd)).pending_role_intents[0]?.correlation_token,
-				correlationToken,
-			);
-		});
-	});
-
-	it("does not authenticate a camelCase taskName role-intent marker without task_name (#3118)", async () => {
-		await withIsolatedNativeRoleState("adapted-camel-task-name", async (cwd, stateDir) => {
-			const canonicalSessionId = "sess-3118-adapted-camel-task-name";
-			const parentThreadId = "thread-3118-adapted-camel-task-name-parent";
-			const childSessionId = "thread-3118-adapted-camel-task-name-child";
-			const correlationToken = "88888888888888888888888800003118";
-			await mkdir(join(stateDir, "sessions", canonicalSessionId), { recursive: true });
-			await writeSessionStart(cwd, canonicalSessionId, { nativeSessionId: parentThreadId });
-			assert.equal(recordPendingRoleIntent(cwd, {
-				role: "architect",
-				sessionId: canonicalSessionId,
-				parentThreadId,
-				correlationToken,
-			}).ok, true);
-
-			await startUntypedNativeChild(cwd, {
-				childSessionId,
-				parentThreadId,
-				camelTaskNames: { thread_spawn: buildRoleIntentSpawnTaskName(correlationToken) },
-			});
-
-			const child = await readNativeRoleChild(stateDir, canonicalSessionId, childSessionId);
-			assert.equal(child?.mode, undefined);
-			assert.equal(child?.role, undefined);
-			assert.equal(child?.provenance_kind, undefined);
-			assert.equal(existsSync(join(stateDir, NATIVE_SUBAGENT_ROLE_ROUTING_MARKER_FILE)), false);
-			assert.equal(readRoleRoutingMarker(stateDir, { cwd, sessionId: canonicalSessionId, parentThreadId }), null);
-			assert.equal((await readSubagentTrackingState(cwd)).pending_role_intents[0]?.correlation_token, correlationToken);
-		});
-	});
 });
 
 // ---------------------------------------------------------------------------
@@ -33923,7 +37778,7 @@ describe("codex native hook triage integration", () => {
     }
   });
 
-  it("makes autopilot keyword activation observable in state, HUD context, and prompt guidance", async () => {
+  it("makes fresh autopilot preflight denial observable in state, HUD context, and prompt guidance", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-autopilot-observable-"));
     try {
       await mkdir(join(cwd, ".omx", "state"), { recursive: true });
@@ -33942,44 +37797,40 @@ describe("codex native hook triage integration", () => {
       );
 
       assert.equal(result.skillState?.skill, "autopilot");
-      assert.equal(result.skillState?.phase, "deep-interview");
-      assert.equal(result.skillState?.initialized_state_path, ".omx/state/sessions/sess-autopilot-observable/autopilot-state.json");
+      assert.equal(result.skillState?.active, false);
+      assert.equal(result.skillState?.phase, "failed");
+      assert.equal(result.skillState?.error, "documented_host_consensus_receipt_unavailable");
+      assert.deepEqual(result.skillState?.active_skills, []);
 
       const additionalContext = String(
         (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "",
       );
-      assert.match(additionalContext, /detected workflow keyword "\$autopilot" -> autopilot/);
-      assert.match(additionalContext, /\$deep-interview -> \$ralplan -> \$ultragoal \(\+ \$team if needed\) -> \$code-review -> \$ultraqa/);
-      assert.match(additionalContext, /deep_interview_gate\.skip_reason/);
-      assert.match(additionalContext, /Do not silently fall back to ordinary \$plan\/ralplan-only handling/);
-      assert.match(additionalContext, /Codex goal-mode handoff guidance/);
-      assert.doesNotMatch(additionalContext, /multi-step goal with no workflow keyword/);
+      assert.match(additionalContext, /denied workflow keyword "\$autopilot" -> autopilot/);
+      assert.match(additionalContext, /documented_host_consensus_receipt_unavailable/);
+      assert.doesNotMatch(additionalContext, /Autopilot protocol:|deep-interview -> ralplan -> ultragoal/);
 
-      const statePath = join(cwd, ".omx", "state", "sessions", "sess-autopilot-observable", "autopilot-state.json");
+      const sessionDir = join(cwd, ".omx", "state", "sessions", "sess-autopilot-observable");
+      const statePath = join(sessionDir, "autopilot-state.json");
       const modeState = JSON.parse(await readFile(statePath, "utf-8")) as {
         active: boolean;
         current_phase: string;
-        state?: { phase_cycle?: string[]; deep_interview_gate?: { status?: string; skip_reason?: string | null } };
+        error?: string;
       };
-      assert.equal(modeState.active, true);
-      assert.equal(modeState.current_phase, "deep-interview");
-      assert.deepEqual(modeState.state?.phase_cycle, ["deep-interview", "ralplan", "ultragoal", "code-review", "ultraqa"]);
-      assert.deepEqual(modeState.state?.deep_interview_gate, {
-        status: "required",
-        skip_reason: null,
-        rationale: "Autopilot starts at the deep-interview gate by default; clear bounded tasks may skip only with an explicit persisted skip reason.",
-      });
+      assert.equal(modeState.active, false);
+      assert.equal(modeState.current_phase, "failed");
+      assert.equal(modeState.error, "documented_host_consensus_receipt_unavailable");
+      assert.equal(existsSync(join(sessionDir, "deep-interview-state.json")), false);
+      assert.equal(existsSync(join(sessionDir, "ultragoal-state.json")), false);
 
       const hudState = await readAllState(cwd);
-      assert.equal(hudState.autopilot?.active, true);
-      assert.equal(hudState.autopilot?.current_phase, "deep-interview");
-      assert.match(renderHud(hudState, "focused"), /autopilot:deep-interview/);
+      assert.equal(hudState.autopilot, null);
+      assert.doesNotMatch(renderHud(hudState, "focused"), /autopilot:/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it("omits Team handoff guidance from autopilot prompt context when Team mode is disabled", async () => {
+  it("keeps fresh autopilot preflight denial free of Team handoff guidance when Team mode is disabled", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-autopilot-observable-no-team-"));
     try {
       await mkdir(join(cwd, ".omx", "state"), { recursive: true });
@@ -34002,12 +37853,17 @@ describe("codex native hook triage integration", () => {
       );
 
       assert.equal(result.skillState?.skill, "autopilot");
+      assert.equal(result.skillState?.active, false);
+      assert.equal(result.skillState?.phase, "failed");
+      assert.equal(result.skillState?.error, "documented_host_consensus_receipt_unavailable");
       const additionalContext = String(
         (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "",
       );
-      assert.match(additionalContext, /detected workflow keyword "\$autopilot" -> autopilot/);
-      assert.match(additionalContext, /\$deep-interview -> \$ralplan -> \$ultragoal -> \$code-review -> \$ultraqa/);
-      assert.doesNotMatch(additionalContext, /\$team/);
+      assert.match(additionalContext, /documented_host_consensus_receipt_unavailable/);
+      assert.doesNotMatch(additionalContext, /Autopilot protocol:|deep-interview -> ralplan -> ultragoal|\$team/);
+      const sessionDir = join(cwd, ".omx", "state", "sessions", "sess-autopilot-observable-no-team");
+      assert.equal(existsSync(join(sessionDir, "deep-interview-state.json")), false);
+      assert.equal(existsSync(join(sessionDir, "ultragoal-state.json")), false);
       assert.equal(existsSync(join(cwd, ".omx", "state", "team-state.json")), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
@@ -34053,7 +37909,7 @@ describe("codex native hook triage integration", () => {
     }
   });
 
-  it("makes bare autopilot command activation observable in state and prompt guidance", async () => {
+  it("makes bare fresh autopilot preflight denial observable in state and prompt guidance", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-autopilot-bare-observable-"));
     try {
       await mkdir(join(cwd, ".omx", "state"), { recursive: true });
@@ -34072,22 +37928,30 @@ describe("codex native hook triage integration", () => {
       );
 
       assert.equal(result.skillState?.skill, "autopilot");
-      assert.equal(result.skillState?.phase, "deep-interview");
-      assert.equal(result.skillState?.initialized_state_path, ".omx/state/sessions/sess-autopilot-bare-observable/autopilot-state.json");
+      assert.equal(result.skillState?.active, false);
+      assert.equal(result.skillState?.phase, "failed");
+      assert.equal(result.skillState?.error, "documented_host_consensus_receipt_unavailable");
+      assert.deepEqual(result.skillState?.active_skills, []);
 
       const additionalContext = String(
         (result.outputJson as { hookSpecificOutput?: { additionalContext?: string } })?.hookSpecificOutput?.additionalContext ?? "",
       );
-      assert.match(additionalContext, /detected workflow keyword "autopilot" -> autopilot/);
-      assert.doesNotMatch(additionalContext, /multi-step goal with no workflow keyword/);
+      assert.match(additionalContext, /denied workflow keyword "autopilot" -> autopilot/);
+      assert.match(additionalContext, /documented_host_consensus_receipt_unavailable/);
+      assert.doesNotMatch(additionalContext, /Autopilot protocol:|deep-interview -> ralplan -> ultragoal/);
 
-      const statePath = join(cwd, ".omx", "state", "sessions", "sess-autopilot-bare-observable", "autopilot-state.json");
+      const sessionDir = join(cwd, ".omx", "state", "sessions", "sess-autopilot-bare-observable");
+      const statePath = join(sessionDir, "autopilot-state.json");
       const modeState = JSON.parse(await readFile(statePath, "utf-8")) as {
         active: boolean;
         current_phase: string;
+        error?: string;
       };
-      assert.equal(modeState.active, true);
-      assert.equal(modeState.current_phase, "deep-interview");
+      assert.equal(modeState.active, false);
+      assert.equal(modeState.current_phase, "failed");
+      assert.equal(modeState.error, "documented_host_consensus_receipt_unavailable");
+      assert.equal(existsSync(join(sessionDir, "deep-interview-state.json")), false);
+      assert.equal(existsSync(join(sessionDir, "ultragoal-state.json")), false);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -35315,6 +39179,102 @@ describe('native UserPromptSubmit payload provenance', () => {
       assert.equal(foreignChild.skillState, null);
       assert.equal(existsSync(join(stateDir, 'sessions', 'foreign-child', 'skill-active-state.json')), false);
       assert.equal(await readFile(join(stateDir, 'sessions', 'selected-root', 'sentinel.json'), 'utf-8'), sentinelBefore);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+	it("denies canonical adapted role intent before hostile pointer states for raw and compiled hooks", async () => {
+		const expected = {
+			hookSpecificOutput: {
+				hookEventName: "PreToolUse",
+				permissionDecision: "deny",
+				permissionDecisionReason: "unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan.",
+			},
+		};
+		const payload = {
+			hook_event_name: "PreToolUse",
+			tool_name: "Bash",
+			tool_use_id: "hostile-pointer-role-intent",
+			tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
+		};
+		const cases: Array<[string, (stateDir: string, pointerPath: string, cwd: string) => Promise<void>]> = [
+			["malformed", async (_stateDir, pointerPath) => { await writeFile(pointerPath, "{", "utf8"); }],
+			["oversized", async (_stateDir, pointerPath) => { await writeFile(pointerPath, "x".repeat(2 * 1024 * 1024), "utf8"); }],
+			["unreadable", async (_stateDir, pointerPath) => { await mkdir(pointerPath); }],
+			["symlink", async (_stateDir, pointerPath, cwd) => {
+				const targetPath = join(cwd, "forged-session.json");
+				await writeFile(targetPath, '{"session_id":"forged"}', "utf8");
+				await symlink(targetPath, pointerPath);
+			}],
+			["replaced", async (_stateDir, pointerPath) => {
+				await writeFile(pointerPath, '{"session_id":"first"}', "utf8");
+				await rm(pointerPath);
+				await writeFile(pointerPath, '{"session_id":"replacement"}', "utf8");
+			}],
+		];
+		for (const [name, setup] of cases) {
+			const cwd = await mkdtemp(join(tmpdir(), `omx-native-hook-role-intent-${name}-`));
+			try {
+				const stateDir = join(cwd, ".omx", "state");
+				const pointerPath = join(stateDir, "session.json");
+				await mkdir(stateDir, { recursive: true });
+				await setup(stateDir, pointerPath, cwd);
+				const raw = await dispatchCodexNativeHook({ ...payload, cwd }, { cwd });
+				assert.deepEqual(raw.outputJson, expected, `${name} raw`);
+				assert.deepEqual((await readdir(stateDir)).sort(), ["session.json"], `${name} raw writes`);
+				const compiled = parseSingleJsonStdout(runNativeHookCli({ ...payload, cwd }, { cwd }));
+				assert.deepEqual(compiled, expected, `${name} compiled`);
+				assert.deepEqual((await readdir(stateDir)).sort(), ["session.json"], `${name} compiled writes`);
+			} finally {
+				await rm(cwd, { recursive: true, force: true });
+			}
+		}
+	});
+});
+
+describe("native Team notice ledger reconciliation", () => {
+  it("invalidates removed Teams before queued wake context reaches the model", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-team-notice-ledger-"));
+    const stateRoot = join(cwd, ".omx", "state");
+    try {
+      const session = await writeSessionStart(cwd, "sess-team-notice-ledger");
+      let wakePrompt = "";
+      for (const teamName of ["notice-live", "notice-removed"]) {
+        const teamDir = join(stateRoot, "team", teamName);
+        await mkdir(teamDir, { recursive: true });
+        await writeFile(join(teamDir, "config.json"), JSON.stringify({ team_name: teamName }));
+        const registration = await registerTeamNotice({
+          stateRoot,
+          targetId: "leader-shared",
+          teamName,
+          noticeClass: "mailbox",
+          generation: "1",
+          source: { kind: "test" },
+        });
+        wakePrompt ||= registration.prompt ?? "";
+      }
+      await rm(join(stateRoot, "team", "notice-removed"), { recursive: true, force: true });
+
+      const result = await dispatchCodexNativeHook({
+        hook_event_name: "UserPromptSubmit",
+        cwd,
+        session_id: session.session_id,
+        prompt: `${wakePrompt} [OMX_TMUX_INJECT]`,
+      }, { cwd });
+      const context = String((result.outputJson?.hookSpecificOutput as { additionalContext?: unknown } | undefined)?.additionalContext ?? "");
+      assert.match(context, /notice-live \(mailbox\)/);
+      assert.doesNotMatch(context, /notice-removed/);
+
+      const replay = await dispatchCodexNativeHook({
+        hook_event_name: "UserPromptSubmit",
+        cwd,
+        session_id: session.session_id,
+        prompt: `${wakePrompt} [OMX_TMUX_INJECT]`,
+      }, { cwd });
+      const replayContext = String((replay.outputJson?.hookSpecificOutput as { additionalContext?: unknown } | undefined)?.additionalContext ?? "");
+      assert.match(replayContext, /notice-live \(mailbox\)/);
+      assert.doesNotMatch(replayContext, /notice-removed/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

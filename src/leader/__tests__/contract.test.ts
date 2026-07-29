@@ -1,6 +1,5 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { randomUUID } from 'node:crypto';
 import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -19,19 +18,16 @@ import {
   NATIVE_SUBAGENT_SUPPORT_BLOCKER_FILE,
   buildRoleRoutingUnavailableGuidance,
   buildUnsupportedNativeSubagentGuidance,
+  isNativeSubagentResultToolName,
+  isNativeSubagentSpawnToolName,
   isRoleRoutingUnavailableEvidence,
   isUnsupportedNativeSubagentEvidence,
   isUnsupportedNativeSubagentEvidenceForScope,
   type RoleRoutingUnavailableMarker,
   resolveNativeSubagentSupportStatus,
   parseNativeSubagentResultDisposition,
-  NATIVE_SPAWN_TASK_NAME_PATTERN,
-  ROLE_INTENT_SPAWN_TASK_NAME_PREFIX,
-  ROLE_INTENT_CORRELATION_TOKEN_PATTERN,
+  canonicalizeNativeCollaborationToolName,
   canonicalizeOriginCwd,
-  buildRoleIntentSpawnTaskName,
-  isAppCompatibleSpawnTaskName,
-  parseRoleIntentCorrelationToken,
 } from '../contract.js';
 
 describe('leader conductor contract', () => {
@@ -175,15 +171,16 @@ describe('leader conductor contract', () => {
     assert.equal(markerEvidence.evidenceSummary, marker.evidence);
   });
 
-  it('renders role-routing guidance that fails closed without adapted authority', () => {
+  it('renders role-routing guidance that fails closed only for adapted Ralplan authority', () => {
     const guidance = buildRoleRoutingUnavailableGuidance({
       status: 'role_routing_unavailable',
       source: 'persisted_role_routing_marker',
       evidenceSummary: 'spawn tool accepted no native role routing',
     });
-    assert.match(guidance, /omx ralplan preflight --json/);
-    assert.match(guidance, /unsupported_documented_leader_proof/);
+    assert.match(guidance, /When adapted Ralplan authority is requested, run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`/);
+    assert.match(guidance, /Ordinary native sessions and ordinary work remain under their own workflow gates/);
     assert.match(guidance, /Do not fabricate agent_type/);
+    assert.doesNotMatch(guidance, /Before Ralplan planner, reviewer, HUD, runtime, or delegation work/);
     assert.doesNotMatch(guidance, /PROCEED|role-intent ledger/);
     assert.match(guidance, /Evidence: spawn tool accepted no native role routing/);
     assert.match(LEADER_CONDUCTOR_ROLE_ROUTING_DEGRADE_BLOCK, /reviewed alternative workflow/);
@@ -239,6 +236,76 @@ describe('leader conductor contract', () => {
         persistedCapacityBlocker: { reason: 'agent_thread_limit_reached', expires_at: '2026-07-12T00:00:00.000Z' },
       }).reason,
       'agent_thread_limit_reached',
+    );
+  });
+
+  it('canonicalizes only the finite known flattened collaboration tool names', () => {
+    const known = new Map([
+      ['collaborationspawn_agent', 'collaboration.spawn_agent'],
+      ['collaborationclose_agent', 'collaboration.close_agent'],
+      ['collaborationlist_agents', 'collaboration.list_agents'],
+      ['collaborationfollowup_task', 'collaboration.followup_task'],
+      ['collaborationwait_agent', 'collaboration.wait_agent'],
+      ['collaborationsend_message', 'collaboration.send_message'],
+      ['collaborationinterrupt_agent', 'collaboration.interrupt_agent'],
+    ]);
+    for (const [flattened, dotted] of known) {
+      assert.equal(canonicalizeNativeCollaborationToolName(flattened), dotted);
+      assert.equal(canonicalizeNativeCollaborationToolName(dotted), dotted);
+    }
+    // Unknown or near-miss flattened names pass through unchanged (fail-closed).
+    for (const name of ['collaborationbogus_thing', 'collaborationspawn_agentx', 'xcollaborationspawn_agent', 'collaborationlist_agent', 'collaborationspawnagent', 'collaboration']) {
+      assert.equal(canonicalizeNativeCollaborationToolName(name), name);
+    }
+  });
+
+  it('recognizes flattened known collaboration spawn and result tool names', () => {
+    assert.equal(isNativeSubagentSpawnToolName('collaborationspawn_agent'), true);
+    for (const toolName of ['collaborationspawn_agent', 'collaborationlist_agents', 'collaborationfollowup_task', 'collaborationwait_agent']) {
+      assert.equal(isNativeSubagentResultToolName(toolName), true, toolName);
+    }
+    // close/send/interrupt keep dotted parity: they are not spawn or result tools.
+    for (const toolName of ['collaborationclose_agent', 'collaborationsend_message', 'collaborationinterrupt_agent']) {
+      assert.equal(isNativeSubagentSpawnToolName(toolName), false, toolName);
+      assert.equal(isNativeSubagentResultToolName(toolName), false, toolName);
+    }
+    // Unknown flattened names remain unrecognized.
+    for (const toolName of ['collaborationbogus_thing', 'collaborationspawn_agentx', 'collaborationlist_agent']) {
+      assert.equal(isNativeSubagentSpawnToolName(toolName), false, toolName);
+      assert.equal(isNativeSubagentResultToolName(toolName), false, toolName);
+    }
+  });
+
+  it('detects native subagent support from flattened available_tools names', () => {
+    assert.equal(
+      resolveNativeSubagentSupportStatus({ payload: { available_tools: ['Read', 'collaborationspawn_agent'] } }).status,
+      'supported',
+    );
+    assert.equal(
+      resolveNativeSubagentSupportStatus({ payload: { available_tools: [{ name: 'collaborationspawn_agent' }] } }).status,
+      'supported',
+    );
+    const companionsOnly = resolveNativeSubagentSupportStatus({
+      payload: { available_tools: ['collaborationfollowup_task', 'collaborationwait_agent'] },
+    });
+    assert.equal(companionsOnly.status, 'unknown');
+  });
+
+  it('parses flattened collaboration result dispositions like their dotted forms', () => {
+    for (const toolName of ['collaborationspawn_agent', 'collaborationlist_agents', 'collaborationfollowup_task', 'collaborationwait_agent']) {
+      assert.equal(
+        parseNativeSubagentResultDisposition(toolName, { success: true, status: 'completed', error: null }).kind,
+        'success',
+        toolName,
+      );
+    }
+    assert.equal(
+      parseNativeSubagentResultDisposition('collaborationspawn_agent', 'collab spawn failed: agent thread limit reached').kind,
+      'capacity',
+    );
+    assert.equal(
+      parseNativeSubagentResultDisposition('collaborationspawn_agent', 'unknown tool is unavailable').kind,
+      'unsupported',
     );
   });
 
@@ -432,38 +499,6 @@ describe('leader conductor contract', () => {
       }, { sessionId: 'sess-1' }),
       true,
     );
-  });
-  it('builds and parses App-compatible native role-intent task names', () => {
-    const taskName = buildRoleIntentSpawnTaskName('abc123');
-    assert.equal(taskName, 'omx_role_intent_abc123');
-    assert.equal(taskName, `${ROLE_INTENT_SPAWN_TASK_NAME_PREFIX}abc123`);
-    assert.match(taskName, NATIVE_SPAWN_TASK_NAME_PATTERN);
-
-    assert.equal(isAppCompatibleSpawnTaskName('omx-role-intent:9f8e'), false);
-    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_DEADBEEF'), false);
-    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_dead-beef'), false);
-    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_dead:beef'), false);
-    assert.equal(isAppCompatibleSpawnTaskName('omx_role_intent_deadbeef'), true);
-    assert.equal(ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test('abc123'), true);
-    assert.equal(ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test('abc_def'), false);
-    assert.throws(() => buildRoleIntentSpawnTaskName('abc_def'), /Invalid role-intent correlation token/);
-
-    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_a3118'), 'a3118');
-    assert.equal(parseRoleIntentCorrelationToken(['omx_role_intent_a3118']), undefined);
-    assert.equal(parseRoleIntentCorrelationToken({ toString: () => 'omx_role_intent_a3118' }), undefined);
-    assert.equal(parseRoleIntentCorrelationToken(' omx_role_intent_a3118'), undefined);
-    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_a3118 '), undefined);
-    assert.equal(parseRoleIntentCorrelationToken('omx-role-intent:deadbeef'), undefined);
-    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_abc_def'), undefined);
-    assert.equal(parseRoleIntentCorrelationToken('omx_role_intent_DEADBEEF'), undefined);
-    assert.equal(parseRoleIntentCorrelationToken(''), undefined);
-    assert.equal(parseRoleIntentCorrelationToken(42), undefined);
-    assert.equal(parseRoleIntentCorrelationToken(null), undefined);
-    assert.equal(parseRoleIntentCorrelationToken(undefined), undefined);
-
-    const generatedTaskName = buildRoleIntentSpawnTaskName(randomUUID().replace(/-/g, ''));
-    assert.match(generatedTaskName, NATIVE_SPAWN_TASK_NAME_PATTERN);
-    assert.doesNotMatch(generatedTaskName, /[-:]/);
   });
 
   it('canonicalizes symlinked and nonexistent-leaf origins while rejecting ELOOP identities', async () => {

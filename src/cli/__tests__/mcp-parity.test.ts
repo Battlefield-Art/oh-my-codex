@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
-import { existsSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { chmod, mkdtemp, mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { tmpdir as osTmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, it } from "node:test";
 import { mcpParityCommand } from "../mcp-parity.js";
 import { writeSessionStart } from "../../hooks/session.js";
 import { getWikiDir } from "../../wiki/storage.js";
+
+const tmpdir = (): string => realpathSync(osTmpdir());
 
 const originalLog = console.log;
 
@@ -150,7 +152,7 @@ describe("mcpParityCommand", () => {
 
       assert.match(
         logs.pop() ?? "",
-        /Cannot resolve writable state scope: OMX_SESSION_ID is not bound to session\.json\./,
+        /Cannot resolve writable state scope: OMX_SESSION_ID does not match the live session recorded in session\.json\./,
       );
       assert.equal(existsSync(join(stateDir, "sessions", "native-unmatched-id", "ralplan-state.json")), false);
       assert.equal(existsSync(join(stateDir, "sessions", "omx-unmatched-id", "ralplan-state.json")), false);

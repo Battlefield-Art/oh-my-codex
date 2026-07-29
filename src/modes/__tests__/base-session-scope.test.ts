@@ -7,12 +7,22 @@ import { tmpdir } from 'node:os';
 import { assertModeStartAllowed, readModeState, startMode, updateModeState } from '../base.js';
 
 
+async function writeSessionPointer(wd: string, sessionId: string): Promise<void> {
+  const stateDir = join(wd, '.omx', 'state');
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(join(stateDir, 'session.json'), JSON.stringify({
+    session_id: sessionId,
+    cwd: wd,
+    state_root: stateDir,
+  }));
+}
+
 describe('modes/base session-scoped persistence', () => {
   it('writes mode state into the current session scope when session.json exists', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-mode-session-scope-'));
     try {
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
-      await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({ session_id: 'sess-base-write' }));
+      await writeSessionPointer(wd, 'sess-base-write');
 
       await startMode('ralplan', 'write in session scope', 5, wd);
 
@@ -35,7 +45,7 @@ describe('modes/base session-scoped persistence', () => {
       const sessionId = 'sess-base-canonical';
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeSessionPointer(wd, sessionId);
 
       await startMode('ralplan', 'write canonical in session scope', 5, wd);
       await updateModeState('ralplan', { current_phase: 'planning', iteration: 1 }, wd);
@@ -59,7 +69,7 @@ describe('modes/base session-scoped persistence', () => {
       const sessionId = 'sess-ralph-owner';
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeSessionPointer(wd, sessionId);
 
       await startMode('ralph', 'own this session', 5, wd);
 
@@ -78,7 +88,7 @@ describe('modes/base session-scoped persistence', () => {
       const sessionId = 'sess-base-read';
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeSessionPointer(wd, sessionId);
       await writeFile(join(stateDir, 'ralplan-state.json'), JSON.stringify({ active: true, current_phase: 'root-only', iteration: 9 }));
       await writeFile(join(sessionDir, 'ralplan-state.json'), JSON.stringify({ active: true, current_phase: 'draft', iteration: 1 }));
 
@@ -105,7 +115,7 @@ describe('modes/base session-scoped persistence', () => {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess-new-ralph';
       await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeSessionPointer(wd, sessionId);
       await writeFile(join(stateDir, 'ralph-state.json'), JSON.stringify({
         active: true,
         mode: 'ralph',
@@ -137,7 +147,7 @@ describe('modes/base session-scoped persistence', () => {
       const sessionId = 'sess-ralph-restart';
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeSessionPointer(wd, sessionId);
       await writeFile(join(sessionDir, 'ralph-state.json'), JSON.stringify({
         active: false,
         iteration: 7,
@@ -169,8 +179,8 @@ describe('modes/base session-scoped persistence', () => {
       await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: 'sess-canonical', cwd: wd }));
       process.env.OMX_SESSION_ID = 'sess-unmatched';
 
-      await assert.rejects(() => assertModeStartAllowed('ralplan', wd), /OMX_SESSION_ID is not bound to session\.json/);
-      await assert.rejects(() => startMode('ralplan', 'must not write', 5, wd), /OMX_SESSION_ID is not bound to session\.json/);
+      await assert.rejects(() => assertModeStartAllowed('ralplan', wd), /OMX_SESSION_ID does not match the live session recorded in session\.json/);
+      await assert.rejects(() => startMode('ralplan', 'must not write', 5, wd), /OMX_SESSION_ID does not match the live session recorded in session\.json/);
       assert.equal(existsSync(join(stateDir, 'sessions', 'sess-unmatched')), false);
       assert.equal(existsSync(join(stateDir, 'ralplan-state.json')), false);
     } finally {

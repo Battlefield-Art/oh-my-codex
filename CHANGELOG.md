@@ -4,6 +4,42 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.20.4] - 2026-07-28
+
+Patch release for the reliability, workflow-safety, and native-hook trust work in `v0.20.3..73cb50c125c11aca0654b8841e690f011eb5f43f`, plus one additive, backward-compatible feature. No intentional breaking CLI or package-layout changes.
+
+### Added
+
+- **Herdr lifecycle/status bridge** — opt-in Herdr lifecycle and status bridge (Phase 1) provides an external adaptation surface (#3241, #3242).
+
+### Fixed
+
+- **Autopilot host-receipt preflight** — fresh default Autopilot now fails before deep-interview and Architect/Critic review work when the official host consensus receipt verifier is deterministically unavailable, while preserving the exact fail-closed blocker, direct/manual Ralplan diagnostics, active-session resumability, and ADR 3194/3212 authority boundaries (#3270).
+- **Native cache integrity boundary** — managed cache binaries without their `.sha256` sidecar are rejected; checksum verification establishes integrity, not a signature. On a retained hydration lock, confirm that no OMX hydration process is active for that cache key, remove only that named lock manually, then retry. SparkShell warns and falls back to raw command execution without summary support when its native sidecar is unavailable or GLIBC-incompatible. Binary and checksum sidecars are published as two files and are not an atomic pair; the lock protocol provides process-crash-safe, fail-closed publication, with manual retained-lock remediation, rather than recovery from a process crash (#3285).
+- **Dead session-pointer lock recovery** — canonical session-pointer locks are recovered when positively dead, with identity-revalidated, no-clobber reversible claims; recovery checkpoints are resumable, swapped claims preserved, failed claims rolled back, and recovery directories atomically quarantined (#3261, #3262; issue #3256).
+- **Team startup rollback and pane authority** — startup cleanup is bound to exact owned panes and split-proof reconciliation, pinned against ambiguous worker/HUD cleanup and PID reuse (#3265; #3231, #3228, #3229, #3230; issue #3224).
+- **Team fail-closed on managed Codex bypass** — managed bypass rejection is enforced fail-closed when Codex bypass is rejected under managed mode (#3232).
+- **Resumed session cancel ownership** — cancel ownership is reconciled for resumed sessions, preserving proven-session scoping (#3280, #3290, #3214).
+- **Root session self-reopen prevention** — root sessions are prevented from self-reopening (#3284, #3289).
+- **Native hook trust and path canonicalization** — exact absolute package CLI status is trusted (#3333; issues #3320, #3322, #3323, #3325, #3321, #3327), conductor mutation roots are canonicalized, macOS policy paths and temporary fixture roots are canonicalized, and planning state transport guards are repaired (#3343, #3344, #3348, #3349, #3350, #3351, #3352, #3353).
+- **Identity-indeterminate pointer recovery** — bounded exact-match recovery resolves identity-indeterminate session pointers (#3324, #3332).
+- **Ultragoal goal-status and state binding** — native Codex goal blocked status is preserved (#3301, #3305), aggregate goals are bound to canonical state paths (#3294, #3297), aggregate completion is persisted on ordinary final checkpoint (#3295), and finite Codex goal tools are authorized under Main-root Conductor (#3300, #3304).
+- **State authoritative root and alias resolution** — verified native session aliases are resolved (#3308, #3160), and durable state commits are revalidated against exact stale session bindings (#3272, #3298).
+- **Deep-interview cancel and self-lock** — the deep-interview omx cancel hook is made hook-owned (#3293, #3299), and the PreToolUse self-lock is fixed (#3240).
+- **HUD teardown and resize guards** — detached HUD is torn down on child exit (#3267), and deferred HUD resize sinks are guarded in command-list context (#3292, #3296).
+- **Native Stop hook bounds** — sloppy fallback Stop audit is bounded and session-scoped (#3347), native Stop hook pointer loops are bounded (#3238), paused Stop guidance is bounded (#3237), and unmatched native Stop is silenced (#3254).
+- **Native sidecar and collaboration authority** — native sidecar session authority is scoped during pointer conflicts (#3244), live session pointers are prevented from native-start replacement (#3235), collaboration tool names are canonicalized (#3264), and collaboration.send_message is scoped out of native-child orchestration deny (#3317).
+- **Standalone Conductor activation guard** — standalone Ultragoal Conductor activation with no reachable owner is refused (#3311, #3312).
+- **Unauthoritative plan bootstrap rejection** — unauthoritative Ultragoal bootstrap publication is rejected (#3326).
+- **Read-only discovery misclassification** — omx/gjc read-only discovery is no longer misclassified as writes (#3313, #3314, #3318).
+- **Auth metadata validation and credential switch** — metadata is validated before credential switch (#3276).
+- **Oversized native hook stdin** — oversized native hook stdin is drained (#3273).
+- **Nonexistent native assignment guidance** — nonexistent native assignment guidance is removed (#3346).
+- **Windows session owner PID** — Windows native hook session owner PID is resolved (#3260).
+- **Bun install ownership** — Bun install ownership is preserved during update (#3259).
+- **tmux separator argv boundaries** — tmux separator argv boundaries are preserved (#3258).
+- **Ralplan preflight guidance** — Ralplan preflight guidance is scoped (#3255).
+
 ## [0.20.3] - 2026-07-19
 
 Patch release for the reliability and workflow-safety work in `v0.20.2..f967cfed64ec57614af136f75d7cb81509808f7e`, plus one additive, backward-compatible feature. No intentional breaking CLI or package-layout changes.
@@ -16,6 +52,9 @@ Patch release for the reliability and workflow-safety work in `v0.20.2..f967cfed
 
 - **Team exact live-pane authority** — Team validates exact live tmux panes before applying explicit lifecycle effects, binds pane ownership through startup, scaling, rollback, recovery, and teardown, makes membership and scaling transactions durable and failure-atomic, and binds notify dispatch to the owning worker pane pid (#3153; issue #3121).
 - **Ralplan review integrity** — Ralplan requires strict direct review order (#3186), fails closed without documented leader proof (#3196; issue #3194), attests the reconciled leader in `PreToolUse` to close the live-exec regression (#3187; issue #3181), and resolves the App leader-proof regression by parsing collaboration results structurally (#3218; issue #3204).
+
+> **Current status / supersession (ADR 3212):** Local leader attestation and adapted role intent no longer authorize. Typed routing/tracker evidence are lifecycle/diagnostic only. On `role_routing_unavailable` adapted Ralplan authority attempts, installed role-intent/preflight fails closed with `unsupported_documented_leader_proof`. Consensus is unavailable with `documented_host_consensus_receipt_unavailable` absent an official host receipt.
+
 - **Team mailbox and session recovery** — mailbox wakeups are coalesced and every wake is acknowledged (#3217; issue #3195), and exact session pointer lock recovery is added (#3215; issue #3203).
 - **Native hook write identity** — native child write identity is hardened across the native hook, code-intel, and wiki MCP surfaces (#3135; issue #3127).
 - **Configuration trust tables** — the config generator reconciles duplicate project trust tables idempotently (#3201; issue #3199).
@@ -44,6 +83,8 @@ Patch release for the reliability and workflow-safety work in `v0.20.1..f5e47531
 
 - **Authenticated Ralplan bootstrap** — a fresh authenticated App leader can create a Ralplan role intent in-turn, with durable leader attestation, atomic single-flight intent recording, recovery, and fail-closed subagent/provenance checks (#3184; issue #3181).
 - **Native subagents and hooks** — App `spawn_agent` uses a surface-aware role contract; adapted role routing is transactionally bound to tracker evidence and markers, including crash recovery and cross-process lock-artifact cleanup (#3152, #3166; issue #3118). Recognized native subagents can stop without an unwanted automatic nudge (#3180).
+
+> **Current status / supersession (ADR 3212; applies to the authority claims above):** Local leader attestation and adapted role intent no longer authorize. Typed routing/tracker evidence are lifecycle/diagnostic only. On `role_routing_unavailable` adapted Ralplan authority attempts, installed role-intent/preflight fails closed with `unsupported_documented_leader_proof`. Consensus is unavailable with `documented_host_consensus_receipt_unavailable` absent an official host receipt.
 - **Workflow activation and terminal state** — workflow activation requires an explicit prompt-leading invocation, avoiding quoted, negated, documented, or malformed mentions (#3140; issue #3133); authenticated deep-interview terminal writes are accepted (#3179; issue #3177).
 - **Session, state, and notification isolation** — prompt session provenance is isolated across concurrent chats (#3168), fallback notification delivery is deduplicated across processes (#3165; issue #3162), canonical Ralplan session ownership rejects ambiguous aliases (#3158), and foreign stale workflow-transition mirrors are ignored (#3172).
 - **Setup and runtime environment** — setup persists an explicit root-local `AGENTS.md` merge policy across refreshes while retaining absence semantics and transient `--force` behavior (#3164; issue #3163); explicit Team worker policy is validated before tmux startup (#3136); detached panes retain their tmux-owned terminal environment (#3183; issue #3175); BOM-prefixed state input files are accepted (#3169).

@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { resolve } from 'node:path';
 
-export type CodexGoalSnapshotStatus = 'active' | 'complete' | 'cancelled' | 'failed' | 'unknown';
+export type CodexGoalSnapshotStatus = 'active' | 'complete' | 'cancelled' | 'failed' | 'blocked' | 'unknown';
 
 export interface CodexGoalSnapshot {
   available: boolean;
@@ -45,12 +45,13 @@ function safeNumber(value: unknown): number | undefined {
 }
 
 function normalizeStatus(value: unknown): CodexGoalSnapshotStatus {
-  const status = safeString(value).toLowerCase();
-  if (status === 'complete' || status === 'completed' || status === 'done') return 'complete';
-  if (status === 'cancelled' || status === 'canceled') return 'cancelled';
-  if (status === 'failed' || status === 'failure') return 'failed';
-  if (status === 'active' || status === 'in_progress' || status === 'pending' || status === 'running') return 'active';
-  return 'unknown';
+	const status = safeString(value).toLowerCase();
+	if (status === 'complete' || status === 'completed' || status === 'done') return 'complete';
+	if (status === 'cancelled' || status === 'canceled') return 'cancelled';
+	if (status === 'failed' || status === 'failure') return 'failed';
+	if (status === 'blocked') return 'blocked';
+	if (status === 'active' || status === 'in_progress' || status === 'pending' || status === 'running') return 'active';
+	return 'unknown';
 }
 
 function normalizeObjective(value: string): string {

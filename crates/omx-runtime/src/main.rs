@@ -123,6 +123,7 @@ fn run() -> Result<(), String> {
             );
             Ok(())
         }
+        Some("fs-rename-no-replace") => run_fs_rename_no_replace(&args[1..]),
         Some("init") => {
             let dir = second.ok_or("init requires a state directory path")?;
             let engine = RuntimeEngine::new().with_state_dir(dir);
@@ -134,12 +135,112 @@ fn run() -> Result<(), String> {
     }
 }
 
+#[derive(Debug, Clone, Copy)]
+enum FsRenameOutcome {
+    Moved,
+    NotMoved,
+    Unsupported(&'static str),
+}
+
+fn run_fs_rename_no_replace(args: &[String]) -> Result<(), String> {
+    if args.len() != 2 {
+        return Err("fs-rename-no-replace requires exactly <from> and <to> paths".to_string());
+    }
+
+    let from = validate_absolute_path(&args[0], "from")?;
+    let to = validate_absolute_path(&args[1], "to")?;
+    let outcome = fs_rename_no_replace(&from, &to)?;
+    let json = match outcome {
+        FsRenameOutcome::Moved => serde_json::json!({ "outcome": "moved" }),
+        FsRenameOutcome::NotMoved => {
+            serde_json::json!({ "outcome": "not-moved", "code": "EEXIST" })
+        }
+        FsRenameOutcome::Unsupported(code) => {
+            serde_json::json!({ "outcome": "unsupported", "code": code })
+        }
+    };
+    println!(
+        "{}",
+        serde_json::to_string(&json).map_err(|error| error.to_string())?
+    );
+    Ok(())
+}
+
+fn validate_absolute_path(raw: &str, name: &str) -> Result<std::ffi::CString, String> {
+    if raw.is_empty() {
+        return Err(format!("{name} path must be a non-empty absolute path"));
+    }
+    if !std::path::Path::new(raw).is_absolute() {
+        return Err(format!("{name} path must be absolute"));
+    }
+    std::ffi::CString::new(raw.as_bytes())
+        .map_err(|_| format!("{name} path contains an embedded NUL byte"))
+}
+
+#[cfg(target_os = "linux")]
+fn fs_rename_no_replace(
+    from: &std::ffi::CString,
+    to: &std::ffi::CString,
+) -> Result<FsRenameOutcome, String> {
+    let result = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            from.as_ptr(),
+            libc::AT_FDCWD,
+            to.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        return Ok(FsRenameOutcome::Moved);
+    }
+
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EEXIST) => Ok(FsRenameOutcome::NotMoved),
+        Some(libc::ENOSYS) => Ok(FsRenameOutcome::Unsupported("ENOSYS")),
+        Some(libc::EINVAL) => Ok(FsRenameOutcome::Unsupported("EINVAL")),
+        Some(libc::ENOTSUP) => Ok(FsRenameOutcome::Unsupported("ENOTSUP")),
+        Some(code) => Err(format!("renameat2 failed with errno {code}: {error}")),
+        None => Err(format!("renameat2 failed: {error}")),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn fs_rename_no_replace(
+    from: &std::ffi::CString,
+    to: &std::ffi::CString,
+) -> Result<FsRenameOutcome, String> {
+    let result = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
+    if result == 0 {
+        return Ok(FsRenameOutcome::Moved);
+    }
+
+    let error = std::io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::EEXIST) => Ok(FsRenameOutcome::NotMoved),
+        Some(libc::ENOSYS) => Ok(FsRenameOutcome::Unsupported("ENOSYS")),
+        Some(libc::EINVAL) | Some(libc::ENOTSUP) => Ok(FsRenameOutcome::Unsupported("ENOTSUP")),
+        Some(code) => Err(format!("renamex_np failed with errno {code}: {error}")),
+        None => Err(format!("renamex_np failed: {error}")),
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn fs_rename_no_replace(
+    _from: &std::ffi::CString,
+    _to: &std::ffi::CString,
+) -> Result<FsRenameOutcome, String> {
+    Ok(FsRenameOutcome::Unsupported("platform"))
+}
+
 fn print_usage() {
     println!(concat!(
         "usage: omx-runtime <command> [options]\n",
         "\n",
         "commands:\n",
         "  schema [--json]                     print the runtime contract summary\n",
+        "  fs-rename-no-replace <from> <to>       atomically move without replacing destination\n",
         "  snapshot [--json] [--state-dir=DIR]  print a runtime snapshot\n",
         "  mux-contract                        print the mux boundary summary\n",
         "  exec <json> [--state-dir=DIR]       process a runtime command from JSON\n",

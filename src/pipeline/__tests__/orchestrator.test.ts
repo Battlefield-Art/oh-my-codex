@@ -14,6 +14,8 @@ import {
   createStrictAutopilotStages,
 } from '../orchestrator.js';
 import { createRalplanStage } from '../stages/ralplan.js';
+import { shouldBlockFreshAutopilotForRalplanReceipt } from '../../ralplan/consensus-gate.js';
+
 import type { PipelineConfig, PipelineStage, StageContext, StageResult } from '../types.js';
 
 // ---------------------------------------------------------------------------
@@ -300,10 +302,10 @@ describe('Pipeline Orchestrator', () => {
       assert.equal(result.status, 'failed');
       assert.equal(result.failedStage, 'ralplan');
       assert.equal(ralplanRuns, 2);
-      assert.equal(result.stageResults.ralplan.error, 'ralplan_consensus_evidence_missing');
+      assert.equal(result.stageResults.ralplan.error, 'documented_host_consensus_receipt_unavailable');
     });
 
-    it('returns to ralplan rather than deep-interview after default quality-gate failures', async () => {
+    it('stops at ralplan before default quality gates when the host receipt is unavailable', async () => {
       const order: string[] = [];
       let qaRuns = 0;
       const stages: PipelineStage[] = [
@@ -345,27 +347,21 @@ describe('Pipeline Orchestrator', () => {
         },
       ];
 
-      const result = await runPipeline({
-        name: 'default-quality-loop-test',
-        task: 'loop until QA clean',
-        stages,
-        cwd: tempDir,
-        maxRalphIterations: 3,
-      });
-
-      assert.equal(result.status, 'completed');
+      await assert.rejects(
+        () => runPipeline({
+          name: 'default-quality-loop-test',
+          task: 'loop until QA clean',
+          stages,
+          cwd: tempDir,
+          maxRalphIterations: 3,
+        }),
+        /documented_host_consensus_receipt_unavailable/,
+      );
       assert.deepEqual(order, [
         'deep-interview:skip-check',
         'ralplan',
-        'ultraqa',
-        'ralplan',
-        'ultraqa',
       ]);
-
-      const ext = await readPipelineState(tempDir);
-      assert.equal(ext?.review_cycle, 1);
-      assert.equal((ext?.qa_verdict as { clean?: boolean } | undefined)?.clean, true);
-      assert.equal(ext?.return_to_ralplan_reason, null);
+      assert.equal(qaRuns, 0);
     });
 
     it('fails after bounded non-clean code-review cycles', async () => {
@@ -398,7 +394,7 @@ describe('Pipeline Orchestrator', () => {
     });
 
 
-    it('final completion write replaces stale BLOCK verdict state with clean artifacts', async () => {
+    it('does not reach final completion cleanup when ralplan lacks a host receipt', async () => {
       let reviewRuns = 0;
       const stages: PipelineStage[] = [
         makeStage('ralplan', { artifacts: { plan: 'approved' } }),
@@ -437,28 +433,16 @@ describe('Pipeline Orchestrator', () => {
         }),
       ];
 
-      const result = await runPipeline({
-        name: 'stale-block-finalization',
-        task: 'finalization replaces stale blockers',
-        stages,
-        cwd: tempDir,
-      });
-
-      assert.equal(result.status, 'completed');
-      assert.equal(reviewRuns, 2);
-      const ext = await readPipelineState(tempDir);
-      const modeState = await readModeState('autopilot', tempDir);
-      assert.equal(modeState?.active, false);
-      assert.equal(modeState?.current_phase, 'complete');
-      assert.equal((ext?.review_verdict as { recommendation?: string } | undefined)?.recommendation, 'APPROVE');
-      assert.equal((ext?.review_verdict as { architectural_status?: string } | undefined)?.architectural_status, 'CLEAR');
-      assert.equal((ext?.review_verdict as { clean?: boolean } | undefined)?.clean, true);
-      assert.equal((ext?.qa_verdict as { clean?: boolean } | undefined)?.clean, true);
-      assert.equal(ext?.return_to_ralplan_reason, null);
-      assert.ok(ext?.handoff_artifacts?.code_review, 'clean code-review artifact should be preserved in terminal state');
-      assert.ok(ext?.handoff_artifacts?.ultraqa, 'clean ultraqa artifact should be preserved in terminal state');
-      assert.equal((ext?.pipeline_stage_results as Record<string, unknown> | undefined)?.['code-review'] !== undefined, true);
-      assert.equal((ext?.pipeline_stage_results as Record<string, unknown> | undefined)?.ultraqa !== undefined, true);
+      await assert.rejects(
+        () => runPipeline({
+          name: 'stale-block-finalization',
+          task: 'finalization replaces stale blockers',
+          stages,
+          cwd: tempDir,
+        }),
+        /documented_host_consensus_receipt_unavailable/,
+      );
+      assert.equal(reviewRuns, 0);
     });
 
     it('passes artifacts between stages', async () => {
@@ -564,7 +548,7 @@ describe('Pipeline Orchestrator', () => {
       assert.ok(ran.includes('after-skip'));
     });
 
-    it('materializes ralplan consensus handoff artifacts when ralplan is skipped', async () => {
+    it('persists a blocked ralplan lifecycle artifact without advancing when the host receipt is unavailable', async () => {
       const plansDir = join(tempDir, '.omx', 'plans');
       const stateDir = join(tempDir, '.omx', 'state');
       await mkdir(plansDir, { recursive: true });
@@ -576,6 +560,7 @@ describe('Pipeline Orchestrator', () => {
         current_phase: 'complete',
         planning_complete: true,
         ralplan_consensus_gate: {
+          documented_host_consensus_receipt: { issuer: 'official-host', verdict: 'approve' },
           complete: true,
           ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', sequence_index: 1, summary: 'architect ok' },
           ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', sequence_index: 2, summary: 'critic ok' },
@@ -589,20 +574,82 @@ describe('Pipeline Orchestrator', () => {
         cwd: tempDir,
       });
 
-      assert.equal(result.status, 'completed');
-      assert.equal(result.stageResults.ralplan.status, 'skipped');
+      assert.equal(result.status, 'failed');
+      assert.equal(result.stageResults.ralplan.status, 'failed');
+      assert.equal(result.stageResults.ralplan.error, 'documented_host_consensus_receipt_unavailable');
+      assert.equal(result.stageResults.after, undefined);
 
       const ext = await readPipelineState(tempDir);
-      const handoffs = ext?.handoff_artifacts as Record<string, unknown>;
-      assert.ok(handoffs.ralplan, 'skipped ralplan handoff should remain visible');
-      assert.deepEqual(handoffs.ralplan_consensus_gate, {
-        complete: true,
+      const handoffs = ext?.handoff_artifacts as Record<string, unknown> | undefined;
+      const persistedRalplan = handoffs?.ralplan as { ralplanConsensusGate?: { complete?: boolean; blockedReason?: string } } | undefined;
+      assert.equal(persistedRalplan?.ralplanConsensusGate?.complete, false);
+      assert.equal(persistedRalplan?.ralplanConsensusGate?.blockedReason, 'documented_host_consensus_receipt_unavailable');
+      const gate = result.stageResults.ralplan.artifacts.ralplanConsensusGate as { complete?: boolean; blockedReason?: string; ralplan_architect_review?: unknown; ralplan_critic_review?: unknown };
+      assert.equal(gate.complete, false);
+      assert.equal(gate.blockedReason, 'documented_host_consensus_receipt_unavailable');
+      assert.ok(gate.ralplan_architect_review);
+      assert.ok(gate.ralplan_critic_review);
+    });
+
+    it('does not advance a completed Ralplan result with a host-receipt blocker into execution', async () => {
+      const executionAttempts: string[] = [];
+      const blockedGate = {
+        complete: false,
         sequence: ['architect-review', 'critic-review'],
-        ralplan_architect_review: { agent_role: 'architect', verdict: 'approve', sequence_index: 1, summary: 'architect ok' },
-        ralplan_critic_review: { agent_role: 'critic', verdict: 'approve', sequence_index: 2, summary: 'critic ok' },
-        source: join(tempDir, '.omx', 'state', 'ralplan-state.json'),
-        blockedReason: null,
+        ralplan_architect_review: { agent_role: 'architect', verdict: 'approve' },
+        ralplan_critic_review: { agent_role: 'critic', verdict: 'approve' },
+        source: 'runtime-result',
+        blockedReason: 'documented_host_consensus_receipt_unavailable',
+      };
+      const result = await runPipeline({
+        name: 'ralplan-host-receipt-blocker',
+        task: 'do not execute without host receipt',
+        stages: [
+          makeStage('ralplan', { artifacts: { ralplanConsensusGate: blockedGate }, error: 'generic materialization failure' }, { canSkip: () => true }),
+          {
+            name: 'ultragoal',
+            async run(): Promise<StageResult> {
+              executionAttempts.push('ultragoal');
+              return { status: 'completed', artifacts: {}, duration_ms: 0 };
+            },
+          },
+          {
+            name: 'ultraqa',
+            async run(): Promise<StageResult> {
+              executionAttempts.push('ultraqa');
+              return { status: 'completed', artifacts: {}, duration_ms: 0 };
+            },
+          },
+        ],
+        cwd: tempDir,
       });
+
+      assert.equal(result.status, 'failed');
+      assert.equal(result.failedStage, 'ralplan');
+      assert.equal(result.error, 'documented_host_consensus_receipt_unavailable');
+      assert.equal(result.stageResults.ralplan.status, 'failed');
+      assert.equal(result.stageResults.ralplan.error, 'documented_host_consensus_receipt_unavailable');
+      assert.deepEqual(result.stageResults.ralplan.artifacts.documented_host_consensus_receipt_diagnostic, { prior_error: 'generic materialization failure' });
+      assert.equal(result.stageResults.ultragoal, undefined);
+      assert.equal(result.stageResults.ultraqa, undefined);
+      assert.deepEqual(executionAttempts, []);
+
+      const ext = await readPipelineState(tempDir);
+      const handoffs = ext?.handoff_artifacts as Record<string, unknown> | undefined;
+      assert.deepEqual((handoffs?.ralplan as { ralplanConsensusGate?: unknown } | undefined)?.ralplanConsensusGate, blockedGate);
+    });
+    it('surfaces the host-receipt blocker over a generic executed Ralplan error', async () => {
+      const blockedGate = { blocked_reason: 'documented_host_consensus_receipt_unavailable' };
+      const result = await runPipeline({
+        name: 'ralplan-executed-host-receipt-blocker',
+        task: 'preserve the exact host receipt blocker',
+        stages: [makeStage('ralplan', { status: 'failed', artifacts: { ralplan_consensus_gate: blockedGate }, error: 'generic runtime failure' })],
+        cwd: tempDir,
+      });
+      assert.equal(result.status, 'failed');
+      assert.equal(result.error, 'documented_host_consensus_receipt_unavailable');
+      assert.equal(result.stageResults.ralplan.error, 'documented_host_consensus_receipt_unavailable');
+      assert.deepEqual(result.stageResults.ralplan.artifacts.documented_host_consensus_receipt_diagnostic, { prior_error: 'generic runtime failure' });
     });
 
     it('fires onStageTransition callback', async () => {
@@ -854,6 +901,97 @@ describe('Pipeline Orchestrator', () => {
     it('does not throw when no state exists', async () => {
       await assert.doesNotReject(() => cancelPipeline(tempDir));
     });
+  });
+
+  it('byte-preserves an active non-primary Autopilot session without running pipeline work', async () => {
+    const sessionId = 'non-primary-active-autopilot';
+    const sessionDir = join(tempDir, '.omx', 'state', 'sessions', sessionId);
+    const statePath = join(sessionDir, 'autopilot-state.json');
+    const rawState = '{"active":true,"mode":"autopilot","current_phase":"ralplan","metadata":{"owner":"existing"},"handoff_artifacts":{"ralplan":{"path":".omx/plans/existing.md"}}}\n';
+    await mkdir(sessionDir, { recursive: true });
+    await writeFile(statePath, rawState);
+    let stageRuns = 0;
+    let transitions = 0;
+    const config = createAutopilotPipelineConfig('preserve active session', {
+      cwd: tempDir,
+      sessionId,
+      stages: [{
+        name: 'deep-interview',
+        async run(): Promise<StageResult> {
+          stageRuns += 1;
+          return { status: 'completed', artifacts: {}, duration_ms: 0 };
+        },
+      }],
+      onStageTransition: () => { transitions += 1; },
+    });
+
+    const result = await runPipeline(config);
+
+    assert.equal(result.status, 'cancelled');
+    assert.deepEqual(result.artifacts, { active_autopilot_session_preserved: true });
+    assert.equal(stageRuns, 0);
+    assert.equal(transitions, 0);
+    assert.equal(await readFile(statePath, 'utf-8'), rawState);
+  });
+
+  it('does not borrow conflicting root Autopilot state for a fresh explicit session', async () => {
+    const sessionId = 'fresh-explicit-session';
+    const stateDir = join(tempDir, '.omx', 'state');
+    const rootPath = join(stateDir, 'autopilot-state.json');
+    const sessionPath = join(stateDir, 'sessions', sessionId, 'autopilot-state.json');
+    const rawRoot = '{"active":true,"mode":"autopilot","current_phase":"ralplan","metadata":{"owner":"root"}}\n';
+    await mkdir(stateDir, { recursive: true });
+    await writeFile(rootPath, rawRoot);
+
+    let stageRuns = 0;
+    const result = await runPipeline(createAutopilotPipelineConfig('fresh explicit session', {
+      cwd: tempDir,
+      sessionId,
+      stages: [{
+        name: 'deep-interview',
+        async run(): Promise<StageResult> {
+          stageRuns += 1;
+          return { status: 'completed', artifacts: {}, duration_ms: 0 };
+        },
+      }],
+    }));
+
+    assert.equal(result.status, 'failed');
+    assert.equal(result.error, 'documented_host_consensus_receipt_unavailable');
+    assert.equal(stageRuns, 0);
+    assert.equal(await readFile(rootPath, 'utf-8'), rawRoot);
+    const sessionState = JSON.parse(await readFile(sessionPath, 'utf-8')) as { active?: boolean; current_phase?: string };
+    assert.equal(sessionState.active, false);
+    assert.equal(sessionState.current_phase, 'failed');
+  });
+
+  it('preflights a fresh default Autopilot before any stage or transition callback when receipt verification is unavailable', async () => {
+    let stageRuns = 0;
+    let transitions = 0;
+    const result = await runPipeline(createAutopilotPipelineConfig('preflight receipt verification', {
+      cwd: tempDir,
+      stages: [{
+        name: 'deep-interview',
+        async run(): Promise<StageResult> {
+          stageRuns += 1;
+          return { status: 'completed', artifacts: {}, duration_ms: 0 };
+        },
+      }],
+      onStageTransition: () => { transitions += 1; },
+    }));
+
+    assert.equal(result.status, 'failed');
+    assert.equal(result.error, 'documented_host_consensus_receipt_unavailable');
+    assert.equal(stageRuns, 0);
+    assert.equal(transitions, 0);
+    const state = await readModeState('autopilot', tempDir);
+    assert.equal(state?.active, false);
+    assert.equal(state?.current_phase, 'failed');
+    assert.equal(state?.error, 'documented_host_consensus_receipt_unavailable');
+  });
+
+  it('does not preflight-block the future verifier-capable path', () => {
+    assert.equal(shouldBlockFreshAutopilotForRalplanReceipt('available'), false);
   });
 
   describe('createAutopilotPipelineConfig', () => {

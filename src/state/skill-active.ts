@@ -1,13 +1,14 @@
 import { existsSync } from 'fs';
 import { mkdir, readFile, readdir, unlink, writeFile } from 'fs/promises';
 import { dirname, join } from 'path';
-import { getBaseStateDir } from '../mcp/state-paths.js';
+import { getBaseStateDir, type BeforeWritableCommit } from '../mcp/state-paths.js';
 import { isTerminalRunOutcome, normalizeRunOutcome, normalizeTerminalLifecycleOutcome } from '../runtime/run-outcome.js';
 import {
   assertWorkflowTransitionAllowed,
   isTrackedWorkflowMode,
   pickPrimaryWorkflowMode,
 } from './workflow-transition.js';
+import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-preflight.js';
 
 export const SKILL_ACTIVE_STATE_MODE = 'skill-active';
 export const SKILL_ACTIVE_STATE_FILE = `${SKILL_ACTIVE_STATE_MODE}-state.json`;
@@ -71,6 +72,7 @@ export interface SyncCanonicalSkillStateOptions {
   nowIso?: string;
   source?: string;
   allSessions?: boolean;
+  beforeCommit?: BeforeWritableCommit;
 }
 
 function safeString(value: unknown): string {
@@ -316,7 +318,9 @@ export function getSkillActiveStatePathsForStateDir(stateDir: string, sessionId?
 
 export async function readSkillActiveState(path: string): Promise<SkillActiveStateLike | null> {
   try {
-    return normalizeSkillActiveState(JSON.parse(await readFile(path, 'utf-8')));
+    const canonical = JSON.parse(await readFile(path, 'utf-8'));
+    const overlay = await readNeutralizedRoutingOverlay(path, 'skill');
+    return normalizeSkillActiveState(overlay ?? canonical);
   } catch {
     return null;
   }
@@ -337,9 +341,10 @@ export async function writeSkillActiveStateCopiesForStateDir(
   state: SkillActiveStateLike,
   sessionId?: string,
   rootState?: SkillActiveStateLike | null,
+  options: { beforeCommit?: BeforeWritableCommit } = {},
 ): Promise<void> {
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
-  await writeSkillActiveStateCopiesToPaths(rootPath, sessionPath, state, rootState);
+  await writeSkillActiveStateCopiesToPaths(rootPath, sessionPath, state, rootState, options.beforeCommit);
 }
 
 async function writeSkillActiveStateCopiesToPaths(
@@ -347,6 +352,7 @@ async function writeSkillActiveStateCopiesToPaths(
   sessionPath: string | undefined,
   state: SkillActiveStateLike,
   rootState?: SkillActiveStateLike | null,
+  beforeCommit?: BeforeWritableCommit,
 ): Promise<void> {
   const normalized = { version: 1, ...state };
   const normalizedRoot = rootState === null
@@ -355,12 +361,14 @@ async function writeSkillActiveStateCopiesToPaths(
   if (normalizedRoot !== null) {
     const rootPayload = JSON.stringify(normalizedRoot, null, 2);
     await mkdir(dirname(rootPath), { recursive: true });
+    await beforeCommit?.({ site: 'skill-active.root-copy', kind: 'write', path: rootPath });
     await writeFile(rootPath, rootPayload);
   }
 
   if (sessionPath) {
     const sessionPayload = JSON.stringify(normalized, null, 2);
     await mkdir(dirname(sessionPath), { recursive: true });
+    await beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
     await writeFile(sessionPath, sessionPayload);
   }
 }
@@ -511,7 +519,9 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
         mode,
         normalizedSessionId,
       );
-    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState);
+    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState, {
+      beforeCommit: options.beforeCommit,
+    });
     return;
   }
 
@@ -538,7 +548,9 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     : [...sessionScopedRootMirrorEntries, ...nextRootScopedEntries];
 
   const nextRootState = applyEntriesToState(existingRoot, nextRootEntries, mode);
-  await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextRootState, undefined, nextRootState);
+  await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextRootState, undefined, nextRootState, {
+    beforeCommit: options.beforeCommit,
+  });
 
   const sessionsDir = join(baseStateDir, 'sessions');
   if (!existsSync(sessionsDir)) return;
@@ -559,7 +571,10 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     const nextSessionEntries = [...nextVisibleRootEntries, ...sessionOnlyEntries];
 
     if (nextSessionEntries.length === 0) {
-      await unlink(sessionPath).catch(() => {});
+      await options.beforeCommit?.({ site: 'skill-active.session-unlink', kind: 'unlink', path: sessionPath });
+      await unlink(sessionPath).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== 'ENOENT') throw error;
+      });
       continue;
     }
 
@@ -569,6 +584,8 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
       nextSessionEntries[0]?.skill || mode,
       sessionId,
     );
-    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState);
+    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState, {
+      beforeCommit: options.beforeCommit,
+    });
   }
 }

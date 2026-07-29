@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
 
-import { ralplanCommand, type RalplanCommandDependencies } from '../ralplan.js';
+import { RALPLAN_HELP, ralplanCommand, type RalplanCommandDependencies } from '../ralplan.js';
 
 async function invoke(args: string[], deps: RalplanCommandDependencies = {}) {
   const stdout: string[] = [];
@@ -17,19 +17,27 @@ async function invoke(args: string[], deps: RalplanCommandDependencies = {}) {
 }
 
 describe('#3194 ralplan CLI unsupported-only surface', () => {
-  it('fails the explicit adapted-surface preflight and neutralizes routing-only Ralplan state', async () => {
+  it('documents only fail-closed adapted-authority diagnostics', () => {
+    assert.match(RALPLAN_HELP, /fail-closed adapted-authority diagnostics/);
+    assert.match(RALPLAN_HELP, /Required only when native role routing is unavailable and adapted Ralplan authority is requested/);
+    assert.match(RALPLAN_HELP, /Ordinary work remains under its own workflow gates/);
+    assert.match(RALPLAN_HELP, /Compatibility diagnostic only: installed roles are denied with unsupported_documented_leader_proof/);
+    assert.doesNotMatch(RALPLAN_HELP, /validated role intents/i);
+  });
+  it('fails the explicit adapted-surface preflight without unproven mutation', async () => {
     let resolved = false;
-    let cancelled = false;
+    let neutralized = false;
     const result = await invoke(['preflight', '--json'], {
       resolveInstalledRoleName: () => { resolved = true; return 'architect'; },
-      cancelRalplan: async () => { cancelled = true; },
+      neutralizeOwnedRoutingRalplan: async () => { neutralized = true; return false; },
     });
     assert.equal(result.exitCode, 1);
     assert.equal(resolved, false);
-    assert.equal(cancelled, true);
+    assert.equal(neutralized, true);
     assert.deepEqual(result.stderr, []);
     assert.deepEqual(JSON.parse(result.stdout.join('\n')), { ok: false, reason: 'unsupported_documented_leader_proof' });
   });
+
   it('validates malformed arguments before resolving a role', async () => {
     let resolved = false;
     await assert.rejects(() => invoke(['role-intent', 'write', '--role', 'architect', '--json'], {
@@ -38,18 +46,17 @@ describe('#3194 ralplan CLI unsupported-only surface', () => {
     assert.equal(resolved, false);
   });
 
-  it('returns unknown_role for a syntactically valid uninstalled role', async () => {
-    const result = await invoke(['role-intent', 'write', '--role', 'synthetic-unknown', '--parent-thread', 'synthetic-parent', '--json'], {
+  it('keeps unknown-role precedence without consulting an authority state source', async () => {
+    const result = await invoke(['role-intent', 'write', '--role', 'synthetic-unknown', '--parent-thread', 'forged-parent', '--json'], {
       resolveInstalledRoleName: () => null,
     });
     assert.equal(result.exitCode, 1);
-    assert.deepEqual(result.stderr, []);
     assert.deepEqual(JSON.parse(result.stdout.join('\n')), { ok: false, reason: 'unknown_role' });
   });
 
-  it('denies installed roles before any runtime state dependency is consulted', async () => {
-    const result = await invoke(['role-intent', 'write', '--role', 'architect', '--parent-thread', 'synthetic-parent', '--session', 'synthetic-session', '--ttl-ms', '1', '--json'], {
-      resolveInstalledRoleName: (role) => role.toLowerCase() === 'architect' ? 'architect' : null,
+  it('denies an installed role without consulting forgeable authority state', async () => {
+    const result = await invoke(['role-intent', 'write', '--role', 'architect', '--parent-thread', 'forged-parent', '--session', 'forged-session', '--ttl-ms', '1', '--json'], {
+      resolveInstalledRoleName: (role) => role === 'architect' ? role : null,
     });
     assert.equal(result.exitCode, 1);
     assert.deepEqual(result.stderr, []);

@@ -51,6 +51,7 @@ describe('ultragoal docs contract', () => {
     assert.match(doc, /same branch\/worktree/i);
     assert.match(doc, /Active or incomplete wrong Codex goals remain strict mismatch errors/i);
     assert.match(doc, /must not be used to bypass active-goal mismatch protection/i);
+    assert.match(doc, /matching native Codex `blocked`|matching native Codex blocked|truthfully `blocked`/i);
   });
 
   it('documents the mandatory final cleanup and review gate', () => {

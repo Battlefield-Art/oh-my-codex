@@ -1,30 +1,6 @@
 import { realpathSync } from 'node:fs';
 import { basename, dirname, join, resolve } from 'node:path';
 
-export const NATIVE_SPAWN_TASK_NAME_PATTERN = /^[a-z0-9_]+$/;
-export const ROLE_INTENT_CORRELATION_TOKEN_PATTERN = /^[a-z0-9]+$/;
-export const ROLE_INTENT_SPAWN_TASK_NAME_PREFIX = 'omx_role_intent_';
-
-
-export function buildRoleIntentSpawnTaskName(correlationToken: string): string {
-  const normalizedCorrelationToken = correlationToken.trim();
-  if (!ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test(normalizedCorrelationToken)) {
-    throw new Error('Invalid role-intent correlation token.');
-  }
-  return `${ROLE_INTENT_SPAWN_TASK_NAME_PREFIX}${normalizedCorrelationToken}`;
-}
-
-export function isAppCompatibleSpawnTaskName(taskName: string): boolean {
-  return NATIVE_SPAWN_TASK_NAME_PATTERN.test(taskName);
-}
-
-export function parseRoleIntentCorrelationToken(taskName: unknown): string | undefined {
-  if (typeof taskName !== 'string') return undefined;
-  if (!taskName.startsWith(ROLE_INTENT_SPAWN_TASK_NAME_PREFIX)) return undefined;
-  const correlationToken = taskName.slice(ROLE_INTENT_SPAWN_TASK_NAME_PREFIX.length);
-  return ROLE_INTENT_CORRELATION_TOKEN_PATTERN.test(correlationToken) ? correlationToken : undefined;
-}
-
 // Canonical origin-workspace identity for adapted role-intent journals. Existing paths
 // resolve symlinks; nonexistent leaves retain their suffix beneath a canonical ancestor.
 export function canonicalizeOriginCwd(cwd: string | undefined): string | null {
@@ -151,7 +127,8 @@ export const LEADER_CONDUCTOR_UNSUPPORTED_NATIVE_DEGRADE_BLOCK = [
 export const LEADER_CONDUCTOR_ROLE_ROUTING_DEGRADE_BLOCK = [
   'Native role routing is unavailable in this environment.',
   'Do not fabricate agent_type or use adapted role intents, task-name carriers, markers, or prompt labels as authority.',
-  'Before Ralplan planner, reviewer, HUD, runtime, or delegation work, run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`.',
+  'When adapted Ralplan authority is requested, run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`.',
+  'Ordinary native sessions and ordinary work remain under their own workflow gates.',
   'Use a surface with installed typed agent_type routing or a reviewed alternative workflow.',
 ].join(' ');
 
@@ -352,6 +329,27 @@ function reasonFromCapabilityRecord(record: Record<string, unknown> | null): Nat
   return nativeSubagents === false ? 'native_subagents_unsupported' : 'multi_agent_v1_unavailable';
 }
 
+// Codex CLI can deliver the known dotted collaboration tool names in a
+// flattened form (the namespace dot is dropped), e.g. `collaboration.spawn_agent`
+// arrives as `collaborationspawn_agent`. Canonicalize ONLY the finite known
+// flattened names back to their dotted form so transport classification,
+// spawn/result recognition, and capability detection all key on one canonical
+// name. Unknown flattened names pass through unchanged and stay fail-closed.
+// Callers keep the original received name for diagnostics and persisted evidence.
+const FLATTENED_NATIVE_COLLABORATION_TOOL_NAMES: ReadonlyMap<string, string> = new Map([
+  ['collaborationspawn_agent', 'collaboration.spawn_agent'],
+  ['collaborationclose_agent', 'collaboration.close_agent'],
+  ['collaborationlist_agents', 'collaboration.list_agents'],
+  ['collaborationfollowup_task', 'collaboration.followup_task'],
+  ['collaborationwait_agent', 'collaboration.wait_agent'],
+  ['collaborationsend_message', 'collaboration.send_message'],
+  ['collaborationinterrupt_agent', 'collaboration.interrupt_agent'],
+]);
+
+export function canonicalizeNativeCollaborationToolName(name: string): string {
+  return FLATTENED_NATIVE_COLLABORATION_TOOL_NAMES.get(name) ?? name;
+}
+
 const NATIVE_SUBAGENT_SPAWN_TOOL_PATTERN = /(?:^|\.)spawn_agent$/;
 
 // Recognizes native delegation spawn tools across terminology drift: bare
@@ -359,13 +357,15 @@ const NATIVE_SUBAGENT_SPAWN_TOOL_PATTERN = /(?:^|\.)spawn_agent$/;
 // the current Codex App `collaboration.spawn_agent`, plus the legacy `task`
 // alias. The suffix anchor keeps `respawn_agent`/`spawn_agentx` from matching.
 export function isNativeSubagentSpawnToolName(name: string): boolean {
-  return NATIVE_SUBAGENT_SPAWN_TOOL_PATTERN.test(name) || name === 'task';
+  const canonical = canonicalizeNativeCollaborationToolName(name);
+  return NATIVE_SUBAGENT_SPAWN_TOOL_PATTERN.test(canonical) || canonical === 'task';
 }
 
 const NATIVE_SUBAGENT_RESULT_TOOL_PATTERN = /(?:^|\.)(?:spawn_agent|list_agents|followup_task|wait_agent)$/;
 
 export function isNativeSubagentResultToolName(name: string): boolean {
-  return NATIVE_SUBAGENT_RESULT_TOOL_PATTERN.test(name) || name === 'task';
+  const canonical = canonicalizeNativeCollaborationToolName(name);
+  return NATIVE_SUBAGENT_RESULT_TOOL_PATTERN.test(canonical) || canonical === 'task';
 }
 
 function availableToolsEvidence(payload: Record<string, unknown> | null): NativeSubagentSupportEvidence | null {

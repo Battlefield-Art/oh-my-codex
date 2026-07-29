@@ -1,7 +1,8 @@
 import { execFileSync } from "child_process";
 import { accessSync, closeSync, constants as fsConstants, existsSync, lstatSync, openSync, readFileSync, readSync, readdirSync, realpathSync, statSync } from "fs";
-import { appendFile, mkdir, readFile, readdir, stat, writeFile } from "fs/promises";
-import { basename, dirname, extname, isAbsolute, join, relative, resolve } from "path";
+import { appendFile, lstat, mkdir, open, readFile, readdir, stat, unlink, writeFile } from "fs/promises";
+import { basename, delimiter, dirname, extname, isAbsolute, join, relative, resolve } from "path";
+import { createHash } from "crypto";
 
 import { fileURLToPath, pathToFileURL } from "url";
 import { readModeStateForActiveDecision, readModeStateForSession, updateModeState } from "../modes/base.js";
@@ -17,13 +18,19 @@ import {
   type SkillActiveEntry,
 } from "../state/skill-active.js";
 import {
+  fenceNativeSubagentAuthorities,
+  forceGlobalAuthorityDenial,
+  consumeDirectChildReopenContext,
   isTrustedSubagentThread,
   readSubagentSessionSummary,
-  readSubagentSessionLedger,
   readSubagentTrackingState,
-  recordSubagentTurnForSession,
+  recordNativeSubagentAuthorityObservation,
+  repairPersistedRootIdentity,
+  quarantinePersistedRootAuthority,
+  revokeNativeSubagentAuthorities,
   resolveInstalledRoleName,
 } from "../subagents/tracker.js";
+
 import { readRoleRoutingMarker, writeRoleRoutingMarker } from "../subagents/role-routing-marker.js";
 import { evaluateCodex01445PreToolUse } from "../ralplan/documented-leader-preflight.js";
 import {
@@ -38,13 +45,16 @@ import {
   isSessionPointerLaunchAbort,
   isSessionStale,
   isSessionStateUsable,
+  isSessionStateAuthoritativeForCwd,
   normalizeSessionId,
+  readNativeSessionOwner,
   readSessionPointer,
   readSessionState,
   readUsableSessionState,
   reconcileNativeSessionStart,
   resolveSessionPointerContext,
   type SessionStartOptions,
+  writeNativeSessionOwner,
   type SessionState,
 } from "../hooks/session.js";
 import {
@@ -63,7 +73,13 @@ import {
   writeTeamLeaderAttention,
   writeTeamPhase,
 } from "../team/state.js";
-import { omxNotepadPath, resolveProjectMemoryPath } from "../utils/paths.js";
+import { parseTeamNoticeLedgerPrompt, reconcileTeamNoticeLedger } from "../team/notice-ledger.js";
+import {
+  canonicalizeComparablePath,
+  omxNotepadPath,
+  resolveProjectMemoryPath,
+  sameFilePath,
+} from "../utils/paths.js";
 import { findGitLayout } from "../utils/git-layout.js";
 import {
   getAuthoritativeActiveStatePaths,
@@ -94,6 +110,7 @@ import {
   SLOPPY_FALLBACK_PHRASE_PATTERNS,
   buildNativePostToolUseOutput,
   buildNativePreToolUseOutput,
+  classifyOmxQuestionPreToolUse,
   commandInvokesApplyPatch,
   detectMcpTransportFailure,
   hasAnyPattern,
@@ -128,11 +145,11 @@ import {
   authorizeConductorAction,
   buildRoleRoutingUnavailableGuidance,
   buildUnsupportedNativeSubagentGuidance,
+  canonicalizeNativeCollaborationToolName,
   classifyConductorArtifactKind,
   isNativeSubagentSpawnToolName,
   isRoleRoutingUnavailableEvidence,
   isUnsupportedNativeSubagentEvidence,
-  parseRoleIntentCorrelationToken,
   parseNativeSubagentResultDisposition,
   resolveNativeSubagentSupportStatus,
   type NativeSubagentUnsupportedReason,
@@ -207,6 +224,7 @@ const NATIVE_STOP_STATE_FILE = "native-stop-state.json";
 const NATIVE_SUBAGENT_CAPACITY_BLOCKER_FILE = "native-subagent-capacity-blocker.json";
 const NATIVE_SUBAGENT_CAPACITY_BLOCKER_TTL_MS = 30 * 60_000;
 const ORDINARY_STOP_NO_PROGRESS_DEFAULT_MAX_REPEATS = 8;
+const SLOPPY_FALLBACK_DIFF_STOP_DEFAULT_MAX_REPEATS = 3;
 const RALPH_ORPHANED_STARTING_STALE_MS = 15 * 60_000;
 const ORDINARY_STOP_NO_PROGRESS_DEFAULT_IDLE_MS = 10 * 60_000;
 const ORDINARY_STOP_NO_PROGRESS_MAX_MESSAGE_LENGTH = 240;
@@ -278,6 +296,7 @@ async function resolveVerifiedOwnerOmxSessionId(): Promise<string | undefined> {
 function isImplicitWritableScopeFailure(error: unknown): boolean {
   return error instanceof Error
     && (error.message === WRITABLE_STATE_SCOPE_ERRORS.unboundEnvironment
+      || error.message === WRITABLE_STATE_SCOPE_ERRORS.sessionBindingMismatch
       || error.message === WRITABLE_STATE_SCOPE_ERRORS.unusableSession);
 }
 
@@ -374,10 +393,11 @@ function shouldSuppressParentWorkflowStopForSideConversation(payload: CodexHookP
 
 interface NativeSubagentSessionStartMetadata {
   parentThreadId: string;
+  childSessionId?: string;
   agentNickname?: string;
   agentRole?: string;
-  correlationToken?: string;
 }
+
 
 
 function readBoundedFirstLineSync(path: string): string {
@@ -408,18 +428,7 @@ function readBoundedFirstLineSync(path: string): string {
   }
 }
 
-function selectAuthoritativeTaskName(
-  threadSpawn: unknown,
-  subagent: unknown,
-  payload: unknown,
-): { present: boolean; value: unknown } {
-  for (const obj of [threadSpawn, subagent, payload]) {
-    if (obj && typeof obj === "object" && "task_name" in obj) {
-      return { present: true, value: (obj as Record<string, unknown>).task_name };
-    }
-  }
-  return { present: false, value: undefined };
-}
+
 
 
 function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeSubagentSessionStartMetadata | null {
@@ -445,10 +454,7 @@ function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeS
       payload.agent_nickname ?? payload.agentNickname,
     ];
     const agentNickname = safeString(agentNicknameCarrierValues[0]).trim();
-    const authoritativeTaskName = selectAuthoritativeTaskName(threadSpawn, subagent, payload);
-    const correlationToken = authoritativeTaskName.present
-      ? parseRoleIntentCorrelationToken(authoritativeTaskName.value)
-      : undefined;
+
     const agentRole = safeString(
       threadSpawn.agent_role
         ?? threadSpawn.agentRole
@@ -461,15 +467,17 @@ function readNativeSubagentSessionStartMetadata(transcriptPath: string): NativeS
     ).trim();
     return {
       parentThreadId,
+      ...(safeString(payload.id).trim() ? { childSessionId: safeString(payload.id).trim() } : {}),
       ...(agentNickname ? { agentNickname } : {}),
       ...(agentRole ? { agentRole } : {}),
-      ...(correlationToken ? { correlationToken } : {}),
     };
+
 
   } catch {
     return null;
   }
 }
+
 
 async function recordNativeSubagentSessionStart(
   cwd: string,
@@ -477,6 +485,9 @@ async function recordNativeSubagentSessionStart(
   childSessionId: string,
   metadata: NativeSubagentSessionStartMetadata,
   transcriptPath: string,
+  rootNativeSessionId = "",
+  authorityEvidence: "valid" | "untrusted" | "absent" = "absent",
+  implicatedChildThreadIds: string[] = [],
 ): Promise<void> {
   const parentThreadId = metadata.parentThreadId.trim();
   const childThreadId = childSessionId.trim();
@@ -485,22 +496,33 @@ async function recordNativeSubagentSessionStart(
     canonicalSessionId.trim(),
     parentThreadId,
   ].filter(Boolean))];
-
-  for (const sessionId of trackingSessionIds) {
-    if (parentThreadId && parentThreadId !== childThreadId) {
-      await recordSubagentTurnForSession(cwd, {
-        sessionId,
-        threadId: parentThreadId,
-        kind: "leader",
-      }).catch(() => {});
-    }
-    await recordSubagentTurnForSession(cwd, {
-      sessionId,
-      threadId: childThreadId,
-      kind: "subagent",
-      ...(parentThreadId && parentThreadId !== childThreadId ? { leaderThreadId: parentThreadId } : {}),
+  let authorityTrackingFailed = false;
+  let authorityFenceFailed = false;
+  try {
+    recordNativeSubagentAuthorityObservation(cwd, {
+      sessionIds: trackingSessionIds,
+      childThreadId,
+      parentThreadId,
+      rootNativeSessionId,
+      authorityEvidence,
+      implicatedChildThreadIds,
       mode: metadata.agentRole,
-    }).catch(() => {});
+    });
+  } catch {
+    authorityTrackingFailed = true;
+    // A failed observation must not leave stale authority usable. Only a
+    // negative (untrusted) observation carries a revocation intent, so fence
+    // exactly those implicated ids until the revocation is durably applied.
+    // A conflicting VALID observation also revokes, so it must fence too.
+    if (authorityEvidence !== "absent") {
+      const fencedIds = [...new Set([childThreadId, ...implicatedChildThreadIds].filter(Boolean))];
+      authorityFenceFailed = !fenceNativeSubagentAuthorities(cwd, fencedIds, `${authorityEvidence}_revocation_failed`);
+      if (authorityFenceFailed) {
+        // Both the tracker denial and the locked fence failed. Escalate to a
+        // lock-free global denial so old authority cannot stay usable.
+        authorityFenceFailed = !forceGlobalAuthorityDenial(cwd, `${authorityEvidence}_denial_escalated`);
+      }
+    }
   }
   refreshNativeSubagentRoleRoutingMarker(
     cwd,
@@ -517,6 +539,8 @@ async function recordNativeSubagentSessionStart(
     ...(metadata.agentNickname ? { agent_nickname: metadata.agentNickname } : {}),
     ...(metadata.agentRole ? { agent_role: metadata.agentRole } : {}),
     ...(transcriptPath ? { transcript_path: transcriptPath } : {}),
+    authority_tracking_status: authorityTrackingFailed ? "failed" : authorityEvidence,
+    ...(authorityFenceFailed ? { authority_fence_status: "failed" } : {}),
     timestamp: new Date().toISOString(),
   }).catch(() => {});
 }
@@ -1537,6 +1561,8 @@ async function readActiveRalphState(
 
 function readParentPid(pid: number): number | null {
   try {
+    if (process.platform === "win32") return null;
+
     if (process.platform === "linux") {
       const stat = readFileSync(`/proc/${pid}/stat`, "utf-8");
       const commandEnd = stat.lastIndexOf(")");
@@ -1561,6 +1587,8 @@ function readParentPid(pid: number): number | null {
 
 function readProcessCommand(pid: number): string {
   try {
+    if (process.platform === "win32") return "";
+
     if (process.platform === "linux") {
       return readFileSync(`/proc/${pid}/cmdline`, "utf-8")
         .replace(/\u0000+/g, " ")
@@ -1577,13 +1605,88 @@ function readProcessCommand(pid: number): string {
   }
 }
 
+interface ProcessLineageEntry {
+  pid: number;
+  command: string;
+  name?: string;
+}
+
+interface WindowsProcessRecord {
+  ProcessId?: unknown;
+  ParentProcessId?: unknown;
+  CommandLine?: unknown;
+  Name?: unknown;
+}
+
+const WINDOWS_PROCESS_TABLE_TIMEOUT_MS = 5_000;
+const WINDOWS_PROCESS_TABLE_MAX_BUFFER_BYTES = 4 * 1024 * 1024;
+
+function readWindowsProcessLineage(startPid: number): ProcessLineageEntry[] | null {
+  if (!Number.isInteger(startPid) || startPid <= 1) return null;
+
+  try {
+    const output = execFileSync(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CommandLine,Name | ConvertTo-Json -Compress",
+      ],
+      {
+        encoding: "utf-8",
+        windowsHide: true,
+        timeout: WINDOWS_PROCESS_TABLE_TIMEOUT_MS,
+        maxBuffer: WINDOWS_PROCESS_TABLE_MAX_BUFFER_BYTES,
+      },
+    );
+    const parsed = JSON.parse(output) as unknown;
+    const records = Array.isArray(parsed) ? parsed : [parsed];
+    const processTable = new Map<number, { parentPid: number | null; command: string; name: string }>();
+
+    for (const record of records) {
+      if (!record || typeof record !== "object") continue;
+      const processRecord = record as WindowsProcessRecord;
+      const pid = safePositiveInteger(processRecord.ProcessId);
+      const parentPid = safePositiveInteger(processRecord.ParentProcessId);
+      const command = safeString(processRecord.CommandLine).trim()
+        || safeString(processRecord.Name).trim();
+      const name = safeString(processRecord.Name).trim();
+      if (pid === null || !command) continue;
+      processTable.set(pid, { parentPid, command, name });
+    }
+
+    const lineage: ProcessLineageEntry[] = [];
+    let currentPid = startPid;
+    for (let i = 0; i < 6 && currentPid > 1; i += 1) {
+      const current = processTable.get(currentPid);
+      if (!current) break;
+      lineage.push({ pid: currentPid, command: current.command, name: current.name });
+      if (!current.parentPid || current.parentPid === currentPid) break;
+      currentPid = current.parentPid;
+    }
+    return lineage.length > 0 ? lineage : null;
+  } catch {
+    return null;
+  }
+}
+
 function looksLikeShellCommand(command: string): boolean {
-  return /(^|[\/\s])(bash|zsh|sh|dash|fish|ksh)(\s|$)/i.test(command);
+  return /(^|[\\/\s])(bash|zsh|sh|dash|fish|ksh|powershell(?:\.exe)?|pwsh(?:\.exe)?|cmd(?:\.exe)?)(\s|$)/i.test(command);
 }
 
 function looksLikeCodexCommand(command: string): boolean {
   if (/codex-native-hook(?:\.js)?/i.test(command)) return false;
-  return /\bcodex(?:\.js)?\b/i.test(command);
+  return /(^|[\\/\s"'])codex(?:\.exe|\.js)?(?=$|[\s"'])/i.test(command);
+}
+
+function looksLikeCodexProcess(entry: ProcessLineageEntry): boolean {
+  const name = safeString(entry.name).trim();
+  if (/^codex(?:\.exe)?$/i.test(name)) return true;
+  if (name && looksLikeShellCommand(name)) return false;
+  return looksLikeCodexCommand(entry.command);
 }
 
 export function resolveSessionOwnerPidFromAncestry(
@@ -1591,22 +1694,31 @@ export function resolveSessionOwnerPidFromAncestry(
   options: {
     readParentPid?: (pid: number) => number | null;
     readProcessCommand?: (pid: number) => string;
+    readProcessLineage?: (pid: number) => ProcessLineageEntry[] | null;
+    platform?: NodeJS.Platform;
   } = {},
 ): number | null {
   const readParent = options.readParentPid ?? readParentPid;
   const readCommand = options.readProcessCommand ?? readProcessCommand;
-  const lineage: Array<{ pid: number; command: string }> = [];
-  let currentPid = startPid;
+  const platform = options.platform ?? process.platform;
+  let lineage: ProcessLineageEntry[] = [];
 
-  for (let i = 0; i < 6 && Number.isInteger(currentPid) && currentPid > 1; i += 1) {
-    const command = readCommand(currentPid);
-    lineage.push({ pid: currentPid, command });
-    const nextPid = readParent(currentPid);
-    if (!nextPid || nextPid === currentPid) break;
-    currentPid = nextPid;
+  if (options.readProcessLineage) {
+    lineage = options.readProcessLineage(startPid) ?? [];
+  } else if (platform === "win32" && !options.readParentPid && !options.readProcessCommand) {
+    lineage = readWindowsProcessLineage(startPid) ?? [];
+  } else {
+    let currentPid = startPid;
+    for (let i = 0; i < 6 && Number.isInteger(currentPid) && currentPid > 1; i += 1) {
+      const command = readCommand(currentPid);
+      lineage.push({ pid: currentPid, command });
+      const nextPid = readParent(currentPid);
+      if (!nextPid || nextPid === currentPid) break;
+      currentPid = nextPid;
+    }
   }
 
-  const codexAncestor = lineage.find((entry) => looksLikeCodexCommand(entry.command));
+  const codexAncestor = lineage.find(looksLikeCodexProcess);
   if (codexAncestor) return codexAncestor.pid;
 
   if (lineage.length >= 2 && looksLikeShellCommand(lineage[0]?.command || "")) {
@@ -1653,6 +1765,7 @@ interface SloppyFallbackDiffFinding {
   path: string;
   line: string;
   source: "staged" | "unstaged" | "untracked";
+  lineNumber?: number;
 }
 
 const SOURCE_DIFF_EXTENSIONS = new Set([
@@ -1751,6 +1864,7 @@ function isSuspiciousSloppyFallbackAddedLine(line: string, nearbyContext: string
 interface SloppyFallbackCandidateLine {
   text: string;
   added: boolean;
+  lineNumber?: number;
 }
 
 function collectFindingsFromCandidateLines(
@@ -1768,7 +1882,7 @@ function collectFindingsFromCandidateLines(
       .map((line) => line.text)
       .join("\n");
     if (isSuspiciousSloppyFallbackAddedLine(candidate.text, nearbyContext)) {
-      findings.push({ path, line: candidate.text.trim(), source });
+      findings.push({ path, line: candidate.text.trim(), source, lineNumber: candidate.lineNumber });
     }
   }
   return findings;
@@ -1781,6 +1895,7 @@ function collectSloppyFallbackFindingsFromPatch(
   const findings: SloppyFallbackDiffFinding[] = [];
   let currentPath = "";
   let hunkLines: SloppyFallbackCandidateLine[] = [];
+  let newFileLineNumber = 0;
 
   const flushHunk = () => {
     findings.push(...collectFindingsFromCandidateLines(currentPath, hunkLines, source));
@@ -1792,6 +1907,7 @@ function collectSloppyFallbackFindingsFromPatch(
     if (fileMatch) {
       flushHunk();
       currentPath = normalizeGitPath(fileMatch[2] || fileMatch[1] || "");
+      newFileLineNumber = 0;
       continue;
     }
     const renameMatch = rawLine.match(/^\+\+\+ b\/(.*)$/);
@@ -1801,45 +1917,110 @@ function collectSloppyFallbackFindingsFromPatch(
     }
     if (rawLine.startsWith("@@")) {
       flushHunk();
+      const hunkMatch = rawLine.match(/^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      newFileLineNumber = hunkMatch ? Number.parseInt(hunkMatch[1], 10) : 0;
       continue;
     }
     if (!currentPath || !isDiffAuditableSourcePath(currentPath) || isDiffHeaderLine(rawLine)) continue;
     if (rawLine.startsWith("+")) {
-      hunkLines.push({ text: rawLine.slice(1), added: true });
+      hunkLines.push({ text: rawLine.slice(1), added: true, lineNumber: newFileLineNumber || undefined });
+      if (newFileLineNumber > 0) newFileLineNumber += 1;
     } else if (rawLine.startsWith(" ")) {
-      hunkLines.push({ text: rawLine.slice(1), added: false });
+      hunkLines.push({ text: rawLine.slice(1), added: false, lineNumber: newFileLineNumber || undefined });
+      if (newFileLineNumber > 0) newFileLineNumber += 1;
     }
   }
   flushHunk();
   return findings;
 }
 
-function collectSloppyFallbackFindingsFromUntracked(cwd: string): SloppyFallbackDiffFinding[] {
+function isSloppyFallbackDiffAuditDisabled(): boolean {
+  return /^(?:0|off|false|disabled?)$/i.test(
+    safeString(process.env.OMX_NATIVE_STOP_SLOPPY_FALLBACK_AUDIT).trim(),
+  );
+}
+
+export function isSloppyFallbackTranscriptStartUsable(birthtimeMs: number, ctimeMs: number): boolean {
+  return (
+    Number.isFinite(birthtimeMs)
+    && birthtimeMs > 0
+    && Number.isFinite(ctimeMs)
+    && birthtimeMs < ctimeMs
+  );
+}
+
+function resolveSloppyFallbackSessionStartMs(payload: CodexHookPayload, cwd: string): number | null {
+  const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim();
+  if (!transcriptPath) return null;
+  try {
+    const resolvedPath = isAbsolute(transcriptPath) ? transcriptPath : resolve(cwd, transcriptPath);
+    const { birthtimeMs, ctimeMs } = statSync(resolvedPath);
+    // Only trust an immutable birth time. On filesystems where Node reports
+    // birthtime as ctime (or another mutable fallback), every transcript
+    // append moves the derived session start forward and can make in-session
+    // edits look pre-session; treat that ambiguity as unavailable and audit
+    // all untracked files instead of risking a silent skip.
+    return isSloppyFallbackTranscriptStartUsable(birthtimeMs, ctimeMs) ? birthtimeMs : null;
+  } catch {
+    return null;
+  }
+}
+
+function collectSloppyFallbackFindingsFromUntracked(cwd: string, sessionStartMs?: number | null): SloppyFallbackDiffFinding[] {
   const output = gitOutput(cwd, ["ls-files", "--others", "--exclude-standard", "-z"]);
   if (!output) return [];
   const findings: SloppyFallbackDiffFinding[] = [];
   for (const rawPath of output.split("\0")) {
     const path = normalizeGitPath(rawPath.trim());
     if (!path || !isDiffAuditableSourcePath(path)) continue;
+    if (sessionStartMs != null) {
+      try {
+        // Skip only files that provably predate the session: mtime alone is
+        // preservable (cp -p, tar), so require every available indicator
+        // (mtime, ctime, and birth time when the filesystem reports one) to
+        // predate the session. A pre-session symlink can still surface
+        // in-session edits through its target, so the target's indicators
+        // must predate the session too; the link's own indicators keep
+        // in-session links to older targets auditable.
+        const fullPath = join(cwd, path);
+        const linkStats = lstatSync(fullPath);
+        const statsToCheck = [linkStats];
+        if (linkStats.isSymbolicLink()) {
+          try {
+            statsToCheck.push(statSync(fullPath));
+          } catch {
+            // Dangling link: nothing readable to audit either way.
+          }
+        }
+        const predatesSession = statsToCheck.every((stats) => {
+          const indicators = [stats.mtimeMs, stats.ctimeMs];
+          if (Number.isFinite(stats.birthtimeMs) && stats.birthtimeMs > 0) indicators.push(stats.birthtimeMs);
+          return indicators.every((indicatorMs) => Number.isFinite(indicatorMs) && indicatorMs < sessionStartMs);
+        });
+        if (predatesSession) continue;
+      } catch {
+        continue;
+      }
+    }
     let content = "";
     try {
       content = readFileSync(join(cwd, path), "utf-8");
     } catch {
       continue;
     }
-    findings.push(...collectFindingsFromCandidateLines(path, content.split(/\r?\n/).map((text) => ({ text, added: true })), "untracked"));
+    findings.push(...collectFindingsFromCandidateLines(path, content.split(/\r?\n/).map((text, index) => ({ text, added: true, lineNumber: index + 1 })), "untracked"));
   }
   return findings;
 }
 
-function findSloppyFallbackDiffFindings(cwd: string): SloppyFallbackDiffFinding[] {
+function findSloppyFallbackDiffFindings(cwd: string, sessionStartMs?: number | null): SloppyFallbackDiffFinding[] {
   const layout = findGitLayout(cwd);
   if (!layout) return [];
   const auditRoot = layout.worktreeRoot;
   return [
     ...collectSloppyFallbackFindingsFromPatch(gitOutput(auditRoot, ["diff", "--cached", "--no-ext-diff", "--unified=3"]), "staged"),
     ...collectSloppyFallbackFindingsFromPatch(gitOutput(auditRoot, ["diff", "--no-ext-diff", "--unified=3"]), "unstaged"),
-    ...collectSloppyFallbackFindingsFromUntracked(auditRoot),
+    ...collectSloppyFallbackFindingsFromUntracked(auditRoot, sessionStartMs),
   ];
 }
 
@@ -1858,6 +2039,80 @@ function buildSloppyFallbackDiffStopOutput(findings: SloppyFallbackDiffFinding[]
     stopReason: "sloppy_fallback_diff_audit",
     systemMessage,
   };
+}
+
+function buildSloppyFallbackDiffGuardFingerprint(findings: SloppyFallbackDiffFinding[]): string {
+  return JSON.stringify(
+    findings
+      .map((finding) => [finding.path, finding.line, finding.lineNumber ?? 0] as const)
+      .sort(([pathA, lineA, numberA], [pathB, lineB, numberB]) =>
+        pathA.localeCompare(pathB) || lineA.localeCompare(lineB) || numberA - numberB),
+  );
+}
+
+async function maybeBuildSloppyFallbackDiffStopOutput(
+  payload: CodexHookPayload,
+  cwd: string,
+  stateDir: string,
+  canonicalSessionId?: string,
+): Promise<Record<string, unknown> | null> {
+  if (isSloppyFallbackDiffAuditDisabled()) return null;
+  const findings = findSloppyFallbackDiffFindings(cwd, resolveSloppyFallbackSessionStartMs(payload, cwd));
+  const statePath = join(stateDir, NATIVE_STOP_STATE_FILE);
+  const state = await readJsonIfExists(statePath) ?? {};
+  const sessions = safeObject(state.sessions);
+  const sessionKey = readNativeStopSessionKey(payload, canonicalSessionId);
+  const sessionState = safeObject(sessions[sessionKey]);
+
+  if (findings.length === 0) {
+    if (sessionState.sloppy_fallback_diff_guard !== undefined) {
+      const clearedSessionState = { ...sessionState };
+      delete clearedSessionState.sloppy_fallback_diff_guard;
+      sessions[sessionKey] = clearedSessionState;
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(statePath, JSON.stringify({ ...state, sessions }, null, 2));
+    }
+    return null;
+  }
+
+  const fingerprint = buildSloppyFallbackDiffGuardFingerprint(findings);
+  const nowIso = new Date().toISOString();
+  const previousGuard = safeObject(sessionState.sloppy_fallback_diff_guard);
+  const sameFingerprint = safeString(previousGuard.fingerprint).trim() === fingerprint;
+  const repeatCount = sameFingerprint
+    ? parseBoundedPositiveInteger(previousGuard.repeat_count, 1) + 1
+    : 1;
+  sessions[sessionKey] = {
+    ...sessionState,
+    sloppy_fallback_diff_guard: {
+      fingerprint,
+      first_seen_at: sameFingerprint
+        ? safeString(previousGuard.first_seen_at).trim() || nowIso
+        : nowIso,
+      last_seen_at: nowIso,
+      repeat_count: repeatCount,
+      last_turn_id: readPayloadTurnId(payload) || null,
+      last_thread_id: readPayloadThreadId(payload) || null,
+    },
+  };
+  await mkdir(stateDir, { recursive: true });
+  await writeFile(statePath, JSON.stringify({ ...state, sessions }, null, 2));
+
+  const maxRepeats = parseBoundedPositiveInteger(
+    process.env.OMX_NATIVE_STOP_SLOPPY_FALLBACK_MAX_REPEATS,
+    SLOPPY_FALLBACK_DIFF_STOP_DEFAULT_MAX_REPEATS,
+  );
+  if (repeatCount > maxRepeats) return null;
+
+  return await returnPersistentStopBlock(
+    payload,
+    stateDir,
+    "sloppy-fallback-diff-stop",
+    JSON.stringify(findings),
+    buildSloppyFallbackDiffStopOutput(findings),
+    canonicalSessionId,
+    { allowRepeatDuringStopHook: true },
+  );
 }
 
 function localExcludeAlreadyIgnoresOmx(cwd: string): boolean {
@@ -1925,24 +2180,63 @@ function shouldBuildSubagentReopenContext(options: {
   return source === "startup" || source === "resume";
 }
 
-function formatSubagentLedgerMetadata(entry: {
-  role?: string;
-  laneId?: string;
-  scope?: string;
-  status?: string;
-  lastHandoffSummary?: string;
-  resumeFailureReason?: string;
-}): string {
-  const metadata = [
-    entry.role ? `role: ${entry.role}` : null,
-    entry.laneId ? `lane: ${entry.laneId}` : null,
-    entry.scope ? `scope: ${entry.scope}` : null,
-    entry.status ? `status: ${entry.status}` : null,
-    entry.lastHandoffSummary ? `handoff: ${entry.lastHandoffSummary.slice(0, 120)}` : null,
-    entry.resumeFailureReason ? `last failure: ${entry.resumeFailureReason.slice(0, 120)}` : null,
-  ].filter((item): item is string => Boolean(item));
-  return metadata.length > 0 ? ` (${metadata.join("; ")})` : "";
+type RawSessionStartNativeId =
+  | { ok: true; value: string }
+  | { ok: false; reason: "missing" | "malformed" | "conflict" };
+
+export function readUnambiguousSessionStartNativeId(payload: CodexHookPayload | undefined): RawSessionStartNativeId {
+  if (!payload) return { ok: false, reason: "missing" };
+  const object = payload as Record<string, unknown>;
+  const hasSnake = Object.prototype.hasOwnProperty.call(object, "session_id");
+  const hasCamel = Object.prototype.hasOwnProperty.call(object, "sessionId");
+  if (!hasSnake && !hasCamel) return { ok: false, reason: "missing" };
+  const values = [
+    ...(hasSnake ? [object.session_id] : []),
+    ...(hasCamel ? [object.sessionId] : []),
+  ];
+  if (values.some((value) => typeof value !== "string" || value.trim().length === 0)) {
+    return { ok: false, reason: "malformed" };
+  }
+  const normalized = values.map((value) => (value as string).trim());
+  if (new Set(normalized).size !== 1) return { ok: false, reason: "conflict" };
+  return { ok: true, value: normalized[0]! };
 }
+
+function readSessionStartNativeCandidates(payload: CodexHookPayload | undefined): string[] {
+  if (!payload) return [];
+  const object = payload as Record<string, unknown>;
+  return [...new Set([
+    Object.prototype.hasOwnProperty.call(object, "session_id") ? object.session_id : undefined,
+    Object.prototype.hasOwnProperty.call(object, "sessionId") ? object.sessionId : undefined,
+  ].filter((value): value is string => typeof value === "string" && value.trim().length > 0).map((value) => value.trim()))];
+}
+
+export type PersistedReopenRootContextResult =
+  | { ok: true; sessionId: string; rootNativeSessionId: string }
+  | { ok: false; reason: "pointer_not_usable" | "pointer_cwd_missing" | "pointer_session_missing" | "pointer_native_root_missing" | "pointer_cwd_mismatch" | "selected_canonical_missing" | "canonical_mismatch" | "event_native_missing" | "event_native_malformed" | "event_native_conflict" | "native_root_mismatch" };
+
+export function resolvePersistedReopenRootContext(
+  cwd: string,
+  selectedCanonicalSessionId: string,
+  payload: CodexHookPayload | undefined,
+  state: SessionState | null,
+): PersistedReopenRootContextResult {
+  if (!state) return { ok: false, reason: "pointer_not_usable" };
+  if (!safeString(state.cwd).trim()) return { ok: false, reason: "pointer_cwd_missing" };
+  const pointerSessionId = safeString(state.session_id).trim();
+  if (!pointerSessionId) return { ok: false, reason: "pointer_session_missing" };
+  const pointerNativeId = safeString(state.native_session_id).trim();
+  if (!pointerNativeId) return { ok: false, reason: "pointer_native_root_missing" };
+  if (!isSessionStateAuthoritativeForCwd(state, cwd)) return { ok: false, reason: "pointer_cwd_mismatch" };
+  const canonicalSessionId = selectedCanonicalSessionId.trim();
+  if (!canonicalSessionId) return { ok: false, reason: "selected_canonical_missing" };
+  if (canonicalSessionId !== pointerSessionId) return { ok: false, reason: "canonical_mismatch" };
+  const rawNativeId = readUnambiguousSessionStartNativeId(payload);
+  if (!rawNativeId.ok) return { ok: false, reason: `event_native_${rawNativeId.reason}` };
+  if (rawNativeId.value !== pointerNativeId) return { ok: false, reason: "native_root_mismatch" };
+  return { ok: true, sessionId: pointerSessionId, rootNativeSessionId: pointerNativeId };
+}
+
 
 async function buildPersistedSubagentReopenContext(
   cwd: string,
@@ -1952,59 +2246,81 @@ async function buildPersistedSubagentReopenContext(
     payload?: CodexHookPayload;
   },
 ): Promise<string | null> {
-  if (!shouldBuildSubagentReopenContext(options)) return null;
-
-  const ledger = await readSubagentSessionLedger(cwd, sessionId).catch(() => null);
-  if (!ledger || ledger.savedSubagents.length === 0) return null;
-
-  const source = readSessionStartSource(options.payload);
-  const reopenTargets = ledger.resumeTargets.filter((entry) => entry.status !== "unavailable");
-  const unavailableTargets = ledger.unavailableSubagents;
-  const failedTargets = ledger.savedSubagents.filter((entry) => entry.resumeFailedAt || entry.resumeFailureReason);
-  const nowIso = new Date().toISOString();
-
-  await Promise.all(reopenTargets.map((entry) => recordSubagentTurnForSession(cwd, {
+  if (options.hookEventName !== "SessionStart") return null;
+  const pointerContext = resolveSessionPointerContext(cwd);
+  const pointer = await readSessionPointer(pointerContext);
+  const rootContext = resolvePersistedReopenRootContext(
+    cwd,
     sessionId,
-    threadId: entry.threadId,
-    kind: "subagent",
-    role: entry.role,
-    laneId: entry.laneId,
-    scope: entry.scope,
-    agentNickname: entry.agentNickname,
-    status: entry.status,
-    resumeRequestedAt: nowIso,
-    preserveCompletionEvidence: true,
-  }).catch(() => null)));
-
-  const lines = [
-    "[Persisted subagent reopen]",
-    `- SessionStart source: ${source}; saved subagent ids found: ${ledger.savedSubagents.length}.`,
-  ];
-
-  if (reopenTargets.length > 0) {
-    lines.push("- Reopen these persisted subagents by id before continuing work or spawning any same-role/same-lane replacement:");
-    for (const entry of reopenTargets.slice(0, 12)) {
-      lines.push(`  - resume_agent(${JSON.stringify(entry.agentId)})${formatSubagentLedgerMetadata(entry)}`);
+    options.payload,
+    pointer.status === "usable" ? pointer.state ?? null : null,
+  );
+  if (!rootContext.ok) return null;
+  // A SessionStart that carries native subagent thread_spawn evidence for a
+  // genuinely DISTINCT child is a child session start, not a root observation,
+  // so it must not trigger root identity repair or reopen consumption on any
+  // source. The suppression is bound to the pointer-authoritative root: a
+  // transcript marker that is self-parented, names this very root as its child,
+  // or otherwise fails to identify a distinct child cannot override the
+  // authenticated pointer/event root identity, because that would let a stale
+  // or spurious marker keep a root-as-subagent inversion persisted forever.
+  const sessionStartTranscriptPath = safeString(options.payload?.transcript_path ?? options.payload?.transcriptPath).trim();
+  const sessionStartChildMetadata = readNativeSubagentSessionStartMetadata(sessionStartTranscriptPath);
+  if (sessionStartChildMetadata) {
+    const markerParentId = sessionStartChildMetadata.parentThreadId.trim();
+    const markerChildId = safeString(sessionStartChildMetadata.childSessionId).trim();
+    // String-distinctness is NOT attestation. Suppression of the
+    // pointer-authoritative root's protection requires the marker to be bound
+    // to the authenticated event identity: the marker's child must be this very
+    // SessionStart's unambiguous native id, and its parent must be exactly the
+    // authenticated native root (a direct child, not a nested descendant or a
+    // child of some foreign parent). Anything else is unauthenticated evidence
+    // and must not keep a root-as-subagent inversion alive.
+    const eventChildIdentity = readUnambiguousSessionStartNativeId(options.payload ?? {});
+    const identifiesAuthenticatedDirectChild = markerChildId !== ""
+      && markerChildId !== rootContext.rootNativeSessionId
+      && markerChildId !== rootContext.sessionId
+      && markerParentId === rootContext.rootNativeSessionId
+      && eventChildIdentity.ok
+      && eventChildIdentity.value === markerChildId;
+    if (identifiesAuthenticatedDirectChild) return null;
+    // Contradictory or self-parented child evidence: this event cannot prove a
+    // distinct child, so it must not suppress the pointer-authoritative root's
+    // protection. Quarantine the root's reopen authority without asserting
+    // leader identity, which preserves legitimate descriptive subagent evidence
+    // while ensuring the root can never carry reopen authority.
+    try {
+      quarantinePersistedRootAuthority(cwd, { sessionId: rootContext.sessionId, rootNativeSessionId: rootContext.rootNativeSessionId });
+    } catch {
+      // Quarantine is best-effort; reopen output stays denied for this event.
     }
-    if (reopenTargets.length > 12) {
-      lines.push(`  - ... ${reopenTargets.length - 12} more saved subagent id(s) omitted from this compact SessionStart context; consult .omx/state/subagent-tracking.json before spawning replacements.`);
-    }
-  } else {
-    lines.push("- No compatible saved subagent id is currently marked reopenable; do not spawn a replacement merely because reopen was unavailable.");
+    return null;
   }
-
-  lines.push("- Silver rule: when follow-up work targets an existing role/lane, reuse the matching reopened id; avoid duplicate same-type subagent spawns.");
-  lines.push("- If resume_agent fails, surface a clear warning with the id and reason, then continue in the root or another compatible existing lane; do not spawn a new agent solely because reopen failed.");
-
-  const warningEntries = [...new Map([...unavailableTargets, ...failedTargets].map((entry) => [entry.agentId, entry])).values()];
-  if (warningEntries.length > 0) {
-    lines.push("- Reopen warnings:");
-    for (const entry of warningEntries.slice(0, 8)) {
-      lines.push(`  - ${entry.agentId}${formatSubagentLedgerMetadata(entry)}`);
+  if (!shouldBuildSubagentReopenContext(options)) {
+    // Reopen output is gated to startup/resume, but root identity repair is not:
+    // a known root-as-subagent inversion must not survive merely because this
+    // SessionStart used another source. Alias/identity conflicts above stay
+    // fail-closed and repair nothing.
+    try {
+      repairPersistedRootIdentity(cwd, { sessionId: rootContext.sessionId, rootNativeSessionId: rootContext.rootNativeSessionId });
+    } catch {
+      // Repair is best-effort; reopen output remains separately gated.
     }
+    return null;
   }
-
-  return lines.join("\n");
+  try {
+    return consumeDirectChildReopenContext(cwd, {
+      sessionId: rootContext.sessionId,
+      rootNativeSessionId: rootContext.rootNativeSessionId,
+      source: readSessionStartSource(options.payload),
+    });
+  } catch {
+    return [
+      "[Persisted subagent reopen]",
+      "- Warning: persisted subagent authority could not be evaluated; no resume authority or bookkeeping was granted.",
+      "- Silver rule: do not spawn a same-role/same-lane replacement solely because persisted reopen was unavailable; continue in the root or another compatible existing lane.",
+    ].join("\n");
+  }
 }
 
 async function buildSessionStartContext(
@@ -2033,7 +2349,7 @@ async function buildSessionStartContext(
 
   const modeSummaries: string[] = [];
   for (const mode of ["ralph", "autopilot", "ultrawork", "ultraqa", "ralplan", "deep-interview", "team"] as const) {
-    const state = await readJsonIfExists(getStatePath(mode, cwd, sessionId));
+    const state = await readModeStateForSession(mode, sessionId, cwd);
     if (state?.active !== true || !isNonTerminalPhase(state.current_phase)) continue;
     if (mode === "team") {
       const teamName = safeString(state.team_name).trim();
@@ -2331,6 +2647,69 @@ function buildNativeOutsideTmuxTeamPromptBlockState(
     transition_error: "Codex App/native outside-tmux sessions cannot activate the tmux-only `team` workflow directly. Launch OMX CLI from an attached tmux shell first, then run `omx team ...` there.",
   };
 }
+// #3311 (repair): the primary standalone-Ultragoal activation path is a
+// UserPromptSubmit `$ultragoal` prompt, which seeds active/planning state
+// synchronously via recordSkillActivation -> persistStatefulSkillSeedState
+// (keyword-detector.ts) *before* any PreToolUse call occurs. The PreToolUse
+// guard alone (buildUltragoalNoOwnerActivationGuardOutput) never sees this
+// seeding step, so it cannot prevent the deadlock for ordinary `$ultragoal`
+// usage. Mirror the existing `team` outside-tmux prompt block: intercept the
+// prompt itself, before recordSkillActivation ever seeds state, and refuse a
+// *fresh* standalone-Ultragoal activation when no owner will be reachable
+// (native launcher, outside tmux). Already-active sessions of any tracked
+// Conductor mode (including autopilot-supervised Ultragoal, and continuation
+// of an already-active standalone Ultragoal session) are left untouched, so
+// resumption, prior-plan continuation, and non-standalone Ultragoal remain
+// exactly as before.
+async function buildNativeOutsideTmuxUltragoalPromptBlockState(
+  classification: KeywordInputClassification,
+  cwd: string,
+  payload: CodexHookPayload,
+  stateDir: string,
+  sessionId?: string,
+  threadId?: string,
+  turnId?: string,
+): Promise<SkillActiveState | null> {
+  const match = classification.matches.find((entry) => entry.skill === "ultragoal") ?? null;
+  if (!match) return null;
+  if (!isNativeOutsideTmuxUserPrompt(cwd, payload, sessionId)) return null;
+  if (!sessionId) return null;
+
+  // Any already-active tracked skill for this session — including autopilot
+  // supervising ultragoal (or ralplan/deep-interview) as a child phase,
+  // continuation of an already-active standalone Ultragoal session, or any
+  // other tracked workflow — means this is not a fresh standalone-Ultragoal
+  // activation. Read the canonical skill-active state directly (not the
+  // Conductor-write-guard-specific readActiveConductorStateForPreToolUse,
+  // which deliberately excludes autopilot supervising ralplan/deep-interview/
+  // rework for an unrelated reason: those phases have their own dedicated
+  // planning guards). Fall through unchanged to recordSkillActivation's own
+  // transition/continuation/supervision logic.
+  const canonicalState = await readVisibleSkillActiveStateForStateDir(stateDir, sessionId);
+  const hasAnyActiveTrackedSkill = canonicalState
+    ? listActiveSkills(canonicalState).some((entry) => (
+      matchesSkillStopContext(entry, canonicalState, sessionId, threadId ?? "")
+    ))
+    : false;
+  if (hasAnyActiveTrackedSkill) return null;
+
+  const nowIso = new Date().toISOString();
+  return {
+    version: 1,
+    active: false,
+    skill: "ultragoal",
+    keyword: match.keyword,
+    phase: "planning",
+    activated_at: nowIso,
+    updated_at: nowIso,
+    source: "keyword-detector",
+    session_id: sessionId,
+    thread_id: threadId,
+    turn_id: turnId,
+    active_skills: [],
+    transition_error: ULTRAGOAL_NO_OWNER_DENY_REASON,
+  };
+}
 
 function buildSkillStateCliInstruction(mode: string, statePath: string): string {
   return `skill: ${mode} activated and initial state initialized at ${statePath}; use CLI-first state updates via \`omx state write/read/clear --input '<json>' --json\`; use omx_state MCP only when explicit MCP compatibility is enabled.`;
@@ -2554,6 +2933,11 @@ function readTeamWorkerEnvironment(): { teamName: string; workerName: string } |
   return internalWorker ?? externalWorker;
 }
 
+function hasRawTeamWorkerDeclaration(): boolean {
+  return safeString(process.env.OMX_TEAM_INTERNAL_WORKER).trim() !== ""
+    || safeString(process.env.OMX_TEAM_WORKER).trim() !== "";
+}
+
 async function hasAuthoritativeTeamWorkerContext(cwd: string): Promise<boolean> {
   const workerContext = readTeamWorkerEnvironment();
   if (!workerContext) return false;
@@ -2569,14 +2953,14 @@ async function hasAuthoritativeTeamWorkerContext(cwd: string): Promise<boolean> 
   const config = await readJsonIfExists(join(teamRoot, "config.json"));
   if (!identity || !manifest || !config) return false;
 
-  const canonicalStateRoot = resolve(stateRoot);
-  const canonicalCwd = resolve(cwd);
-  const canonicalLeaderCwd = resolve(safeString(process.env.OMX_TEAM_LEADER_CWD).trim() || cwd);
+  const canonicalStateRoot = canonicalizeComparablePath(stateRoot);
+  const canonicalCwd = canonicalizeComparablePath(cwd);
+  const canonicalLeaderCwd = canonicalizeComparablePath(safeString(process.env.OMX_TEAM_LEADER_CWD).trim() || cwd);
   const pathMatches = (value: unknown, expected: string): boolean => {
     const candidate = safeString(value).trim();
     if (!candidate) return false;
     try {
-      return resolve(candidate) === expected;
+      return sameFilePath(candidate, expected);
     } catch {
       return false;
     }
@@ -2678,7 +3062,7 @@ async function resolveTeamWorkerStopDecision(
   const blockWorkerStop = (
     reasonCode: string,
     detail: string,
-    stateDirForDecision = getBaseStateDir(cwd),
+    stateDirForDecision = join(cwd, ".omx", "state"),
   ): TeamWorkerStopDecision => ({
     kind: "blocked",
     stateDir: stateDirForDecision,
@@ -2800,11 +3184,51 @@ function isStopExempt(payload: CodexHookPayload): boolean {
   );
 }
 
+async function buildDeclaredTeamWorkerStopOutput(
+  payload: CodexHookPayload,
+  cwd: string,
+): Promise<Record<string, unknown> | null> {
+  if (isStopExempt(payload)) return null;
+  const decision = await resolveTeamWorkerStopDecision(cwd);
+  if (decision.kind === "blocked") {
+    if ((payload.stop_hook_active === true || payload.stopHookActive === true) && !decision.allowRepeatDuringStopHook) return null;
+    return decision.output;
+  }
+  if (decision.kind === "allowed") {
+    try {
+      await maybeNudgeLeaderForAllowedWorkerStop({
+        stateDir: decision.stateDir,
+        logsDir: join(cwd, ".omx", "logs"),
+        workerContext: decision.workerContext,
+      });
+    } catch (err) {
+      void err;
+    }
+    return null;
+  }
+  const workerName = readTeamWorkerEnvironment()?.workerName ?? "unknown";
+  const reason = "OMX cannot resolve authoritative Team worker state for Stop.";
+  return {
+    decision: "block",
+    stopReason: `team_worker_${workerName}_missing_worker_state`,
+    reason,
+    systemMessage: reason,
+  };
+}
+
 async function readModeStateWithStopSource(
   mode: "autopilot" | "ultrawork" | "ultraqa",
   cwd: string,
   sessionId?: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<{ state: Record<string, unknown>; path: string } | null> {
+  if (options.sessionScopedOnly) {
+    const normalizedSessionId = safeString(sessionId).trim();
+    if (!normalizedSessionId) return null;
+    const path = getStateFilePath(`${mode}-state.json`, cwd, normalizedSessionId);
+    const state = await readJsonIfExists(path);
+    return state ? { state, path } : null;
+  }
   const paths = await getAuthoritativeActiveStatePaths(mode, cwd, sessionId?.trim() || undefined).catch(() => [] as string[]);
   const path = paths[0];
   if (!path) return null;
@@ -2874,6 +3298,7 @@ async function buildModeBasedStopOutput(
   mode: "autopilot" | "ultrawork" | "ultraqa",
   cwd: string,
   sessionId?: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<Record<string, unknown> | null> {
   if (await readCanonicalTerminalRunStateForStop(cwd, sessionId, mode)) {
     return null;
@@ -2881,10 +3306,12 @@ async function buildModeBasedStopOutput(
   if (mode === "autopilot" && await readAutopilotDeepInterviewQuestionWaitState(cwd, sessionId)) {
     return null;
   }
-  const sourcedState = await readModeStateWithStopSource(mode, cwd, sessionId);
+  const sourcedState = await readModeStateWithStopSource(mode, cwd, sessionId, options);
   const state = sourcedState?.state ?? null;
   if (!state || !shouldContinueRun(state)) return null;
-  const rootCanonicalState = await readRawSkillActiveState(getSkillActiveStatePathsForStateDir(getBaseStateDir(cwd)).rootPath);
+  const rootCanonicalState = options.sessionScopedOnly
+    ? null
+    : await readRawSkillActiveState(getSkillActiveStatePathsForStateDir(getBaseStateDir(cwd)).rootPath);
   const canonicalDisagreement = rootCanonicalState
     ? canonicalStopDisagreement(state, rootCanonicalState, mode, sessionId)
     : "canonical_state_missing";
@@ -3066,7 +3493,14 @@ async function buildCompletedGoalCleanupStopOutput(payload: CodexHookPayload, cw
   };
 }
 
-async function findActiveGoalWorkflowReconciliationRequirement(cwd: string): Promise<{ workflow: string; command: string; remediation?: string } | null> {
+interface GoalWorkflowReconciliationRequirement {
+  workflow: string;
+  command?: string;
+  remediation?: string;
+  paused?: boolean;
+}
+
+async function findActiveGoalWorkflowReconciliationRequirement(cwd: string): Promise<GoalWorkflowReconciliationRequirement | null> {
   const ultragoal = await readJsonIfExists(join(cwd, ".omx", "ultragoal", "goals.json"));
   const aggregateCompletion = safeObject(ultragoal?.aggregateCompletion);
   const aggregateProductComplete = safeString(aggregateCompletion.status) === "complete";
@@ -3079,6 +3513,14 @@ async function findActiveGoalWorkflowReconciliationRequirement(cwd: string): Pro
   }
   if (activeUltragoal) {
     const goalId = safeString(activeUltragoal.id) || "<goal-id>";
+    const status = safeString(activeUltragoal.status);
+    if (status === "review_blocked" || status === "needs_user_decision") {
+      return {
+        workflow: "ultragoal",
+        paused: true,
+        remediation: `Ultragoal ${goalId} is paused with status ${status}; preserve its recorded blocker and resume only after the required review resolution or user decision is available.`,
+      };
+    }
     return {
       workflow: "ultragoal",
       command: `omx ultragoal checkpoint --goal-id ${goalId} --status complete --codex-goal-json '<get_goal JSON or path>' --quality-gate-json '<quality-gate JSON or path>' --evidence '<evidence>' --json`,
@@ -3140,6 +3582,7 @@ async function buildGoalWorkflowReconciliationPromptWarning(cwd: string, prompt:
   if (!looksLikeGoalCompletionPrompt(prompt)) return null;
   const requirement = await findActiveGoalWorkflowReconciliationRequirement(cwd);
   if (!requirement) return null;
+  if (requirement.paused) return `OMX ${requirement.remediation}`;
   return [
     `OMX ${requirement.workflow} goal workflow requires Codex goal snapshot reconciliation before completion.`,
     "Call get_goal, pass the resulting JSON or a path with --codex-goal-json, and do not rely on hooks or shell commands to mutate Codex-owned goal state.",
@@ -3158,6 +3601,15 @@ async function buildGoalWorkflowReconciliationStopOutput(
   if (!requirement) return null;
   if (requirement.workflow === "autoresearch-goal" && reportsAutoresearchGoalObjectiveMismatch(lastAssistantMessage)) {
     return null;
+  }
+  if (requirement.paused) {
+    const systemMessage = `OMX ${requirement.remediation} Stop after reporting the paused status; do not retry completion reconciliation until it is resumed.`;
+    return {
+      decision: "block",
+      reason: systemMessage,
+      stopReason: `${requirement.workflow}_paused`,
+      systemMessage,
+    };
   }
   const systemMessage =
     [
@@ -3196,6 +3648,7 @@ async function readTeamModeStateForStop(
   stateDir: string,
   sessionId?: string,
   threadId?: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<TeamModeStateForStop | null> {
   const normalizedSessionId = safeString(sessionId).trim();
   if (!normalizedSessionId) return null;
@@ -3206,6 +3659,7 @@ async function readTeamModeStateForStop(
       ? { state: scopedState, scope: "session" }
       : null;
   }
+  if (options.sessionScopedOnly) return null;
 
   const rootState = await readJsonIfExists(join(stateDir, "team-state.json"));
   if (rootState?.active !== true) return null;
@@ -3220,21 +3674,37 @@ async function readTeamModeStateForStop(
   return { state: rootState, scope: "root" };
 }
 
-async function buildTeamStopOutput(cwd: string, sessionId?: string, threadId?: string): Promise<Record<string, unknown> | null> {
+async function buildTeamStopOutput(
+  cwd: string,
+  sessionId?: string,
+  threadId?: string,
+  options: { sessionScopedOnly?: boolean } = {},
+): Promise<Record<string, unknown> | null> {
   if (await readCanonicalTerminalRunStateForStop(cwd, sessionId, "team")) {
     return null;
   }
-  const teamStateForStop = await readTeamModeStateForStop(cwd, getBaseStateDir(cwd), sessionId, threadId);
+  const teamStateForStop = await readTeamModeStateForStop(
+    cwd,
+    getBaseStateDir(cwd),
+    sessionId,
+    threadId,
+    options,
+  );
   if (!teamStateForStop || teamStateForStop.state.active !== true) return null;
   const teamState = teamStateForStop.state;
   const teamName = safeString(teamState.team_name).trim();
+  const coarsePhase = teamState.current_phase;
+  if (options.sessionScopedOnly) {
+    return isNonTerminalPhase(coarsePhase)
+      ? buildTeamStopOutputForPhase(teamName, formatPhase(coarsePhase))
+      : null;
+  }
   if (teamName) {
     const canonicalTeamDir = join(resolveCanonicalTeamStateRoot(cwd), "team", teamName);
     if (!existsSync(canonicalTeamDir)) {
       return null;
     }
   }
-  const coarsePhase = teamState.current_phase;
   const canonicalPhaseState = teamName ? await readTeamPhase(teamName, cwd) : null;
   if (teamStateForStop.scope === "root" && !canonicalPhaseState) return null;
   const canonicalPhase = canonicalPhaseState?.current_phase ?? coarsePhase;
@@ -3332,6 +3802,12 @@ function readPayloadSessionId(payload: CodexHookPayload): string {
   return payloadAliasValues(payload, ["session_id", "sessionId"])[0] ?? "";
 }
 
+function readUnambiguousNormalizedPayloadSessionId(payload: CodexHookPayload): string {
+  const aliases = payloadAliasValues(payload, ["session_id", "sessionId"]);
+  if (aliases.length !== 1) return "";
+  return normalizeSessionId(aliases[0]) ?? "";
+}
+
 function readPayloadThreadId(payload: CodexHookPayload): string {
   return payloadAliasValues(payload, ["thread_id", "threadId"])[0] ?? "";
 }
@@ -3345,6 +3821,16 @@ interface PreToolUseSessionBinding {
   missing: boolean;
 }
 
+function sessionPointerAliases(state: SessionState | null | undefined): Set<string> {
+  return new Set(uniqueNonEmpty([
+    safeString(state?.session_id).trim(),
+    safeString(state?.native_session_id).trim(),
+    safeString(state?.owner_omx_session_id).trim(),
+    safeString(state?.owner_codex_session_id).trim(),
+    safeString(state?.codex_session_id).trim(),
+  ]));
+}
+
 async function resolvePreToolUseSessionBinding(
   cwd: string,
   stateDir: string,
@@ -3356,10 +3842,7 @@ async function resolvePreToolUseSessionBinding(
     : await readUsableSessionStateFromStateDir(cwd, stateDir).catch(() => null);
   const canonicalSessionId = safeString(currentSession?.session_id).trim();
   const aliases = payloadAliasValues(payload, ["session_id", "sessionId"]);
-  const knownAliases = new Set([
-    canonicalSessionId,
-    safeString(currentSession?.native_session_id).trim(),
-  ].filter(Boolean));
+  const knownAliases = sessionPointerAliases(currentSession);
   return {
     canonicalSessionId,
     missing: aliases.length === 0,
@@ -3369,6 +3852,164 @@ async function resolvePreToolUseSessionBinding(
       && knownAliases.has(aliases[0] ?? ""),
   };
 }
+// Issue #3293 cancellation boundary: identity matching is payload-bound while target-root
+// selection remains ambient and same-euid trusted (OMX_ROOT/OMX_STATE_ROOT/OMX_TEAM_STATE_ROOT
+// select the tree; they are not authority).
+export type HookCancelTransactionFailureReason =
+  | "invalid_target"
+  | "lock_held"
+  | "recovery_required"
+  | "preflight_failed"
+  | "state_mismatch"
+  | "journal_failed"
+  | "write_failed"
+  | "rollback_failed"
+  | "verification_failed"
+  | "cleanup_failed";
+
+export interface HookCancelTransactionResult {
+  ok: boolean;
+  reason?: HookCancelTransactionFailureReason;
+}
+
+const HOOK_CANCEL_MAX_STATE_BYTES = 1024 * 1024;
+const HOOK_CANCEL_LOCK_FILE = ".hook-cancel.lock";
+const HOOK_CANCEL_JOURNAL_FILE = ".hook-cancel-transaction.json";
+
+type HookCancelTargetIdentity = { dev: number; ino: number; mode: number; uid: number; size: number; mtimeMs: number };
+type HookCancelPinnedFile = { path: string; bytes: Buffer; identity: HookCancelTargetIdentity; value: Record<string, unknown> };
+
+function hookCancelIdentity(stats: { dev: number; ino: number; mode: number; uid: number; size: number; mtimeMs: number }): HookCancelTargetIdentity {
+  return { dev: stats.dev, ino: stats.ino, mode: stats.mode, uid: stats.uid, size: stats.size, mtimeMs: stats.mtimeMs };
+}
+function hookCancelIdentityMatches(left: HookCancelTargetIdentity, right: HookCancelTargetIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.uid === right.uid && left.size === right.size && left.mtimeMs === right.mtimeMs;
+}
+function hookCancelTargetMatches(left: HookCancelTargetIdentity, right: HookCancelTargetIdentity): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.mode === right.mode && left.uid === right.uid;
+}
+
+function hookCancelDigest(bytes: Buffer): string { return createHash("sha256").update(bytes).digest("hex"); }
+function hookCancelObject(bytes: Buffer): Record<string, unknown> | null {
+  if (bytes.length === 0 || bytes.length > HOOK_CANCEL_MAX_STATE_BYTES) return null;
+  try { const value = JSON.parse(bytes.toString("utf8")); return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : null; } catch { return null; }
+}
+function hookCancelString(value: unknown): string { return typeof value === "string" ? value.trim() : ""; }
+function hookCancelCwdMatches(value: Record<string, unknown>, canonicalCwd: string): boolean {
+  const recorded = hookCancelString(value.cwd) || hookCancelString(value.workingDirectory);
+  try { return !recorded || sameFilePath(recorded, canonicalCwd); } catch { return false; }
+}
+function hookCancelSessionMatches(value: Record<string, unknown>, sessionId: string, cwd: string): boolean {
+  const recorded = hookCancelString(value.session_id);
+  return (!recorded || recorded === sessionId) && hookCancelCwdMatches(value, cwd);
+}
+function hookCancelAutopilotMatches(value: Record<string, unknown>, sessionId: string, cwd: string): boolean {
+  return value.active === true && hookCancelString(value.mode).toLowerCase() === "autopilot" && normalizeAutopilotPhase(hookCancelString(value.current_phase)) === "deep-interview" && hookCancelSessionMatches(value, sessionId, cwd);
+}
+function hookCancelSkillMatches(value: Record<string, unknown>, sessionId: string, cwd: string): boolean {
+  if (!hookCancelSessionMatches(value, sessionId, cwd)) return false;
+  const entries = Array.isArray(value.active_skills) ? value.active_skills : [value];
+  return entries.some((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return false;
+    const entry = candidate as Record<string, unknown>;
+    return hookCancelString(entry.skill).toLowerCase() === "autopilot"
+      && entry.active !== false
+      && (!hookCancelString(entry.session_id) || hookCancelString(entry.session_id) === sessionId)
+      && hookCancelCwdMatches(entry, cwd);
+  });
+}
+async function hookCancelFsyncDirectory(path: string): Promise<void> {
+  const handle = await open(path, "r"); try { await handle.sync(); } finally { await handle.close(); }
+}
+async function hookCancelPinnedRead(path: string): Promise<HookCancelPinnedFile | null> {
+  let before: Awaited<ReturnType<typeof lstat>>;
+  try { before = await lstat(path); } catch { return null; }
+  if (!before.isFile() || before.isSymbolicLink() || before.nlink !== 1 || before.uid !== process.getuid?.()) return null;
+  let handle: Awaited<ReturnType<typeof open>>;
+  try { handle = await open(path, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW); } catch { return null; }
+  try {
+    const opened = await handle.stat();
+    if (!opened.isFile() || !hookCancelIdentityMatches(hookCancelIdentity(before), hookCancelIdentity(opened))) return null;
+    const bytes = await handle.readFile(); const after = await handle.stat();
+    if (!hookCancelIdentityMatches(hookCancelIdentity(opened), hookCancelIdentity(after))) return null;
+    if (process.env.NODE_ENV === "test" && process.env.OMX_NATIVE_HOOK_TEST_CANCEL_TRANSACTION_FAIL_AFTER === "preflight-instability") return null;
+    const value = hookCancelObject(bytes); return value ? { path, bytes, identity: hookCancelIdentity(after), value } : null;
+  } catch { return null; } finally { await handle.close(); }
+}
+function hookCancelPreparedAutopilot(value: Record<string, unknown>, nowIso: string): Record<string, unknown> {
+  return { ...value, active: false, current_phase: "cancelled", completed_at: nowIso, last_turn_at: nowIso };
+}
+function hookCancelPreparedSkill(value: Record<string, unknown>, sessionId: string, nowIso: string): Record<string, unknown> {
+  const sourceEntries = Array.isArray(value.active_skills) ? value.active_skills : [value]; let cancelled = false;
+  const entries = sourceEntries.map((candidate) => {
+    if (!candidate || typeof candidate !== "object" || Array.isArray(candidate)) return candidate;
+    const entry = candidate as Record<string, unknown>;
+    const matches = hookCancelString(entry.skill).toLowerCase() === "autopilot"
+      && entry.active !== false
+      && (!hookCancelString(entry.session_id) || hookCancelString(entry.session_id) === sessionId);
+    if (!matches) return entry; cancelled = true; return { ...entry, active: false, phase: "cancelled", updated_at: nowIso };
+  });
+  if (!cancelled) return value;
+  const activeEntries = entries.filter((entry) => entry && typeof entry === "object" && !Array.isArray(entry) && (entry as Record<string, unknown>).active !== false) as Record<string, unknown>[];
+  const primary = activeEntries[0];
+  return { ...value, active: activeEntries.length > 0, skill: primary ? hookCancelString(primary.skill) : "autopilot", phase: primary ? hookCancelString(primary.phase) : "cancelled", updated_at: nowIso, active_skills: entries };
+}
+function hookCancelInjectFailure(boundary: string): void {
+  if (process.env.NODE_ENV === "test" && process.env.OMX_NATIVE_HOOK_TEST_CANCEL_TRANSACTION_FAIL_AFTER === boundary) throw new Error("test-induced hook cancellation transaction failure");
+}
+async function hookCancelWriteExact(handle: Awaited<ReturnType<typeof open>>, bytes: Buffer): Promise<void> { await handle.write(bytes, 0, bytes.length, 0); await handle.truncate(bytes.length); await handle.sync(); }
+async function hookCancelWriteTarget(path: string, identity: HookCancelTargetIdentity, expected: Buffer, next: Buffer): Promise<void> {
+  const handle = await open(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+  try { const current = await handle.stat(); if (!current.isFile() || !hookCancelTargetMatches(identity, hookCancelIdentity(current))) throw new Error("target identity changed"); const bytes = await handle.readFile(); if (!bytes.equals(expected)) throw new Error("target content changed"); await hookCancelWriteExact(handle, next); } finally { await handle.close(); }
+}
+async function hookCancelRestoreTarget(path: string, identity: HookCancelTargetIdentity, original: Buffer): Promise<void> {
+  const handle = await open(path, fsConstants.O_RDWR | fsConstants.O_NOFOLLOW);
+  try { const current = await handle.stat(); if (!current.isFile() || !hookCancelTargetMatches(identity, hookCancelIdentity(current))) throw new Error("rollback identity changed"); await hookCancelWriteExact(handle, original); } finally { await handle.close(); }
+}
+export async function readHookCancelTransactionRecoveryState(input: { stateDir: string; canonicalSessionId: string }): Promise<HookCancelTransactionFailureReason | null> {
+  if (!input.canonicalSessionId || basename(input.canonicalSessionId) !== input.canonicalSessionId) return "invalid_target";
+  try { const journal = hookCancelObject(await readFile(join(input.stateDir, "sessions", input.canonicalSessionId, HOOK_CANCEL_JOURNAL_FILE))); return journal?.phase === "prepared" ? "recovery_required" : "cleanup_failed"; } catch (error) { return (error as NodeJS.ErrnoException).code === "ENOENT" ? null : "cleanup_failed"; }
+}
+export async function terminalizeExactAutopilotSessionForHookCancel(input: { stateDir: string; canonicalSessionId: string; cwd: string; nowIso: string }): Promise<HookCancelTransactionResult> {
+  let canonicalStateDir: string; let canonicalCwd: string;
+  try { canonicalStateDir = realpathSync(input.stateDir); canonicalCwd = realpathSync(input.cwd); } catch { return { ok: false, reason: "invalid_target" }; }
+  if (!input.canonicalSessionId || basename(input.canonicalSessionId) !== input.canonicalSessionId) return { ok: false, reason: "invalid_target" };
+  const sessionsDir = join(canonicalStateDir, "sessions"); const sessionDir = join(sessionsDir, input.canonicalSessionId);
+  try {
+    const [sessionsStats, sessionStats, resolvedSessionDir] = await Promise.all([lstat(sessionsDir), lstat(sessionDir), import("fs/promises").then(({ realpath }) => realpath(sessionDir))]);
+    if (!sessionsStats.isDirectory() || sessionsStats.isSymbolicLink() || !sessionStats.isDirectory() || sessionStats.isSymbolicLink() || relative(canonicalStateDir, resolvedSessionDir).startsWith("..") || resolve(resolvedSessionDir) !== resolve(sessionDir)) return { ok: false, reason: "invalid_target" };
+  } catch { return { ok: false, reason: "invalid_target" }; }
+  const recovery = await readHookCancelTransactionRecoveryState({ stateDir: canonicalStateDir, canonicalSessionId: input.canonicalSessionId }); if (recovery) return { ok: false, reason: recovery };
+  const lockPath = join(sessionDir, HOOK_CANCEL_LOCK_FILE); const journalPath = join(sessionDir, HOOK_CANCEL_JOURNAL_FILE); let lock: Awaited<ReturnType<typeof open>>;
+  try { lock = await open(lockPath, "wx", 0o600); await lock.sync(); await hookCancelFsyncDirectory(sessionDir); } catch { return { ok: false, reason: "lock_held" }; }
+  try {
+    const [autopilot, skill] = await Promise.all([hookCancelPinnedRead(join(sessionDir, "autopilot-state.json")), hookCancelPinnedRead(join(sessionDir, "skill-active-state.json"))]);
+    if (!autopilot || !skill) return { ok: false, reason: "preflight_failed" };
+    if (!hookCancelAutopilotMatches(autopilot.value, input.canonicalSessionId, canonicalCwd) || !hookCancelSkillMatches(skill.value, input.canonicalSessionId, canonicalCwd)) return { ok: false, reason: "state_mismatch" };
+    const nextAutopilot = Buffer.from(JSON.stringify(hookCancelPreparedAutopilot(autopilot.value, input.nowIso), null, 2)); const nextSkill = Buffer.from(JSON.stringify(hookCancelPreparedSkill(skill.value, input.canonicalSessionId, input.nowIso), null, 2));
+    const journal = Buffer.from(JSON.stringify({ version: 1, session_id: input.canonicalSessionId, phase: "prepared", targets: { autopilot: { identity: autopilot.identity, old_sha256: hookCancelDigest(autopilot.bytes), new_sha256: hookCancelDigest(nextAutopilot) }, skill_active: { identity: skill.identity, old_sha256: hookCancelDigest(skill.bytes), new_sha256: hookCancelDigest(nextSkill) } } }));
+    if (journal.length > HOOK_CANCEL_MAX_STATE_BYTES) return { ok: false, reason: "journal_failed" };
+    const journalHandle = await open(journalPath, "wx", 0o600); try { await journalHandle.writeFile(journal); await journalHandle.sync(); } finally { await journalHandle.close(); }
+    await hookCancelFsyncDirectory(sessionDir); hookCancelInjectFailure("journal-fsync");
+    let autopilotWritten = false; let skillWritten = false;
+    try { await hookCancelWriteTarget(autopilot.path, autopilot.identity, autopilot.bytes, nextAutopilot); autopilotWritten = true; hookCancelInjectFailure("first-data-write"); await hookCancelWriteTarget(skill.path, skill.identity, skill.bytes, nextSkill); skillWritten = true; hookCancelInjectFailure("second-data-write"); }
+    catch {
+      try { if (skillWritten) await hookCancelRestoreTarget(skill.path, skill.identity, skill.bytes); if (autopilotWritten) await hookCancelRestoreTarget(autopilot.path, autopilot.identity, autopilot.bytes); await hookCancelFsyncDirectory(sessionDir); } catch { return { ok: false, reason: "rollback_failed" }; }
+      await unlink(journalPath); await hookCancelFsyncDirectory(sessionDir); return { ok: false, reason: "write_failed" };
+    }
+    const [verifiedAutopilot, verifiedSkill] = await Promise.all([readFile(autopilot.path), readFile(skill.path)]);
+    if (!verifiedAutopilot.equals(nextAutopilot) || !verifiedSkill.equals(nextSkill)) return { ok: false, reason: "verification_failed" };
+    hookCancelInjectFailure("verification");
+    const committed = Buffer.from(JSON.stringify({ ...JSON.parse(journal.toString("utf8")), phase: "committed" })); const committedHandle = await open(journalPath, fsConstants.O_WRONLY | fsConstants.O_NOFOLLOW);
+    try { await committedHandle.write(committed, 0, committed.length, 0); await committedHandle.truncate(committed.length); await committedHandle.sync(); } finally { await committedHandle.close(); }
+    hookCancelInjectFailure("journal-commit"); await unlink(journalPath); await hookCancelFsyncDirectory(sessionDir); hookCancelInjectFailure("unlink");
+    return { ok: true };
+  } catch { return { ok: false, reason: "journal_failed" }; }
+  finally {
+    try { await lock.close(); await unlink(lockPath); await hookCancelFsyncDirectory(sessionDir); hookCancelInjectFailure("lock-release"); } catch {}
+  }
+}
+
 
 interface ConductorPolicyRootResolution {
   cwd: string;
@@ -3460,7 +4101,7 @@ function buildNativeUnknownRolePreToolUseOutput(
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       additionalContext:
-        "Use an installed OMX role for native agent_type/agent_role dispatch. When the surface reports role_routing_unavailable, do not fabricate agent_type; run `omx ralplan preflight --json` before Ralplan planning, state, HUD, runtime, or delegation work and stop on `unsupported_documented_leader_proof`.",
+        "Use an installed OMX role for native agent_type/agent_role dispatch. When the surface reports role_routing_unavailable and adapted Ralplan authority is requested, do not fabricate agent_type; run `omx ralplan preflight --json` and stop on `unsupported_documented_leader_proof`. Ordinary work remains under its own workflow gates.",
     },
   };
 }
@@ -3607,7 +4248,7 @@ function isFreshNativeSubagentCapacityBlocker(
   const blockerCwd = safeString(blocker.cwd).trim();
   if (blockerCwd) {
     try {
-      if (resolve(blockerCwd) !== resolve(cwd)) return false;
+      if (!sameFilePath(blockerCwd, cwd)) return false;
     } catch {
       return false;
     }
@@ -3617,18 +4258,25 @@ function isFreshNativeSubagentCapacityBlocker(
   return !blockerSessionId || !payloadSessionId || blockerSessionId === payloadSessionId;
 }
 
+// Batched payloads embed recipient names inside serialized input, so the
+// substring scan must also recognize the flattened close_agent delivery form
+// (`collaborationclose_agent`); dotted forms already carry a word boundary
+// before close_agent. This is a recognition heuristic for the capacity close
+// guard only: matching here can only make the guard block, never authorize.
+const NATIVE_CLOSE_AGENT_REQUEST_PATTERN = /\b(?:close_agent|collaborationclose_agent)\b/i;
+
 function inputContainsCloseAgentRequest(value: unknown): boolean {
-  if (typeof value === "string") return /\bclose_agent\b/i.test(value);
+  if (typeof value === "string") return NATIVE_CLOSE_AGENT_REQUEST_PATTERN.test(value);
   if (!value || typeof value !== "object") return false;
   try {
-    return /\bclose_agent\b/i.test(JSON.stringify(value));
+    return NATIVE_CLOSE_AGENT_REQUEST_PATTERN.test(JSON.stringify(value));
   } catch {
     return false;
   }
 }
 
 function isCloseAgentToolUse(payload: CodexHookPayload): boolean {
-  const toolName = safeString(payload.tool_name).trim();
+  const toolName = canonicalizeNativeCollaborationToolName(safeString(payload.tool_name).trim());
   if (/\bclose_agent\b/i.test(toolName)) return true;
   if (/multi_tool_use\.parallel/i.test(toolName) && inputContainsCloseAgentRequest(payload.tool_input)) return true;
   return inputContainsCloseAgentRequest(payload.tool_input) && /multi_agent|agent|tool_use/i.test(toolName);
@@ -3670,12 +4318,8 @@ async function resolveInternalSessionIdForPayload(
   const canonicalSessionId = safeString(currentSession?.session_id).trim();
   if (!canonicalSessionId) return allowUnboundPayloadFallback ? payloadSessionId : "";
 
-  const nativeSessionId = safeString(currentSession?.native_session_id).trim();
-  const ownerOmxSessionId = safeString(currentSession?.owner_omx_session_id).trim();
   if (!payloadSessionId) return canonicalSessionId;
-  if (payloadSessionId === canonicalSessionId) return canonicalSessionId;
-  if (nativeSessionId && payloadSessionId === nativeSessionId) return canonicalSessionId;
-  if (ownerOmxSessionId && payloadSessionId === ownerOmxSessionId) return canonicalSessionId;
+  if (sessionPointerAliases(currentSession).has(payloadSessionId)) return canonicalSessionId;
   return allowUnboundPayloadFallback ? payloadSessionId : "";
 }
 
@@ -3692,13 +4336,8 @@ async function readRootSessionStateFromStateDir(stateDir: string): Promise<Sessi
 }
 
 function payloadMatchesSessionPointer(payloadSessionId: string, state: SessionState): boolean {
-  const canonicalSessionId = safeString(state.session_id).trim();
-  const nativeSessionId = safeString(state.native_session_id).trim();
-  const ownerOmxSessionId = safeString(state.owner_omx_session_id).trim();
   if (!payloadSessionId) return true;
-  return payloadSessionId === canonicalSessionId
-    || (nativeSessionId !== "" && payloadSessionId === nativeSessionId)
-    || (ownerOmxSessionId !== "" && payloadSessionId === ownerOmxSessionId);
+  return sessionPointerAliases(state).has(payloadSessionId);
 }
 
 function isRootSessionPointerLive(state: SessionState): boolean {
@@ -3851,10 +4490,7 @@ function normalizePlanningArtifactRelativePath(cwd: string, rawPath: string): st
   const trimmed = rawPath.trim();
   if (!trimmed || trimmed.includes("\0")) return null;
   try {
-    const absolute = resolve(cwd, trimmed);
-    const relativePath = relative(cwd, absolute).replace(/\\/g, "/");
-    if (!relativePath || relativePath.startsWith("..") || relativePath.startsWith("/")) return null;
-    return relativePath;
+    return normalizePolicyRelativePath(cwd, resolve(cwd, trimmed));
   } catch {
     return null;
   }
@@ -4095,6 +4731,15 @@ function classifyRalplanBeadsMetadataCommand(cwd: string, command: string): Ralp
 function readPreToolUseCommand(payload: CodexHookPayload): string {
   const toolInput = safeObject(payload.tool_input);
   return safeString(toolInput.command).trim();
+}
+
+// Authorization decisions whose security contract depends on exact bytes
+// (currently only the direct `omx cancel` exemption) must compare against the
+// unmodified command string: ECMAScript trim() removes BOM/NBSP/CR and other
+// non-shell whitespace, so a trimmed command can normalize a different
+// executable name (e.g. `\uFEFFomx`) into the exact `omx` token.
+function readPreToolUseRawCommand(payload: CodexHookPayload): string {
+  return safeString(safeObject(payload.tool_input).command);
 }
 
 function readPreToolUsePathCandidates(payload: CodexHookPayload): string[] {
@@ -4705,7 +5350,7 @@ function commandHasDeepInterviewWriteIntent(command: string, depth = 0, cwd = pr
     ));
 }
 
-type PreToolUseMutationTransport = "read-only" | "bash" | "path" | "state" | "orchestration" | "unknown";
+type PreToolUseMutationTransport = "read-only" | "bash" | "path" | "state" | "orchestration" | "goal-lifecycle" | "unknown";
 
 const READ_ONLY_PRETOOLUSE_TOOL_NAMES = new Set([
   "Read",
@@ -4782,6 +5427,37 @@ const CONDUCTOR_ORCHESTRATION_TOOL_NAMES = new Set([
   "multi_agent_v1.close_agent",
 ]);
 
+// Finite native Codex goal-tool identities for Ultragoal reconciliation.
+// Canonicalize ONLY exact known host-emitted forms (bare, functions.*, and known
+// flattened forms). Unknown/near-miss names stay fail-closed as "unknown".
+// Callers keep the original received name for diagnostics.
+const NATIVE_CODEX_GOAL_READ_TOOL_NAMES = new Set([
+  "get_goal",
+  "functions.get_goal",
+  "functionsget_goal",
+]);
+const NATIVE_CODEX_GOAL_LIFECYCLE_TOOL_NAMES = new Set([
+  "create_goal",
+  "update_goal",
+  "functions.create_goal",
+  "functions.update_goal",
+  "functionscreate_goal",
+  "functionsupdate_goal",
+]);
+
+function canonicalizeNativeCodexGoalToolName(name: string): string {
+  switch (name) {
+    case "functionsget_goal":
+      return "functions.get_goal";
+    case "functionscreate_goal":
+      return "functions.create_goal";
+    case "functionsupdate_goal":
+      return "functions.update_goal";
+    default:
+      return name;
+  }
+}
+
 function classifyPreToolUseMutationTransport(
   payload: CodexHookPayload,
   toolName: string,
@@ -4789,6 +5465,10 @@ function classifyPreToolUseMutationTransport(
 ): PreToolUseMutationTransport {
   if (toolName === "Bash") {
     const command = readPreToolUseCommand(payload);
+    if (
+      readPreToolUseRawCommand(payload) === command
+      && (isAllowedOmxReadOnlyCommand(command, cwd) || isAllowedGhReadOnlyCommand(command) || isAllowedVersionProbeCommand(command))
+    ) return "read-only";
     return commandHasDeepInterviewWriteIntent(command, 0, cwd) || collectOmxStateCommandOperations(command, "write").length > 0 || commandHasNestedCliMutationIntent(command) || classifyConductorExecutableRuntime(command, 0, cwd) !== null
       ? "bash"
       : "read-only";
@@ -4798,10 +5478,20 @@ function classifyPreToolUseMutationTransport(
   if (READ_ONLY_PRETOOLUSE_TOOL_NAMES.has(toolName) || READ_ONLY_PRETOOLUSE_MCP_TOOL_NAMES.has(toolName)) {
     return "read-only";
   }
+  // Finite Codex goal tools: exact names only (bare, functions.*, known flattened).
+  // Preserve the original toolName for deny diagnostics; classify on the canonical form.
+  if (NATIVE_CODEX_GOAL_READ_TOOL_NAMES.has(toolName) || NATIVE_CODEX_GOAL_READ_TOOL_NAMES.has(canonicalizeNativeCodexGoalToolName(toolName))) {
+    return "read-only";
+  }
+  if (NATIVE_CODEX_GOAL_LIFECYCLE_TOOL_NAMES.has(toolName) || NATIVE_CODEX_GOAL_LIFECYCLE_TOOL_NAMES.has(canonicalizeNativeCodexGoalToolName(toolName))) {
+    return "goal-lifecycle";
+  }
+  const canonicalToolName = canonicalizeNativeCollaborationToolName(toolName);
+
   if (
-    CONDUCTOR_ORCHESTRATION_TOOL_NAMES.has(toolName)
-    || toolName.startsWith("collaboration.")
-    || toolName.startsWith("multi_agent_v1.")
+    CONDUCTOR_ORCHESTRATION_TOOL_NAMES.has(canonicalToolName)
+    || canonicalToolName.startsWith("collaboration.")
+    || canonicalToolName.startsWith("multi_agent_v1.")
     || toolName.startsWith("mcp__omx_team__")
     || toolName.startsWith("mcp__omx_ultragoal__")
   ) {
@@ -5748,17 +6438,12 @@ function describeImplementationToolBlock(
 // is the narrow exception: the backend has a dedicated completeRalplanSession
 // path that coherently terminalizes root and session state when the payload is a
 // complete consensus-approved terminal state.
-function readStateWriteInputPayload(
+function extractStateWriteOperationPayload(
   cwd: string,
+  stateWriteOperation: OmxStateCommandOperation,
   command: string,
-  sourceCommand: string = command,
+  sourceCommand: string,
 ): Record<string, unknown> | null {
-  const stateWriteOperations = collectOmxStateCommandOperations(command, "write");
-  if (stateWriteOperations.length === 0) return null;
-  if (stateWriteOperations.length > 1) return null;
-
-  const stateWriteOperation = stateWriteOperations[0];
-  if (!stateWriteOperation) return null;
   const stateWriteArgs = stateWriteOperation.args;
 
   const mergeModeFlag = (payload: Record<string, unknown>): Record<string, unknown> | null => {
@@ -5800,13 +6485,50 @@ function readStateWriteInputPayload(
 
   try {
     const raw = readFileSync(resolve(resolvedInputFileCwd, inputFile.trim()), "utf-8");
-    const parsed = JSON.parse(raw);
+    const parsed = JSON.parse(raw.startsWith("\uFEFF") ? raw.slice(1) : raw);
     return parsed && typeof parsed === "object" && !Array.isArray(parsed)
       ? mergeModeFlag(parsed as Record<string, unknown>)
       : null;
   } catch {
     return null;
   }
+}
+
+function readStateWriteInputPayload(
+  cwd: string,
+  command: string,
+  sourceCommand: string = command,
+): Record<string, unknown> | null {
+  const stateWriteOperations = collectOmxStateCommandOperations(command, "write");
+  if (stateWriteOperations.length === 0) return null;
+  if (stateWriteOperations.length > 1) return null;
+
+  const stateWriteOperation = stateWriteOperations[0];
+  if (!stateWriteOperation) return null;
+
+  return extractStateWriteOperationPayload(cwd, stateWriteOperation, command, sourceCommand);
+}
+
+// #3311: unlike readStateWriteInputPayload (deliberately conservative —
+// abstains on any compound command for the broader planning-boundary guards
+// that call it), this variant is scoped to the narrow ultragoal-no-owner
+// activation check only. It inspects EVERY `omx state write` operation in a
+// compound Bash command (e.g. `omx state write ...; omx state write ...`)
+// so a benign-looking leading statement cannot mask a later activation
+// write that recreates the #3311 deadlock through the documented
+// `skills/ultragoal/SKILL.md` direct-write contract.
+function readAllStateWriteInputPayloads(
+  cwd: string,
+  command: string,
+  sourceCommand: string = command,
+): Record<string, unknown>[] {
+  const stateWriteOperations = collectOmxStateCommandOperations(command, "write");
+  const payloads: Record<string, unknown>[] = [];
+  for (const stateWriteOperation of stateWriteOperations) {
+    const payload = extractStateWriteOperationPayload(cwd, stateWriteOperation, command, sourceCommand);
+    if (payload) payloads.push(payload);
+  }
+  return payloads;
 }
 
 function envCommandHasCwdChangingOption(words: string[], startIndex: number): boolean {
@@ -5964,7 +6686,20 @@ function tokenizeShellWords(segment: string): string[] {
       }
       continue;
     }
-    if (!quote && /\s/.test(char)) {
+    // Bash's own lexer treats ONLY ASCII space, tab, and newline as
+    // word-separating blanks. It does NOT split on any other whitespace --
+    // not Unicode whitespace (NBSP U+00A0, BOM U+FEFF, Zs-class spaces,
+    // U+2028/2029), and not other ASCII control characters either (CR, VT,
+    // FF are literal bytes within a word to Bash, confirmed empirically via
+    // `bash -c`). JS regex `\s` (and an earlier, still-too-broad fix that
+    // additionally special-cased CR/VT/FF) previously let an embedded
+    // whitespace/control character make this tokenizer see two words
+    // ("omx", "--help") while Bash resolves and executes a single,
+    // differently-named executable ("omx<NBSP>--help", "omx<VT>--help",
+    // etc.) -- silently borrowing a trusted lookup for a different,
+    // attacker-controlled binary. Restrict this split to exactly the three
+    // characters Bash's own lexer recognizes as blanks.
+    if (!quote && (char === " " || char === "\t" || char === "\n")) {
       pushCurrent();
       continue;
     }
@@ -8317,7 +9052,7 @@ function isStandaloneParsedOmxStateWriteTransport(cwd: string, command: string, 
     || safeString(payload.session_id).trim() !== authoritativeSessionId
     || !suppliedSessionAliasesMatch(payload, authoritativeSessionId)
     || safeString(payload.workingDirectory).trim() === ""
-    || resolve(safeString(payload.workingDirectory)) !== resolve(cwd)) return false;
+    || !sameFilePath(safeString(payload.workingDirectory), cwd)) return false;
   const usesInputFile = readStateWriteFlagValue(stateWriteOperation.args, "--input-file") !== undefined;
   if (usesInputFile && splitStateScanSegments(canonicalCommand).length !== 1) return false;
   if (extractDeepInterviewCommandRedirectTargets(command).length > 0) return false;
@@ -8328,35 +9063,165 @@ function isStandaloneParsedOmxStateWriteTransport(cwd: string, command: string, 
   return mutations.length === 1 && mutations[0]?.mainRootStructuredStateWrite === true;
 }
 
-function isAllowedDeepInterviewRalplanHandoffCommand(cwd: string, command: string, authoritativeSessionId: string): boolean {
-  if (omxStateTransportHasUnsafeRuntimeWrapper(command)) return false;
-  const canonicalCommand = canonicalizeOmxStateTransportCommand(command);
-  if (hasUnsafeUnquotedHeredocExpansion(canonicalCommand)) return false;
-  if (hasUnquotedShellSubstitution(canonicalCommand)) return false;
-  if (findUnquotedOmxStateCommandIndexes(canonicalCommand, "clear").length > 0) return false;
-  if (hasDynamicNestedShellExecution(canonicalCommand)) return false;
-  if (commandHasUntargetedPlanningForbiddenIntent(canonicalCommand)) return false;
-  if (sourcesFileWrittenEarlierInSameCommand(cwd, canonicalCommand)) return false;
+export type DeepInterviewHandoffRejectReason =
+  | "session_id_missing"
+  | "session_id_mismatch"
+  | "session_alias_conflict"
+  | "working_directory_missing"
+  | "working_directory_mismatch"
+  | "gate_incomplete"
+  | "durable_evidence_missing"
+  | "artifact_target_not_allowed"
+  | "unsafe_transport";
+
+export const DEEP_INTERVIEW_HANDOFF_REJECT_DETAILS: Record<DeepInterviewHandoffRejectReason, string> = {
+  session_id_missing: "The handoff payload must include the authoritative session_id.",
+  session_id_mismatch: "The handoff payload session_id does not match the authoritative session.",
+  session_alias_conflict: "The handoff payload session aliases must match the authoritative session.",
+  working_directory_missing: "The handoff payload must include workingDirectory.",
+  working_directory_mismatch: "The handoff payload workingDirectory does not match the active workspace.",
+  gate_incomplete: "The handoff payload does not contain a complete deep-interview gate.",
+  durable_evidence_missing: "The handoff requires durable deep-interview evidence.",
+  artifact_target_not_allowed: "The handoff artifact target is not allowed.",
+  unsafe_transport: "The handoff command uses an unsafe transport.",
+};
+
+export type DeepInterviewRalplanHandoffEvaluation = {
+  allowed: boolean;
+  reason?: DeepInterviewHandoffRejectReason;
+};
+
+function rejectDeepInterviewRalplanHandoff(reason: DeepInterviewHandoffRejectReason): DeepInterviewRalplanHandoffEvaluation {
+  return { allowed: false, reason };
+}
+
+/**
+ * Resolves only the two documented shell parameter expansions in an inline
+ * handoff payload. This is not an authority grant: the values come from the
+ * hook's authoritative binding and active cwd, and the evaluator immediately
+ * verifies the resulting payload against those same values. Every other shell
+ * variable expansion is rejected rather than interpreted.
+ */
+function resolveDocumentedDeepInterviewHandoffInput(
+  canonicalCommand: string,
+  authoritativeSessionId: string,
+  cwd: string,
+): string | null {
   const stateWriteOperations = collectOmxStateCommandOperations(canonicalCommand, "write");
-  if (stateWriteOperations.length !== 1) return false;
+  const stateWriteOperation = stateWriteOperations.length === 1 ? stateWriteOperations[0] : undefined;
+  const inlineInput = stateWriteOperation ? readStateWriteFlagValue(stateWriteOperation.args, "--input") : undefined;
+  const expansions = canonicalCommand.match(/\$\{[^}]*\}/g) ?? [];
+  const shellExpansions = canonicalCommand.match(/\$(?:\{[^}]*\}|[A-Za-z_][A-Za-z0-9_]*)/g) ?? [];
+  const inputExpansions = inlineInput?.match(/\$[A-Za-z_][A-Za-z0-9_]*/g) ?? [];
+  if (expansions.length === 0) return canonicalCommand;
+  if (!inlineInput || expansions.length !== 2 || shellExpansions.length !== 2 || inputExpansions.length !== 2) return null;
+  if (!inputExpansions.every((expansion) => expansion === "$CONDUCTOR_DYNAMIC_PARAMETER")) return null;
+
+  const replacements = new Map<string, string>([
+    ["${OMX_SESSION_ID}", authoritativeSessionId],
+    ["${OMX_SESSION_ID:?authoritative OMX session required}", authoritativeSessionId],
+    ["${PWD}", cwd],
+    ["${PWD:?working directory required}", cwd],
+  ]);
+  if (!expansions.every((expansion) => replacements.has(expansion))) return null;
+  if (!expansions.some((expansion) => expansion.startsWith("${OMX_SESSION_ID"))) return null;
+  if (!expansions.some((expansion) => expansion.startsWith("${PWD"))) return null;
+
+  return canonicalizeOmxStateTransportCommand(canonicalCommand.replace(/\$\{[^}]*\}/g, (expansion) => replacements.get(expansion) ?? expansion));
+}
+
+function deepInterviewRalplanHandoffPayloadHasExactSchema(payload: Record<string, unknown>): boolean {
+  for (const [key, value] of Object.entries(payload)) {
+    if (key === "state") {
+      const nested = safeObject(value);
+      if (!nested || (Object.keys(nested).length > 0 && !deepInterviewRalplanHandoffPayloadHasExactSchema(nested))) return false;
+      continue;
+    }
+    if (key === "handoff_artifacts") {
+      const artifacts = safeObject(value);
+      if (!artifacts || Object.keys(artifacts).some((artifact) => artifact !== "deep_interview")) return false;
+      if (artifacts.deep_interview !== undefined && !safeString(artifacts.deep_interview).trim()) return false;
+      continue;
+    }
+    if (!CONDUCTOR_STATE_WRITE_ALLOWED_PAYLOAD_KEYS.has(key)) return false;
+  }
+  return Object.keys(payload).length > 0;
+}
+
+function readDeepInterviewRalplanHandoffPayload(
+  canonicalCommand: string,
+  authoritativeSessionId: string,
+  cwd: string,
+): Record<string, unknown> | null {
+  const resolvedCommand = resolveDocumentedDeepInterviewHandoffInput(canonicalCommand, authoritativeSessionId, cwd);
+  if (!resolvedCommand) return null;
+  // Preserve base input-file transport. The inline fallback admits only the
+  // documented handoff_artifacts expansion, with the same recursive key guard.
+  const basePayload = readStateWriteInputPayload(cwd, resolvedCommand, canonicalCommand);
+  if (basePayload) return basePayload;
+  const operations = collectOmxStateCommandOperations(resolvedCommand, "write");
+  const operation = operations.length === 1 ? operations[0] : undefined;
+  const inlineInput = operation ? readStateWriteFlagValue(operation.args, "--input") : undefined;
+  if (!operation || !inlineInput || readStateWriteFlagValue(operation.args, "--input-file") !== undefined) return null;
+  try {
+    const parsed = JSON.parse(inlineInput);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed)
+      && deepInterviewRalplanHandoffPayloadHasExactSchema(parsed as Record<string, unknown>)
+      ? normalizeStateWriteClassificationPayload(parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
+}
+
+
+export function evaluateDeepInterviewRalplanHandoffCommand(
+  cwd: string,
+  command: string,
+  authoritativeSessionId: string,
+): DeepInterviewRalplanHandoffEvaluation {
+  if (omxStateTransportHasUnsafeRuntimeWrapper(command)) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
+  const canonicalCommand = canonicalizeOmxStateTransportCommand(command);
+  if (hasUnsafeUnquotedHeredocExpansion(canonicalCommand)) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
+  if (hasUnquotedShellSubstitution(canonicalCommand)) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
+  if (findUnquotedOmxStateCommandIndexes(canonicalCommand, "clear").length > 0) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
+  if (hasDynamicNestedShellExecution(canonicalCommand)) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
+  if (commandHasUntargetedPlanningForbiddenIntent(canonicalCommand)) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
+  if (sourcesFileWrittenEarlierInSameCommand(cwd, canonicalCommand)) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
+  const stateWriteOperations = collectOmxStateCommandOperations(canonicalCommand, "write");
+  if (stateWriteOperations.length !== 1) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
   const stateWriteOperation = stateWriteOperations[0];
-  if (!stateWriteOperation || stateWriteOperation.nested) return false;
-  const payload = readStateWriteInputPayload(cwd, canonicalCommand, command);
-  if (!payload || !isDeepInterviewRalplanHandoffStatePayload(payload)) return false;
-  if (
-    safeString(payload.session_id).trim() !== authoritativeSessionId
-    || !suppliedSessionAliasesMatch(payload, authoritativeSessionId)
-    || safeString(payload.workingDirectory).trim() === ""
-    || resolve(safeString(payload.workingDirectory)) !== resolve(cwd)
-  ) return false;
+  if (!stateWriteOperation || stateWriteOperation.nested) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
+  const payload = readDeepInterviewRalplanHandoffPayload(canonicalCommand, authoritativeSessionId, cwd);
+  if (!payload) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
+  if (!isDeepInterviewRalplanHandoffStatePayload(payload)) return rejectDeepInterviewRalplanHandoff("gate_incomplete");
+  const payloadSessionId = safeString(payload.session_id).trim();
+  if (!payloadSessionId) return rejectDeepInterviewRalplanHandoff("session_id_missing");
+  if (payloadSessionId !== authoritativeSessionId) return rejectDeepInterviewRalplanHandoff("session_id_mismatch");
+  if (!suppliedSessionAliasesMatch(payload, authoritativeSessionId)) return rejectDeepInterviewRalplanHandoff("session_alias_conflict");
+  const workingDirectory = safeString(payload.workingDirectory).trim();
+  if (!workingDirectory) return rejectDeepInterviewRalplanHandoff("working_directory_missing");
+  if (!sameFilePath(workingDirectory, cwd)) return rejectDeepInterviewRalplanHandoff("working_directory_mismatch");
   const targets = extractDeepInterviewCommandWriteTargets(command);
   if (targets.length === 0) {
-    return !hasPriorExecutableCommand(stateWriteOperation.prefix)
-      && hasExistingDurableDeepInterviewHandoffEvidence(cwd);
+    if (hasPriorExecutableCommand(stateWriteOperation.prefix)) return rejectDeepInterviewRalplanHandoff("unsafe_transport");
+    return hasExistingDurableDeepInterviewHandoffEvidence(cwd)
+      ? { allowed: true }
+      : rejectDeepInterviewRalplanHandoff("durable_evidence_missing");
   }
-  if (!targets.some((target) => isDurableDeepInterviewHandoffEvidencePath(cwd, target))) return false;
-  if (!hasOnlyAllowedDeepInterviewRalplanHandoffMutations(cwd, command, authoritativeSessionId)) return false;
-  return targets.every((target) => isAllowedDeepInterviewArtifactPath(cwd, target, authoritativeSessionId));
+  if (!targets.some((target) => isDurableDeepInterviewHandoffEvidencePath(cwd, target))) return rejectDeepInterviewRalplanHandoff("durable_evidence_missing");
+  if (!hasOnlyAllowedDeepInterviewRalplanHandoffMutations(cwd, command, authoritativeSessionId)) {
+    return targets.some((target) => !isAllowedDeepInterviewArtifactPath(cwd, target, authoritativeSessionId))
+      ? rejectDeepInterviewRalplanHandoff("artifact_target_not_allowed")
+      : rejectDeepInterviewRalplanHandoff("unsafe_transport");
+  }
+  return targets.every((target) => isAllowedDeepInterviewArtifactPath(cwd, target, authoritativeSessionId))
+    ? { allowed: true }
+    : rejectDeepInterviewRalplanHandoff("artifact_target_not_allowed");
+}
+
+function isAllowedDeepInterviewRalplanHandoffCommand(cwd: string, command: string, authoritativeSessionId: string): boolean {
+  return evaluateDeepInterviewRalplanHandoffCommand(cwd, command, authoritativeSessionId).allowed;
 }
 
 
@@ -8389,7 +9254,7 @@ function isCompleteRalplanTerminalWritePayload(
   ).trim();
   if (payloadSessionId !== sessionId) return false;
   if (!suppliedSessionAliasesMatch(payload, sessionId)) return false;
-  if (safeString(payload.workingDirectory).trim() === "" || resolve(safeString(payload.workingDirectory)) !== resolve(cwd)) return false;
+  if (safeString(payload.workingDirectory).trim() === "" || !sameFilePath(safeString(payload.workingDirectory), cwd)) return false;
   if (activeSessionId && payloadSessionId !== activeSessionId) return false;
   return true;
 }
@@ -8457,7 +9322,7 @@ function isCompleteDeepInterviewTerminalWritePayload(
   const phase = safeString(payload.current_phase ?? payload.currentPhase).trim().toLowerCase();
   const payloadSessionId = safeString(payload.session_id).trim();
   if (!hasOnlyFinishedExplicitOutcomes(payload)) return false;
-  if (safeString(payload.workingDirectory).trim() === "" || resolve(safeString(payload.workingDirectory)) !== resolve(cwd)) return false;
+  if (safeString(payload.workingDirectory).trim() === "" || !sameFilePath(safeString(payload.workingDirectory), cwd)) return false;
   return mode === "deep-interview"
     && payload.active === false
     && phase === "complete"
@@ -8569,12 +9434,528 @@ function commandEndsPlanningPhase(cwd: string, command: string): boolean {
   return payload ? isPlanningPhaseDeactivationPayload(payload) : true;
 }
 
+function isSingleLiteralShellInvocation(command: string): boolean {
+  const normalizedCommand = normalizeShellLineContinuations(command).trim();
+  if (!normalizedCommand) return false;
+  if (hasUnquotedShellControlOrRedirection(normalizedCommand)) return false;
+  if (hasUnquotedShellSubstitution(normalizedCommand)) return false;
+  if (hasDynamicNestedShellExecution(normalizedCommand)) return false;
+  return splitShellCommandSegments(stripHeredocBodiesForCommandScan(normalizedCommand)).length === 1;
+}
+
+function literalInvocationWords(command: string): string[] {
+  return tokenizeShellWords(normalizeShellLineContinuations(command).trim()).map(shellWordLiteral);
+}
+
+function skipLiteralLeadingAssignments(words: string[]): number {
+  let index = 0;
+  while (index < words.length && isEnvironmentAssignmentWord(words[index] ?? "")) index += 1;
+  return index;
+}
+
+// Direct cancellation is recognized from the RAW command string with a
+// deliberately tiny ASCII grammar: exactly `omx cancel` (plus `--force` only
+// at the ralplan/Conductor callsites; deep-interview stays plain-cancel) with
+// optional ASCII space/tab padding. No leading environment assignments are
+// accepted at all — runtime startup/configuration variables are an open-ended
+// namespace (PATH, NODE_OPTIONS, OPENSSL_CONF, ...) and a denylist cannot
+// prove the invoked program is the unmodified OMX cancellation path. No
+// quotes, backslashes, shell operators, path-qualified or case-folded
+// executables, and no CR/LF/NUL/BOM/NBSP/Unicode whitespace: the scanner's
+// word boundaries and executable identity are exactly the shell's, so a
+// presented cancellation cannot smuggle a different executable, preload code,
+// or redirect a state tree. Callers must also prove the raw payload command
+// equals the analyzed command, because a lossy trim seam would otherwise
+// normalize a lookalike executable (e.g. `\uFEFFomx`) into the exact token.
+function isDirectOmxCancelCommand(command: string, options: { allowForce?: boolean } = {}): boolean {
+  if (!/^[\x09\x20-\x7E]*$/.test(command)) return false;
+  const words = command.replace(/^[ \t]+|[ \t]+$/g, "").split(/[ \t]+/).filter(Boolean);
+  if (words[0] !== "omx" || words[1] !== "cancel") return false;
+  const args = words.slice(2);
+  return args.length === 0 || (options.allowForce === true && args.length === 1 && args[0] === "--force");
+}
+
+type DirectCancelDenyReason =
+  | "invalid_command"
+  | "session_binding"
+  | "actor_authority"
+  | "active_state"
+  | HookCancelTransactionFailureReason;
+type DirectCancelResult =
+  | { kind: "not-direct-cancel" }
+  | { kind: "handled"; reason: "cancelled_exact_session"; output: Record<string, unknown> }
+  | { kind: "denied"; reason: DirectCancelDenyReason; output: Record<string, unknown> };
+
+function directCancelOutput(reason: string, handled = false): Record<string, unknown> {
+  return {
+    decision: "block",
+    reason: handled
+      ? "OMX direct cancellation completed for this session; the external command was intentionally not executed."
+      : `OMX direct cancellation was not performed (${reason}).`,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      permissionDecision: "deny",
+      permissionDecisionReason: handled ? "cancelled_exact_session" : reason,
+    },
+  };
+}
+
+async function handleDirectOmxCancel(input: {
+  command: string; rawCommand: string; cwd: string; stateDir: string;
+  canonicalSessionId: string; payload: CodexHookPayload; allowForce: boolean;
+  activeState: Record<string, unknown>;
+}): Promise<DirectCancelResult> {
+  const cancelLike = /^[ \t]*omx[ \t]+cancel\b/.test(input.command);
+  if (!cancelLike) return { kind: "not-direct-cancel" };
+  // IR2: hook-owned cancellation is exclusive to active Autopilot
+  // deep-interview. Every other workflow falls through to its pre-#3293
+  // executable-trust path unchanged.
+  if (!hookCancelAutopilotMatches(input.activeState, input.canonicalSessionId, resolve(input.cwd))) {
+    return { kind: "not-direct-cancel" };
+  }
+  if (input.rawCommand !== input.command || !isDirectOmxCancelCommand(input.command, { allowForce: input.allowForce })) {
+    return { kind: "denied", reason: "invalid_command", output: directCancelOutput("invalid_command") };
+  }
+  const aliases = payloadAliasValues(input.payload, ["session_id", "sessionId"]);
+  if (!input.canonicalSessionId || aliases.length !== 1 || aliases[0] !== input.canonicalSessionId || payloadHasConflictingIdentityAliases(input.payload)) {
+    return { kind: "denied", reason: "session_binding", output: directCancelOutput("session_binding") };
+  }
+  const actor = await resolvePreToolUseWriteActor(input.payload, input.cwd, input.stateDir, input.canonicalSessionId);
+  if (actor !== "main-root") return { kind: "denied", reason: "actor_authority", output: directCancelOutput("actor_authority") };
+
+  const recovery = await readHookCancelTransactionRecoveryState({ stateDir: input.stateDir, canonicalSessionId: input.canonicalSessionId });
+  if (recovery) return { kind: "denied", reason: recovery, output: directCancelOutput(recovery) };
+  const transaction = await terminalizeExactAutopilotSessionForHookCancel({
+    stateDir: input.stateDir,
+    canonicalSessionId: input.canonicalSessionId,
+    cwd: input.cwd,
+    nowIso: new Date().toISOString(),
+  });
+  if (!transaction.ok) {
+    const reason = transaction.reason ?? "preflight_failed";
+    return { kind: "denied", reason, output: directCancelOutput(reason) };
+  }
+  return { kind: "handled", reason: "cancelled_exact_session", output: directCancelOutput("cancelled_exact_session", true) };
+}
+
+function isAllowedOmxCleanupDryRunCommand(command: string): boolean {
+  if (!isSingleLiteralShellInvocation(command)) return false;
+  const words = literalInvocationWords(command);
+  const index = skipLiteralLeadingAssignments(words);
+  if (!["omx", "gjc"].includes(commandNameFromShellWord(words[index] ?? ""))) return false;
+  const args = words.slice(index + 1).filter(Boolean);
+  return args[0] === "cleanup"
+    && args.includes("--dry-run")
+    && args.every((arg, argIndex) => argIndex === 0 || arg === "--dry-run" || arg === "--json");
+}
+
+function stateReadTrailingArgsAreSafe(trailing: string[]): boolean {
+  if (trailing.length === 1 && (trailing[0] === "--help" || trailing[0] === "-h" || trailing[0] === "help")) return true;
+  let sawMode = false;
+  let sawJson = false;
+  let sawInput = false;
+  let sawInputFile = false;
+  const staticFlagValue = (value: string): boolean => Boolean(value) && !/[`$\0]/.test(value);
+  for (let index = 0; index < trailing.length; index += 1) {
+    const arg = trailing[index] ?? "";
+    if (arg === "--json") {
+      if (sawJson) return false;
+      sawJson = true;
+      continue;
+    }
+    if (arg === "--mode") {
+      if (sawMode) return false;
+      const value = trailing[index + 1] ?? "";
+      if (!staticFlagValue(value) || value.startsWith("-")) return false;
+      sawMode = true;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--mode=")) {
+      const value = arg.slice("--mode=".length);
+      if (sawMode || !staticFlagValue(value)) return false;
+      sawMode = true;
+      continue;
+    }
+    if (arg === "--input") {
+      if (sawInput || sawInputFile) return false;
+      const value = trailing[index + 1] ?? "";
+      if (!staticFlagValue(value)) return false;
+      sawInput = true;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--input=")) {
+      const value = arg.slice("--input=".length);
+      if (sawInput || sawInputFile || !staticFlagValue(value)) return false;
+      sawInput = true;
+      continue;
+    }
+    if (arg === "--input-file") {
+      if (sawInput || sawInputFile) return false;
+      const value = trailing[index + 1] ?? "";
+      if (!staticFlagValue(value) || value.startsWith("-")) return false;
+      sawInputFile = true;
+      index += 1;
+      continue;
+    }
+    if (arg.startsWith("--input-file=")) {
+      const value = arg.slice("--input-file=".length);
+      if (sawInput || sawInputFile || !staticFlagValue(value)) return false;
+      sawInputFile = true;
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+
+// Sparkshell's direct-argv dispatch (`omx sparkshell [--json] [--budget N] --
+// <argv...>`) executes the wrapped argv without shell reinterpretation, so
+// each wrapped word is already a literal token. Re-quoting those literal
+// tokens into a synthetic single-invocation command string lets the wrapped
+// invocation be re-scrutinized through the exact same write-intent checks
+// used for a directly-typed command, instead of trusting a bespoke allowlist.
+// `--shell`/`--tmux-pane`/any unrecognized sparkshell flag is refused (return
+// null) because those modes are not literal, bounded argv dispatch.
+function extractOmxSparkshellDirectArgvCommand(args: readonly string[]): string | null {
+  if (args[0] !== "sparkshell") return null;
+  let index = 1;
+  while (index < args.length) {
+    const arg = args[index] ?? "";
+    if (arg === "--") {
+      const wrapped = args.slice(index + 1);
+      if (wrapped.length === 0) return null;
+      return wrapped.map((word) => `'${word.replace(/'/g, `'\\''`)}'`).join(" ");
+    }
+    if (arg === "--json") {
+      index += 1;
+      continue;
+    }
+    if (arg === "--budget") {
+      const value = args[index + 1] ?? "";
+      if (!/^[1-9][0-9]*$/.test(value)) return null;
+      index += 2;
+      continue;
+    }
+    return null;
+  }
+  return null;
+}
+
+function isAllowedOmxSparkshellWrappedReadOnlyCommand(wrappedCommand: string): boolean {
+  if ([...OMX_SPARKSHELL_IMPLEMENTATION_ENV_NAMES].some(environmentNameIsPresent)) return false;
+  return !commandHasDeepInterviewWriteIntent(wrappedCommand)
+    && !commandHasNestedCliMutationIntent(wrappedCommand)
+    && collectOmxStateCommandOperations(wrappedCommand, "write").length === 0;
+}
+
+// The read-only allowlist (help/version/status/read, sparkshell-wrapped
+// discovery) must not authorize based on the bare `omx`/`gjc` basename alone:
+// an attacker-controlled PATH prefix, a path-qualified impostor executable
+// (absolute OR relative -- `./omx` resolves via the current directory, never
+// via PATH, so a basename-only trust check can be fooled by a legitimate
+// trusted `omx` existing elsewhere on PATH while a *different* `./omx` is
+// what the shell actually executes), or an inherited BASH_FUNC_omx%%/gjc%%
+// shell-function shadow could otherwise be granted this allowance regardless
+// of what it actually does, since the caller returns immediately on a
+// positive match. Share the exact trusted-package-CLI execution-context
+// proof already used for the direct-cancel path (including its literal bare
+// command-word grammar, function-shadow rejection, and inherited
+// NODE_OPTIONS/OPENSSL_CONF/Node-output-environment checks) so both paths
+// can never drift apart.
+
+const OMX_SPARKSHELL_IMPLEMENTATION_ENV_NAMES = new Set([
+  "OMX_SPARKSHELL_BIN",
+  "OMX_NATIVE_CACHE_DIR",
+  "OMX_NATIVE_MANIFEST_URL",
+  "OMX_NATIVE_RELEASE_BASE_URL",
+  "OMX_NATIVE_AUTO_FETCH",
+  "XDG_CACHE_HOME",
+  "LOCALAPPDATA",
+]);
+
+function environmentNameIsPresent(name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(process.env, name);
+}
+
+function commandHasLeadingEnvironmentName(command: string, names: ReadonlySet<string>): boolean {
+  const segments = splitShellCommandSegments(
+    stripHeredocBodiesForCommandScan(normalizeShellLineContinuations(command)),
+  );
+  for (const segment of segments) {
+    const words = tokenizeShellWords(segment);
+    const commandIndex = findWrappedCommandPositionIndex(words, 0);
+    const prefix = commandIndex === null ? words : words.slice(0, commandIndex);
+    if (prefix.some((word) => isEnvironmentAssignmentWord(word) && names.has(shellAssignmentName(word)))) return true;
+  }
+  return false;
+}
+
+function sparkshellImplementationOverrideIsPresent(command?: string): boolean {
+  if ([...OMX_SPARKSHELL_IMPLEMENTATION_ENV_NAMES].some(environmentNameIsPresent)) return true;
+  return command ? commandHasLeadingEnvironmentName(command, OMX_SPARKSHELL_IMPLEMENTATION_ENV_NAMES) : false;
+}
+const OMX_GJC_TRUSTED_CONTEXT_UNSAFE_INHERITED_ENV_NAMES = [
+  "NODE_OPTIONS",
+  "OPENSSL_CONF",
+];
+
+function omxOrGjcExecutionContextIsTrusted(
+  command: string,
+  cwd: string,
+  allowedCommandWords: readonly string[],
+): boolean {
+  if (commandHasUnsafeConductorShellState(command, cwd)) return false;
+  if (allowedCommandWords.some((name) => safeString(process.env[`BASH_FUNC_${name}%%`]).trim() !== "")) return false;
+  const unsafeInheritedNames = [...OMX_GJC_TRUSTED_CONTEXT_UNSAFE_INHERITED_ENV_NAMES, ...CONDUCTOR_NODE_OUTPUT_ENVIRONMENT_NAMES];
+  if (unsafeInheritedNames.some((name) => safeString(process.env[name]).trim() !== "")) return false;
+  if (commandHasUnsafeDynamicLoaderEnvironment(command)) return false;
+  if (commandHasUnsafeLeadingRuntimeEnvironment(command)) return false;
+  const words = tokenizeConductorShellWords(command);
+  const index = skipShellCommandPositionPrefixWords(words, 0);
+  // Require the literal bare command word (no path separator at all, not
+  // just an unqualified basename) so a relative or absolute impostor never
+  // borrows a trusted PATH resolution that belongs to a different, unrelated
+  // `omx`/`gjc` entry.
+  const commandWord = shellWordLiteral(words[index] ?? "");
+  if (!allowedCommandWords.includes(commandWord)) return false;
+  return conductorCommandResolvesTrustedPackageCli(words, 0, index, createConductorRuntimeShellState(cwd), cwd);
+}
+
+function isTrustedOmxOrGjcReadOnlyInvocation(command: string, cwd: string): boolean {
+  if (!isSingleLiteralShellInvocation(command)) return false;
+  return omxOrGjcExecutionContextIsTrusted(command, cwd, ["omx", "gjc"]);
+}
+const OMX_NESTED_HELP_COMMANDS = new Set([
+  "adapt",
+  "agents",
+  "agents-init",
+  "api",
+  "ask",
+  "autoresearch",
+  "autoresearch-goal",
+  "auth",
+  "capabilities",
+  "cleanup",
+  "deepinit",
+  "explore",
+  "hooks",
+  "hud",
+  "list",
+  "mcp-serve",
+  "mission",
+  "performance-goal",
+  "question",
+  "ralplan",
+  "ralph",
+  "resume",
+  "session",
+  "sidecar",
+  "sparkshell",
+  "state",
+  "team",
+  "tmux-hook",
+  "trace",
+  "ultragoal",
+  "url",
+  "wiki",
+]);
+const OMX_STATE_READ_ONLY_OPERATIONS = new Set(["read", "get-status"]);
+const OMX_HELP_TOKENS = new Set(["--help", "-h"]);
+
+function isAllowedOmxNestedHelpForm(args: readonly string[]): boolean {
+  if (args.length === 2 && OMX_NESTED_HELP_COMMANDS.has(args[0] ?? "")) {
+    return OMX_HELP_TOKENS.has(args[1] ?? "");
+  }
+  if (
+    args.length === 3
+    && args[0] === "state"
+    && OMX_STATE_READ_ONLY_OPERATIONS.has(args[1] ?? "")
+  ) {
+    return OMX_HELP_TOKENS.has(args[2] ?? "") || args[2] === "help";
+  }
+  return args.length === 2 && args[0] === "auth" && args[1] === "help";
+}
+
+// Shape-only recognizer (no trust check): true when `command` syntactically
+// resembles an OMX/GJC read-only surface or a recognized-but-sensitive
+// invocation that must be hard-denied when its strict parser form is not met.
+// It prevents the generic write-intent scanner from silently re-authorizing an
+// untrusted binary, shell-function shadow, invalid state spelling, or unsafe
+// sparkshell mode.
+function omxOrGjcReadOnlyShapeMatches(command: string): boolean {
+  if (!isSingleLiteralShellInvocation(command)) return false;
+  const words = literalInvocationWords(command);
+  const index = skipLiteralLeadingAssignments(words);
+  const commandName = commandNameFromShellWord(words[index] ?? "");
+  if (commandName !== "omx" && commandName !== "gjc") return false;
+  const args = words.slice(index + 1).filter(Boolean);
+  if (args.length === 0) return false;
+  if (args.some((arg) => arg === "--help" || arg === "-h" || arg === "--version" || arg === "-v")) return true;
+  if (args[0] === "help" || args[0] === "status" || args[0] === "version") return true;
+  if (args[0] === "state" && ["read", "get-status", "status"].includes(args[1] ?? "")) return true;
+  if (args[0] === "sparkshell") return true;
+  return args[0] === "cleanup" && args.includes("--dry-run");
+}
+
+function isAllowedOmxReadOnlyCommand(command: string, cwd: string): boolean {
+  if (!isTrustedOmxOrGjcReadOnlyInvocation(command, cwd)) return false;
+  const words = literalInvocationWords(command);
+  const index = skipLiteralLeadingAssignments(words);
+  const commandName = commandNameFromShellWord(words[index] ?? "");
+  if (commandName !== "omx" && commandName !== "gjc") return false;
+  const args = words.slice(index + 1).filter(Boolean);
+  if (args.length === 0) return false;
+
+  if (args[0] === "sparkshell") {
+    if (sparkshellImplementationOverrideIsPresent(command)) return false;
+    if (args.length === 2 && OMX_HELP_TOKENS.has(args[1] ?? "")) return true;
+    const sparkshellWrapped = extractOmxSparkshellDirectArgvCommand(args);
+    return sparkshellWrapped !== null && isAllowedOmxSparkshellWrappedReadOnlyCommand(sparkshellWrapped);
+  }
+
+  if (args.length === 1 && (args[0] === "--help" || args[0] === "-h" || args[0] === "--version" || args[0] === "-v")) return true;
+  if (args.length === 1 && (args[0] === "help" || args[0] === "status" || args[0] === "version")) return true;
+  if (isAllowedOmxNestedHelpForm(args)) return true;
+  if (args[0] === "state" && OMX_STATE_READ_ONLY_OPERATIONS.has(args[1] ?? "")) {
+    return stateReadTrailingArgsAreSafe(args.slice(2));
+  }
+  return isAllowedOmxCleanupDryRunCommand(command);
+}
+
+function isAllowedTrustedAbsoluteOmxReadOnlyCommand(command: string, cwd: string): boolean {
+  if (!isSingleLiteralShellInvocation(command)) return false;
+  if (commandHasUnsafeDynamicLoaderEnvironment(command) || commandHasUnsafeLeadingRuntimeEnvironment(command)) return false;
+  const unsafeInheritedNames = [...OMX_GJC_TRUSTED_CONTEXT_UNSAFE_INHERITED_ENV_NAMES, ...CONDUCTOR_NODE_OUTPUT_ENVIRONMENT_NAMES];
+  if (unsafeInheritedNames.some((name) => safeString(process.env[name]).trim() !== "")) return false;
+  const words = tokenizeConductorShellWords(command);
+  const index = skipShellCommandPositionPrefixWords(words, 0);
+  const commandWord = shellWordLiteral(words[index] ?? "");
+  if (!isAbsolute(commandWord) || !commandWord.includes("/") || /[$`]/.test(commandWord)) return false;
+  const commandName = commandNameFromShellWord(commandWord);
+  if (commandName !== "omx" && commandName !== "gjc") return false;
+  const state = resolveConductorCommandPathState(words, 0, index, createConductorRuntimeShellState(cwd));
+  if (!conductorSlashCommandIsTrusted(commandWord, state, cwd)) return false;
+  const args = collectConductorInvocationWords(words, index).map(shellWordLiteral).filter(Boolean);
+  if (args.length === 1 && (args[0] === "--help" || args[0] === "-h" || args[0] === "--version" || args[0] === "-v")) return true;
+  if (args.length === 1 && (args[0] === "help" || args[0] === "status" || args[0] === "version")) return true;
+  if (isAllowedOmxNestedHelpForm(args)) return true;
+  return args.length === 3
+    && args[0] === "ultragoal"
+    && args[1] === "status"
+    && args[2] === "--json";
+}
+
+function isAllowedVersionProbeCommand(command: string): boolean {
+  if (!isSingleLiteralShellInvocation(command)) return false;
+  const words = literalInvocationWords(command);
+  const index = skipLiteralLeadingAssignments(words);
+  return commandNameFromShellWord(words[index] ?? "") === "rtk"
+    && words[index + 1] === "--version"
+    && words.slice(index + 2).every((word) => word === "");
+}
+
+function isAllowedGhReadOnlyCommand(command: string): boolean {
+  if (!isSingleLiteralShellInvocation(command)) return false;
+  const words = literalInvocationWords(command);
+  const index = skipLiteralLeadingAssignments(words);
+  return commandNameFromShellWord(words[index] ?? "") === "gh"
+    && !ghInvocationHasUnsafeHelperEnvironment(words, index)
+    && ghReadOnlyCommandHasStaticRemoteArguments(words, index)
+    && !ghCommandHasMutationIntent(words, index);
+}
+
+function isAllowedDeepInterviewCommandSpecificBash(
+  payload: CodexHookPayload,
+  command: string,
+  cwd: string,
+): boolean {
+  const questionClassification = classifyOmxQuestionPreToolUse(command, payload);
+  if (questionClassification.kind === "allowed") return true;
+  // Parity with the ralplan/Conductor trusted direct-cancel path (#3313): a
+  // standalone (non-Autopilot-supervised) deep-interview session has no
+  // hook-owned cancellation handler, so `omx cancel` must still reach the
+  // same trusted-execution-context check ralplan already applies rather than
+  // being denied unconditionally. An unproven execution context still denies.
+  if (readPreToolUseRawCommand(payload) === command && isDirectOmxCancelCommand(command)) {
+    return directOmxCancelCommandHasTrustedExecutionContext(command, cwd);
+  }
+  // Authorization decisions whose security contract depends on exact bytes
+  // must compare against the unmodified command string, matching the
+  // direct-cancel exemption above: ECMAScript trim() removes a leading
+  // BOM/NBSP/CR from the analyzed `command`, which could otherwise let a
+  // differently-named executable (e.g. `\uFEFFomx`) borrow the trusted
+  // `omx`/`gjc` read-only allowance while the shell actually executes the
+  // untrimmed, differently-named binary.
+  if (readPreToolUseRawCommand(payload) !== command) return false;
+  return isAllowedOmxReadOnlyCommand(command, cwd)
+    || isAllowedGhReadOnlyCommand(command)
+    || isAllowedVersionProbeCommand(command);
+}
+
+// The pre-#3293 direct-cancel trust check is retained for Ralplan and
+// Conductor. IR2 scopes hook-owned terminalization to Autopilot deep-interview
+// only; those other workflows still execute their existing trusted command.
+// Shares omxOrGjcExecutionContextIsTrusted with the read-only allowlist so the
+// two proofs cannot drift apart (see the comment above that helper).
+function directOmxCancelCommandHasTrustedExecutionContext(command: string, cwd: string): boolean {
+  return omxOrGjcExecutionContextIsTrusted(command, cwd, ["omx"]);
+}
+
+function isCommandResolutionSensitiveEnvironmentName(name: string): boolean {
+  // Variables that redirect where the shell resolves the executable itself.
+  // A leading PATH/PATHEXT override can point a bare `omx`/`rtk` at an
+  // attacker-controlled binary before the command-specific allow return.
+  return name === "PATH" || name === "PATHEXT";
+}
+
+function commandHasUnsafeLeadingRuntimeEnvironment(command: string): boolean {
+  const segments = splitShellCommandSegments(
+    stripHeredocBodiesForCommandScan(normalizeShellLineContinuations(command)),
+  );
+  for (const segment of segments) {
+    for (const word of tokenizeShellWords(segment)) {
+      if (!isEnvironmentAssignmentWord(word)) break;
+      const name = shellAssignmentName(word);
+      if (
+        conductorRuntimeEnvironmentNameIsSensitive(name)
+        || isCommandResolutionSensitiveEnvironmentName(name)
+      ) return true;
+    }
+  }
+  return false;
+}
+
 function isAllowedDeepInterviewBashWrite(
   cwd: string,
   command: string,
   activeState?: Record<string, unknown>,
   sessionId = "",
+  payload?: CodexHookPayload,
 ): boolean {
+  if (commandHasUnsafeLeadingRuntimeEnvironment(command)) return false;
+  const questionClassification = payload
+    ? classifyOmxQuestionPreToolUse(command, payload)
+    : { kind: "not-question" as const };
+  if (questionClassification.kind !== "not-question") {
+    // omx question is only permitted as a clean, standalone bridged invocation; any
+    // compound/redirect/substitution form is denied so it cannot smuggle a mutation.
+    return questionClassification.kind === "allowed" && isSingleLiteralShellInvocation(command);
+  }
+  if (payload && isAllowedDeepInterviewCommandSpecificBash(payload, command, cwd)) return true;
+  // A command that syntactically matches a direct-cancel or read-only omx/gjc
+  // shape but failed that specific check (untrusted execution context,
+  // invalid grammar, unsafe sparkshell mode, etc.) must hard-deny here rather
+  // than fall through to the generic write-intent scanner below: that
+  // scanner has no notion of this allowlist's trust requirement and can
+  // independently conclude "no write intent" for unrelated reasons (e.g. an
+  // inherited BASH_FUNC_omx%%/gjc%% shell-function shadow), silently
+  // re-authorizing exactly what the specific check just refused.
+  if (
+    (payload && readPreToolUseRawCommand(payload) === command && isDirectOmxCancelCommand(command))
+    || omxOrGjcReadOnlyShapeMatches(command)
+  ) return false;
   if (sourcesFileWrittenEarlierInSameCommand(cwd, command)) return false;
   const stateWriteOperations = collectOmxStateCommandOperations(command, "write");
   const hasUnsafeRuntimeStateWrite = (words: string[]): boolean => {
@@ -8623,7 +10004,7 @@ function isAllowedDeepInterviewBashWrite(
       || safeString(payload.session_id).trim() !== sessionId
       || !suppliedSessionAliasesMatch(payload, sessionId)
       || safeString(payload.workingDirectory).trim() === ""
-      || resolve(safeString(payload.workingDirectory)) !== resolve(cwd)) return false;
+      || !sameFilePath(safeString(payload.workingDirectory), cwd)) return false;
   }
   if (commandHasUntargetedPlanningForbiddenIntent(command)) return false;
   if (firstPlanningTmpScriptExecutionTarget(cwd, command)) return false;
@@ -8669,16 +10050,28 @@ async function readActiveDeepInterviewStateForPreToolUse(
   if (!modeStateMatchesSkillStopContext(autopilotState, cwd, sessionId)) return null;
   const autopilotStatePhase = safeString(autopilotState.current_phase ?? autopilotState.currentPhase).trim().toLowerCase();
   const autopilotIsDeepInterview = normalizeAutopilotPhase(autopilotStatePhase) === "deep-interview";
-  const hasDeepInterviewScopedAutopilotSkill = listActiveSkills(canonicalState).some((entry) => (
-    entry.skill === "autopilot"
-    && normalizeAutopilotPhase(safeString(entry.phase).trim().toLowerCase()) === "deep-interview"
-    && matchesSkillStopContext(entry, canonicalState, sessionId, threadId)
-  ));
-  const hasActiveAutopilotSkill = listActiveSkills(canonicalState).some((entry) => (
+  const activeAutopilotEntries = listActiveSkills(canonicalState).filter((entry) => (
     entry.skill === "autopilot"
     && matchesSkillStopContext(entry, canonicalState, sessionId, threadId)
   ));
-  if (!hasActiveAutopilotSkill) return null;
+  const hasDeepInterviewScopedAutopilotSkill = activeAutopilotEntries.some((entry) => (
+    normalizeAutopilotPhase(safeString(entry.phase).trim().toLowerCase()) === "deep-interview"
+  ));
+  if (activeAutopilotEntries.length === 0) return null;
+  if (autopilotIsDeepInterview && !hasDeepInterviewScopedAutopilotSkill) {
+    const disagreeingPhase = activeAutopilotEntries
+      .map((entry) => safeString(entry.phase).trim())
+      .find((phase) => phase && normalizeAutopilotPhase(phase.toLowerCase()) !== "deep-interview");
+    if (disagreeingPhase) {
+      return {
+        ...autopilotState,
+        __omx_state_phase_mismatch: {
+          lifecycle_phase: autopilotStatePhase || "deep-interview",
+          skill_mirror_phase: disagreeingPhase,
+        },
+      };
+    }
+  }
   if (!autopilotIsDeepInterview && !hasDeepInterviewScopedAutopilotSkill) return null;
   return autopilotState;
 }
@@ -8735,7 +10128,40 @@ function isAllowedRalplanBashWrite(
   command: string,
   activeState: Record<string, unknown>,
   sessionId: string,
+  // Authorizing evaluators must receive the untrimmed payload command
+  // explicitly; only diagnostic callers may reuse the analyzed command here.
+  rawCommand: string,
 ): boolean {
+  // Session-scoped cancellation is the owning session's documented recovery
+  // surface: it terminalizes workflow state without touching planning
+  // artifacts, so it stays available while ralplan is active (parity with the
+  // deep-interview boundary). The allow admits only the exact bare
+  // `omx cancel [--force]` invocation, and only when the raw payload command
+  // is byte-identical to the analyzed command, so neither a presented
+  // cancellation nor a lossy normalization seam can smuggle a different
+  // executable, preload code, or redirect a state tree.
+  if (rawCommand === command && isDirectOmxCancelCommand(command, { allowForce: true })) {
+    return directOmxCancelCommandHasTrustedExecutionContext(command, cwd);
+  }
+  // Read-only discovery (help/version/status/read, sparkshell-wrapped
+  // read-only argv, and gh read-only commands) is not implementation intent
+  // and must not be misclassified as a write during ralplan planning (#3314).
+  // Requires raw/analyzed byte equality first, matching the direct-cancel
+  // exemption above: trimming can otherwise let a differently-named
+  // executable (e.g. leading BOM/NBSP) borrow this trusted allowance while
+  // the shell executes a different, untrimmed binary name.
+  if (
+    rawCommand === command
+    && (isAllowedOmxReadOnlyCommand(command, cwd) || isAllowedGhReadOnlyCommand(command) || isAllowedVersionProbeCommand(command))
+  ) {
+    return true;
+  }
+  // Hard-deny a recognized-but-untrusted omx/gjc read-only shape instead of
+  // falling through to the generic write-intent scanner below, which has no
+  // notion of this allowlist's trust requirement (see the identical deny in
+  // isAllowedDeepInterviewBashWrite for the full rationale).
+  if (omxOrGjcReadOnlyShapeMatches(command)) return false;
+
   const beadsCommand = classifyRalplanBeadsMetadataCommand(cwd, command);
   const targets = extractDeepInterviewCommandWriteTargets(command);
   const hasAllowedTargets = targets.length > 0
@@ -8826,12 +10252,12 @@ function buildPlanningActorWriteDeny(
     decision: "block",
     reason: provenanceConflict
       ? `PROVENANCE_DENIED: ${modeLabel} is active (phase: ${phase}); payload identity aliases conflict and cannot authorize a write.`
-      : `OWNER_CONFIRMATION_REQUIRED: ${modeLabel} is active (phase: ${phase}); implementation/write tools are blocked because native child/descendant provenance establishes same-session origin, not assigned write authority.`,
+      : `OWNER_CONFIRMATION_REQUIRED: ${modeLabel} is active (phase: ${phase}); implementation/write tools are blocked because native child/descendant provenance establishes same-session origin, not product-write authority.`,
     hookSpecificOutput: {
       hookEventName: "PreToolUse",
       additionalContext: provenanceConflict
         ? "PROVENANCE_DENIED: Conflicting or ambiguous native identity cannot authorize planning or workflow-state mutations."
-        : `OWNER_CONFIRMATION_REQUIRED: Native child/descendant provenance permits only positively classified read-only operations unless exact authoritative write assignment exists. ${modeLabel === "Deep-interview" ? "Deep-interview remains requirements/spec mode." : "Planning artifact paths do not grant write authority."}`,
+        : `OWNER_CONFIRMATION_REQUIRED: Native child/descendant provenance permits only positively classified read-only operations in this implementation. ${modeLabel === "Deep-interview" ? "Deep-interview remains requirements/spec mode." : "Planning artifact paths do not grant write authority."}`,
     },
   };
 }
@@ -8873,7 +10299,7 @@ function teamWorkerMutationTargetsProtectedWorkflowState(
   };
   const mutationTransport = classifyPreToolUseMutationTransport(payload, toolName, cwd);
   if (toolName === "mcp__omx_state__state_clear" || toolName === "mcp__omx_state__state_write") return true;
-  if (mutationTransport === "unknown" || mutationTransport === "state") return true;
+  if (mutationTransport === "unknown" || mutationTransport === "state" || mutationTransport === "goal-lifecycle") return true;
   if (toolName === "Bash") {
     if (collectOmxStateCommandOperations(command, "write").length > 0
       || findUnquotedOmxStateCommandIndexes(command, "clear").length > 0) return true;
@@ -8943,6 +10369,54 @@ function teamWorkerMutationTargetsProtectedWorkflowState(
 }
 
 
+// #3316: `collaboration.send_message` tool_input is inert coordination
+// metadata (`{agent_id, message}`) with no path/command/code payload — it
+// cannot itself execute or mutate anything. It is scoped out of the blanket
+// native-child "orchestration" deny ONLY when a registered child can prove,
+// against the same authoritative session's `subagent-tracking.json`, that it
+// is messaging its own owning leader thread. Every other collaboration.* tool
+// (spawn/close/interrupt/followup/wait_agent) stays gated via the unchanged
+// "orchestration" transport classification, and every other actor/target
+// combination for send_message itself (foreign session, unrelated cross-child,
+// wrong parent/session, malformed/empty/non-string target, unregistered
+// cold-start leader) stays denied fail-closed.
+function readCollaborationSendMessageTargetAgentId(payload: CodexHookPayload): string {
+  const input = safeObject(payload.tool_input);
+  const value = input?.agent_id;
+  return typeof value === "string" ? value.trim() : "";
+}
+
+async function resolveAuthorizedSendMessageChildToLeader(
+  payload: CodexHookPayload,
+  toolName: string,
+  cwd: string,
+  sessionId: string,
+): Promise<boolean> {
+  if (!sessionId) return false;
+  if (canonicalizeNativeCollaborationToolName(toolName) !== "collaboration.send_message") return false;
+
+  const targetAgentId = readCollaborationSendMessageTargetAgentId(payload);
+  if (!targetAgentId) return false;
+
+  const callerId = readPayloadAgentId(payload) || readPayloadThreadId(payload);
+  if (!callerId) return false;
+
+  const trackingState = await readSubagentTrackingState(cwd).catch(() => null);
+  const session = trackingState?.sessions?.[sessionId];
+  // A leader that has not yet been registered (cold-start) is not treated as
+  // an authoritative target here; fail closed rather than silently trust an
+  // unregistered identity.
+  const leaderThreadId = safeString(session?.leader_thread_id).trim();
+  if (!leaderThreadId) return false;
+  if (targetAgentId !== leaderThreadId) return false;
+
+  // Target relation must be proven: the caller must itself be a registered
+  // subagent thread of this exact session (not an arbitrary same-session
+  // cross-child, and not the leader thread messaging itself).
+  const callerThread = session?.threads?.[callerId];
+  return Boolean(callerThread) && callerThread!.kind === "subagent";
+}
+
 async function buildRalplanPreToolUseBoundaryOutput(
   payload: CodexHookPayload,
   cwd: string,
@@ -8957,7 +10431,7 @@ async function buildRalplanPreToolUseBoundaryOutput(
   if (!activeState) return null;
 
   const toolName = safeString(payload.tool_name).trim();
-  if (toolName === "mcp__omx_state__state_write" && !directConductorStateWritePayloadHasExactSchema(payload, cwd, sessionId)) {
+  if (toolName === "mcp__omx_state__state_write" && !await directConductorStateWritePayloadHasExactSchema(payload, cwd, stateDir, sessionId)) {
     return buildPlanningStateScopeDeny(
       safeString(activeState.mode).trim().toLowerCase() === "autopilot" ? "Autopilot planning" : "Ralplan",
       formatPhase(activeState.current_phase ?? activeState.currentPhase, "planning"),
@@ -8982,7 +10456,14 @@ async function buildRalplanPreToolUseBoundaryOutput(
       || collectOmxStateCommandOperations(command, "write").length > 0
       || commandHasNestedCliMutationIntent(command)
     : mutationTransport !== "read-only";
-  if (actorMutation && (actor === "native-child" || actor === "provenance-conflict")) {
+  if (
+    actorMutation
+    && (actor === "native-child" || actor === "provenance-conflict")
+    && !(
+      actor === "native-child"
+      && await resolveAuthorizedSendMessageChildToLeader(payload, toolName, authorityCwd, sessionId)
+    )
+  ) {
     return buildPlanningActorWriteDeny(
       safeString(activeState.mode).trim().toLowerCase() === "autopilot" ? "Autopilot planning" : "Ralplan",
       formatPhase(activeState.current_phase ?? activeState.currentPhase, "planning"),
@@ -8994,7 +10475,7 @@ async function buildRalplanPreToolUseBoundaryOutput(
   let blockedDetail = "implementation/write tools are blocked until an explicit execution handoff workflow is activated";
 
   if (toolName === "Bash") {
-    blocked = !isAllowedRalplanBashWrite(cwd, command, activeState, sessionId);
+    blocked = !isAllowedRalplanBashWrite(cwd, command, activeState, sessionId, readPreToolUseRawCommand(payload));
     if (blocked) {
       blockedDetail = buildRalplanBashBlockedDetail(cwd, command, sessionId);
     }
@@ -9019,7 +10500,7 @@ async function buildRalplanPreToolUseBoundaryOutput(
         blockedDetail = describeImplementationToolBlock(toolName, blockedPath, toolPathCandidates.length);
       }
     }
-  } else if (mutationTransport === "unknown") {
+  } else if (mutationTransport === "unknown" || mutationTransport === "goal-lifecycle") {
     blocked = true;
     blockedDetail = `${toolName || "unknown tool"} is not a recognized read-only or explicitly authorized planning mutation transport`;
   }
@@ -9081,7 +10562,7 @@ async function buildDeepInterviewPreToolUseBoundaryOutput(
   if (!activeState) return null;
 
   const toolName = safeString(payload.tool_name).trim();
-  if (toolName === "mcp__omx_state__state_write" && !directConductorStateWritePayloadHasExactSchema(payload, cwd, sessionId)) {
+  if (toolName === "mcp__omx_state__state_write" && !await directConductorStateWritePayloadHasExactSchema(payload, cwd, stateDir, sessionId)) {
     return buildPlanningStateScopeDeny(
       "Deep-interview",
       formatPhase(activeState.current_phase ?? activeState.currentPhase, "planning"),
@@ -9106,7 +10587,14 @@ async function buildDeepInterviewPreToolUseBoundaryOutput(
       || collectOmxStateCommandOperations(command, "write").length > 0
       || commandHasNestedCliMutationIntent(command)
     : mutationTransport !== "read-only";
-  if (actorMutation && (actor === "native-child" || actor === "provenance-conflict")) {
+  if (
+    actorMutation
+    && (actor === "native-child" || actor === "provenance-conflict")
+    && !(
+      actor === "native-child"
+      && await resolveAuthorizedSendMessageChildToLeader(payload, toolName, authorityCwd, sessionId)
+    )
+  ) {
     return buildPlanningActorWriteDeny(
       "Deep-interview",
       formatPhase(activeState.current_phase ?? activeState.currentPhase, "planning"),
@@ -9117,7 +10605,7 @@ async function buildDeepInterviewPreToolUseBoundaryOutput(
   let blockedDetail = "implementation/write tools are blocked until an explicit handoff workflow is activated";
 
   if (toolName === "Bash") {
-    blocked = !isAllowedDeepInterviewBashWrite(cwd, command, activeState, sessionId);
+    blocked = !isAllowedDeepInterviewBashWrite(cwd, command, activeState, sessionId, payload);
     if (blocked) {
       blockedDetail = buildDeepInterviewBashBlockedDetail(cwd, command, sessionId);
     }
@@ -9138,7 +10626,7 @@ async function buildDeepInterviewPreToolUseBoundaryOutput(
       const blockedPath = candidates.find((candidate) => !isAllowedDeepInterviewArtifactPath(cwd, candidate, sessionId));
       blockedDetail = describeImplementationToolBlock(toolName, blockedPath, candidates.length);
     }
-  } else if (mutationTransport === "unknown") {
+  } else if (mutationTransport === "unknown" || mutationTransport === "goal-lifecycle") {
     blocked = true;
     blockedDetail = `${toolName || "unknown tool"} is not a recognized read-only or explicitly authorized deep-interview mutation transport`;
   }
@@ -9146,6 +10634,22 @@ async function buildDeepInterviewPreToolUseBoundaryOutput(
   if (!blocked) return null;
 
   const phase = formatPhase(activeState.current_phase ?? activeState.currentPhase, "planning");
+  const phaseMismatch = activeState.__omx_state_phase_mismatch && typeof activeState.__omx_state_phase_mismatch === "object"
+    ? activeState.__omx_state_phase_mismatch as Record<string, unknown>
+    : null;
+  if (phaseMismatch) {
+    const lifecyclePhase = safeString(phaseMismatch.lifecycle_phase).trim() || phase;
+    const skillMirrorPhase = safeString(phaseMismatch.skill_mirror_phase).trim() || "<missing>";
+    return {
+      decision: "block",
+      reason: `STATE_PHASE_MISMATCH: Autopilot lifecycle phase: ${lifecyclePhase}; skill mirror phase: ${skillMirrorPhase}. The lifecycle state remains authoritative for write protection; use same-session \`omx cancel\` or a validated Autopilot deep-interview -> ralplan state transition to recover; ${blockedDetail}.`,
+      hookSpecificOutput: {
+        hookEventName: "PreToolUse",
+        additionalContext:
+          "STATE_PHASE_MISMATCH: Autopilot lifecycle and skill-active mirror disagree. Do not infer implementation authorization from the mirror phase; recover with same-session `omx cancel` or a validated lifecycle transition that updates canonical state.",
+      },
+    };
+  }
   return {
     decision: "block",
     reason: `Deep-interview is active (phase: ${phase}); implementation/write tools are blocked until an explicit handoff workflow is activated; ${blockedDetail}.`,
@@ -9163,7 +10667,7 @@ function blocksDeepInterviewImplementationWrite(payload: CodexHookPayload, cwd: 
     return !isAllowedDeepInterviewBashWrite(cwd, readPreToolUseCommand(payload), undefined, authoritativeSessionId);
   }
   const mutationTransport = classifyPreToolUseMutationTransport(payload, toolName);
-  if (mutationTransport === "unknown") return true;
+  if (mutationTransport === "unknown" || mutationTransport === "goal-lifecycle") return true;
   if (mutationTransport !== "path") return false;
   const candidates = collectImplementationToolPathCandidates(
     payload,
@@ -9264,7 +10768,7 @@ async function buildPlanningRootPointerConflictPreToolUseOutput(
   if (toolName === "Bash") {
     const command = readPreToolUseCommand(payload);
     blocked = commandEndsPlanningPhase(cwd, command)
-      || !isAllowedRalplanBashWrite(cwd, command, ralplanState, rootSessionId);
+      || !isAllowedRalplanBashWrite(cwd, command, ralplanState, rootSessionId, readPreToolUseRawCommand(payload));
   } else if (
     mutationTransport === "state"
     && (
@@ -9281,7 +10785,7 @@ async function buildPlanningRootPointerConflictPreToolUseOutput(
     );
     blocked = toolPathCandidates.length === 0
       || toolPathCandidates.some((candidate) => !isAllowedRalplanArtifactPath(cwd, candidate, rootSessionId));
-  } else if (mutationTransport === "unknown") {
+  } else if (mutationTransport === "unknown" || mutationTransport === "goal-lifecycle") {
     blocked = true;
   }
 
@@ -9411,17 +10915,145 @@ async function readActiveConductorStateForPreToolUse(
 
   return null;
 }
+// #3311: standalone Ultragoal must not activate an execution-blocking
+// Main-root Conductor state on a host surface where no authorized executor
+// will ever be reachable. On native Codex App / native-hook surfaces outside
+// tmux, the Team runtime is unavailable and typed native child/descendant
+// provenance intentionally does not grant write authority (see #3127), so
+// once Conductor mode activates for standalone ultragoal there, only
+// `omx cancel` remains reachable. Refuse the activation write itself instead
+// of letting the deadlock occur; this is additive and only fires for a
+// *fresh* activation (no existing active Conductor state for this session).
+const ULTRAGOAL_NO_OWNER_DENY_REASON =
+  "OMX-ULTRAGOAL-NO-OWNER: standalone Ultragoal cannot activate Main-root Conductor mode on this host surface "
+  + "(Codex App / native hook, outside tmux) because no authorized executor is reachable here: the Team runtime "
+  + "is tmux-only, and native child/descendant provenance intentionally does not grant write authority (see #3127). "
+  + "Activating Conductor mode here would deadlock with only `omx cancel` reachable.";
+
+function collectUltragoalActivationCandidatePayloads(
+  payload: CodexHookPayload,
+  toolName: string,
+  cwd: string,
+): Record<string, unknown>[] {
+  if (toolName === "mcp__omx_state__state_write") {
+    const input = safeObject(payload.tool_input);
+    return input ? [input] : [];
+  }
+  if (toolName === "Bash") {
+    return readAllStateWriteInputPayloads(cwd, readPreToolUseCommand(payload));
+  }
+  return [];
+}
+
+// #3311: executeStateOperation's state_write backend merges a payload as
+// `{...existing, ...fields, ...(state || {})}` — a nested `state` object
+// (present on both the Bash --input JSON and the structured MCP tool_input)
+// overrides top-level activation fields, while `mode` always comes from the
+// top-level routing field regardless of any nested `state.mode`. Flatten the
+// same way here so a payload that only nests `current_phase`/`active` under
+// `state` cannot bypass detection while still reaching the exact same write.
+function flattenStateWriteActivationPayload(input: Record<string, unknown>): Record<string, unknown> {
+  const nestedState = safeObject(input.state);
+  return nestedState ? { ...input, ...nestedState, mode: input.mode } : input;
+}
+
+function isUltragoalConductorActivationPayload(input: Record<string, unknown> | null): boolean {
+  if (!input) return false;
+  const flattened = flattenStateWriteActivationPayload(input);
+  if (safeString(flattened.mode).trim() !== "ultragoal") return false;
+  if (flattened.active !== true) return false;
+  return isNonTerminalPhase(flattened.current_phase ?? flattened.currentPhase);
+}
+
+async function buildUltragoalNoOwnerActivationGuardOutput(
+  payload: CodexHookPayload,
+  cwd: string,
+  stateDir: string,
+  resolvedSessionId?: string,
+  policyCwd = cwd,
+): Promise<Record<string, unknown> | null> {
+  const toolName = safeString(payload.tool_name).trim();
+  if (toolName !== "Bash" && toolName !== "mcp__omx_state__state_write") return null;
+  const activationCandidates = collectUltragoalActivationCandidatePayloads(payload, toolName, cwd);
+  if (!activationCandidates.some((candidate) => isUltragoalConductorActivationPayload(candidate))) return null;
+
+  const sessionId = safeString(resolvedSessionId ?? readPayloadSessionId(payload)).trim();
+  if (!sessionId) return null;
+
+  // Already-active sessions (phase updates, resumption, or recovery on an
+  // existing stuck state) remain governed by the existing Conductor write
+  // guard and `omx cancel`, not this pre-activation refusal.
+  if (await readActiveConductorStateForPreToolUse(payload, policyCwd, stateDir, sessionId)) return null;
+
+  const writeActor = await resolvePreToolUseWriteActor(payload, cwd, stateDir, sessionId);
+  if (writeActor !== "main-root") return null;
+
+  const executionSurface = resolveCodexExecutionSurface(cwd, {
+    hookEventName: "PreToolUse",
+    payload,
+    canonicalSessionId: sessionId,
+    nativeSessionId: readPayloadThreadId(payload),
+  });
+  if (executionSurface.launcher !== "native" || executionSurface.transport !== "outside-tmux") return null;
+
+  return {
+    decision: "block",
+    reason: ULTRAGOAL_NO_OWNER_DENY_REASON,
+    hookSpecificOutput: {
+      hookEventName: "PreToolUse",
+      additionalContext:
+        "Standalone Ultragoal Conductor mode requires an attached tmux session (Team execution) on native Codex App "
+        + "outside tmux; native child/descendant provenance does not grant write authority. Do not set ultragoal "
+        + "active/current_phase here. Proceed with direct bounded implementation for this task without "
+        + "entering Ultragoal's Conductor-gated planning mode, or re-run from an attached tmux OMX CLI shell so "
+        + "`omx team` is available. `omx cancel` remains available if a stuck Conductor state already exists.",
+    },
+  };
+}
 
 function normalizeRepoRelativePath(cwd: string, rawPath: string): string | null {
   const candidate = rawPath.trim();
   if (!candidate || isUnresolvedVariableTarget(candidate)) return null;
   const absolute = isAbsolute(candidate) ? resolve(candidate) : resolve(cwd, candidate);
-  let relativePath = relative(cwd, absolute).replace(/\\/g, "/");
-  if (!relativePath || relativePath === ".") return null;
-  if (relativePath.startsWith("../") || relativePath === "..") {
-    relativePath = candidate.replace(/\\/g, "/");
+  const canonicalRelative = normalizePolicyRelativePath(cwd, absolute);
+  if (canonicalRelative) return canonicalRelative;
+
+  let lexicalRelative = relative(cwd, absolute).replace(/\\/g, "/");
+  if (!lexicalRelative || lexicalRelative === ".") return null;
+  if (lexicalRelative.startsWith("../") || lexicalRelative === "..") {
+    lexicalRelative = candidate.replace(/\\/g, "/");
   }
-  return relativePath.replace(/^\.\//, "");
+  return lexicalRelative.replace(/^\.\//, "");
+}
+
+function normalizePolicyRelativePath(policyRoot: string, candidatePath: string): string | null {
+  const lexicalRoot = resolve(policyRoot);
+  const lexicalCandidate = resolve(candidatePath);
+  const lexicalRelative = relative(lexicalRoot, lexicalCandidate).replace(/\\/g, "/");
+  if (
+    lexicalRelative
+    && lexicalRelative !== "."
+    && !lexicalRelative.startsWith("../")
+    && lexicalRelative !== ".."
+    && conductorPathTraversesLink(lexicalRoot, lexicalRelative)
+  ) {
+    return null;
+  }
+
+  const canonicalRoot = canonicalizeComparablePath(lexicalRoot);
+  const canonicalCandidate = canonicalizeComparablePath(lexicalCandidate);
+  const canonicalRelative = relative(canonicalRoot, canonicalCandidate).replace(/\\/g, "/");
+  if (
+    !canonicalRelative
+    || canonicalRelative === "."
+    || canonicalRelative.startsWith("../")
+    || canonicalRelative === ".."
+    || canonicalRelative.startsWith("/")
+  ) {
+    return null;
+  }
+  if (conductorPathTraversesLink(canonicalRoot, canonicalRelative)) return null;
+  return canonicalRelative.replace(/^\.\//, "");
 }
 
 function conductorPathTraversesLink(cwd: string, relativePath: string): boolean {
@@ -9997,6 +11629,7 @@ function commandHasUnsafeConductorShellState(command: string, cwd = process.cwd(
   let unresolvedNameref = false;
 
   if (!inheritedConductorShellOptions().known) return true;
+  if (isAllowedTrustedAbsoluteOmxReadOnlyCommand(command, cwd)) return false;
   for (const commandStart of collectShellCommandStartIndexes(words)) {
     const directCommandIndex = skipShellCommandPositionPrefixWords(words, commandStart);
     const directCommandWord = shellWordLiteral(words[directCommandIndex] ?? "");
@@ -10468,10 +12101,56 @@ function ghIssueCreateHasStaticRemoteArguments(words: string[], commandIndex: nu
   return values.has("--title") && (values.has("--body") || values.has("--body-file"));
 }
 
+function ghReadOnlyCommandHasStaticRemoteArguments(words: string[], commandIndex: number): boolean {
+  const args = collectConductorInvocationWords(words, commandIndex);
+  const [command, subcommand] = ghCommandPath(words, commandIndex);
+  if (!command || !subcommand) return false;
+  const readOnly = new Map<string, string[]>([
+    ["issue", ["list", "status", "view"]],
+    ["pr", ["checks", "diff", "list", "status", "view"]],
+    ["release", ["list", "view"]],
+    ["run", ["list", "view"]],
+    ["repo", ["list", "view"]],
+    ["gist", ["list", "view"]],
+    ["workflow", ["list", "view"]],
+    ["auth", ["status"]],
+    ["config", ["get"]],
+    ["extension", ["list"]],
+  ]);
+  if (!readOnly.get(command)?.includes(subcommand)) return false;
+  const valueOptions = new Set([
+    "--repo", "-R", "--hostname", "--json", "--jq", "--template", "--limit",
+    "--state", "--label", "--assignee", "--author", "--search", "--base",
+    "--head", "--branch", "--commit", "--workflow", "--app", "--user",
+  ]);
+  const flagOptions = new Set([
+    "--comments", "--files", "--patch", "--verbose", "--paginate",
+    "--archived", "--source", "--fork", "--public", "--private", "--internal",
+    "--owner", "--all", "--compact",
+  ]);
+  for (let index = 0; index < args.length; index += 1) {
+    const rawWord = args[index] ?? "";
+    const word = shellWordLiteral(rawWord);
+    if (!word || word === "--" || isDynamicNestedCommandString(word) || /[$`\0]/.test(word)) return false;
+    if (!word.startsWith("-")) continue;
+    const option = word.includes("=") ? word.split("=", 1)[0] ?? "" : word;
+    if (flagOptions.has(option)) {
+      if (word.includes("=")) return false;
+      continue;
+    }
+    if (!valueOptions.has(option)) return false;
+    const parsed = ghStaticOptionValue(args, index, option, true);
+    if (!parsed) return false;
+    index = parsed.nextIndex;
+  }
+  return true;
+}
+
 function isPositivelyClassifiedGhCommand(words: string[], commandIndex: number): boolean {
   if (ghInvocationHasUnsafeHelperEnvironment(words, commandIndex)) return false;
   return ghApiHasStaticRemoteEndpoint(words, commandIndex)
-    || ghIssueCreateHasStaticRemoteArguments(words, commandIndex);
+    || ghIssueCreateHasStaticRemoteArguments(words, commandIndex)
+    || ghReadOnlyCommandHasStaticRemoteArguments(words, commandIndex);
 }
 
 function ghCommandUsesOnlyRemoteOptions(words: string[], commandIndex: number): boolean {
@@ -10486,9 +12165,9 @@ function ghCommandHasMutationIntent(words: string[], commandIndex: number): bool
   if (command === "api") return parseConductorStaticGhApiInvocation(words, commandIndex)?.mutationIntent ?? true;
   const readOnly = new Map<string, string[]>([
     ["issue", ["list", "status", "view"]], ["pr", ["checks", "diff", "list", "status", "view"]],
-    ["release", ["list", "view"]], ["run", ["list", "view", "watch"]], ["repo", ["list", "view"]],
+    ["release", ["list", "view"]], ["run", ["list", "view"]], ["repo", ["list", "view"]],
     ["gist", ["list", "view"]], ["workflow", ["list", "view"]],
-    ["auth", ["status"]], ["config", ["get"]], ["alias", ["list"]], ["extension", ["list"]],
+    ["auth", ["status"]], ["config", ["get"]], ["extension", ["list"]],
   ]);
   return !readOnly.get(command)?.includes(subcommand);
 }
@@ -10541,7 +12220,7 @@ function omxCliInvocationHasMutationIntent(words: string[], commandIndex: number
   const commandName = operands[0] ?? "";
   const subcommand = operands[1] ?? "";
   if (!commandName || ["help", "read", "status", "version"].includes(commandName)) return false;
-  if (commandName === "state" && ["read", "status"].includes(subcommand)) return false;
+  if (commandName === "state" && ["read", "get-status"].includes(subcommand)) return false;
   if (["deep-interview", "ralplan", "ralph", "team", "ultragoal"].includes(commandName) && ["read", "status"].includes(subcommand)) return false;
   return true;
 }
@@ -10811,25 +12490,27 @@ function commandMayPopulateSensitiveRuntimeEnvironment(command: string): boolean
   };
   for (const segment of splitShellCommandSegments(stripHeredocBodiesForCommandScan(command))) {
     const words = tokenizeConductorShellWords(segment);
-    for (let index = 0; index < words.length; index += 1) {
-      const commandName = commandNameFromShellWord(words[index] ?? "");
+    for (const commandStart of collectShellCommandStartIndexes(words)) {
+      const directCommandIndex = skipShellCommandPositionPrefixWords(words, commandStart);
+      const commandIndex = findWrappedCommandPositionIndex(words, commandStart) ?? directCommandIndex;
+      const commandName = commandNameFromShellWord(words[commandIndex] ?? "");
       if (commandName === "printf") {
-        const operands = collectConductorInvocationWords(words, index);
+        const operands = collectConductorInvocationWords(words, commandIndex);
         const valueIndex = operands.findIndex((operand) => shellWordLiteral(operand) === "-v");
         if (valueIndex >= 0 && isSensitiveTarget(operands[valueIndex + 1])) return true;
         if (operands.some((operand) => /^-v[^-]/.test(shellWordLiteral(operand)))) return true;
       } else if (commandName === "read") {
-        const operands = collectConductorInvocationWords(words, index);
+        const operands = collectConductorInvocationWords(words, commandIndex);
         const names = operands.filter((operand) => {
           const literal = shellWordLiteral(operand);
           return literal !== "--" && !literal.startsWith("-");
         });
         if (names.some((name) => isSensitiveTarget(name))) return true;
       } else if (commandName === "getopts") {
-        const operands = collectConductorInvocationWords(words, index);
+        const operands = collectConductorInvocationWords(words, commandIndex);
         if (isSensitiveTarget(operands[1])) return true;
       } else if (commandName === "for" || commandName === "select") {
-        if (isSensitiveTarget(words[index + 1])) return true;
+        if (isSensitiveTarget(words[commandIndex + 1])) return true;
       }
     }
   }
@@ -14445,6 +16126,26 @@ function isStaticallyRecognizedConductorOrchestrationMutation(
   return hasExactConductorOrchestrationOptionSchema(commandName, words, commandIndex);
 }
 
+function isDirectTrustedAbsoluteUltragoalCheckpoint(command: string, rootCwd: string): boolean {
+  const words = tokenizeConductorShellWords(command);
+  const commandStarts = collectShellCommandStartIndexes(words);
+  if (commandStarts.length !== 1 || commandStarts[0] !== 0) return false;
+  const commandIndex = skipShellCommandPositionPrefixWords(words, 0);
+  if (words.slice(0, commandIndex).some((word) => parseShellAssignmentWord(word) === null)) return false;
+  const commandWord = shellWordLiteral(words[commandIndex] ?? "");
+  if (!isAbsolute(commandWord) || !commandWord.includes("/") || /[$`]/.test(commandWord)) return false;
+  const commandName = commandNameFromShellWord(commandWord);
+  if (commandName !== "omx" && commandName !== "gjc") return false;
+  const invocation = collectConductorInvocationWords(words, commandIndex).map(shellWordLiteral);
+  if (invocation[0] !== "ultragoal" || invocation[1] !== "checkpoint") return false;
+  const state = resolveConductorCommandPathState(words, 0, commandIndex, createConductorRuntimeShellState(rootCwd));
+  return conductorSlashCommandIsTrusted(commandWord, state, rootCwd)
+    && hasCanonicalInheritedConductorOrchestrationRoots(words, 0, commandIndex, rootCwd)
+    && !commandHasUnsafeConductorOrchestrationPrefixEnvironment(command, rootCwd)
+    && hasSafeConductorOrchestrationRuntimeEnvironment(words, 0, commandIndex, rootCwd, state)
+    && isStaticallyRecognizedConductorOrchestrationMutation(commandName, words, commandIndex, false);
+}
+
 
 function findConductorIsolatedInvocationBoundary(words: string[], commandStartIndex: number): number {
   const groupingOpens: number[] = [];
@@ -15350,6 +17051,28 @@ function conductorExecutableHasTrustedCurrentNodeRuntimeIdentity(commandName: st
   }
 }
 
+function conductorExecutableHasTrustedPackageCliIdentity(
+  commandName: string,
+  commandPath: string,
+  rootCwd: string,
+  state: ShellPosixState,
+): boolean {
+  if (commandName !== "omx" && commandName !== "gjc") return false;
+  try {
+    const lexical = resolve(commandPath);
+    const root = realpathSync(resolve(rootCwd));
+    if (lexical === root || lexical.startsWith(`${root}/`)) return false;
+    const knownCli = conductorKnownPackageCliPath(commandName);
+    const canonicalCommand = realpathSync(commandPath);
+    const interpreterTrusted = conductorPackageCliHasTrustedNodeInterpreter(commandPath, state, rootCwd);
+    return knownCli !== null
+      && canonicalCommand === knownCli
+      && interpreterTrusted;
+  } catch {
+    return false;
+  }
+}
+
 function conductorExecutableHasTrustedIdentity(
   commandName: string,
   commandPath: string,
@@ -15359,6 +17082,7 @@ function conductorExecutableHasTrustedIdentity(
   seen = new Set<string>(),
 ): boolean {
   if (conductorExecutableHasTrustedCurrentNodeRuntimeIdentity(commandName, commandPath)) return true;
+  if (conductorExecutableHasTrustedPackageCliIdentity(commandName, commandPath, rootCwd, state)) return true;
   if (!conductorExecutableHasTrustedSystemIdentity(commandPath, rootCwd)) return false;
   if (depth >= CONDUCTOR_BASH_MAX_NESTING_DEPTH) return false;
   let canonical: string;
@@ -15413,18 +17137,42 @@ function conductorNativeExecutableHeaderIsRecognized(header: Buffer): boolean {
     || header.includes(0);
 }
 
+const CONDUCTOR_WINDOWS_DEFAULT_PATHEXT = [".COM", ".EXE", ".BAT", ".CMD"] as const;
+function conductorPathListDelimiter(): string {
+  return process.platform === "win32" ? ";" : delimiter;
+}
+// Windows resolves a bare command through PATHEXT; enumerate the actual suffix
+// order instead of treating `:` as a universal PATH separator or trusting a
+// basename without proving which executable the shell selected.
+
+function conductorExecutablePathCandidates(directory: string, commandName: string): string[] | null {
+  if (process.platform !== "win32") return [join(directory, commandName)];
+  const rawPathext = process.env.PATHEXT;
+  const suffixes = rawPathext === undefined || rawPathext === ""
+    ? [...CONDUCTOR_WINDOWS_DEFAULT_PATHEXT]
+    : rawPathext.split(conductorPathListDelimiter()).map((suffix) => suffix.trim().toUpperCase()).filter(Boolean);
+  if (suffixes.length === 0 || suffixes.some((suffix) => !/^\.[A-Z0-9]+$/.test(suffix))) return null;
+  return [
+    join(directory, commandName),
+    ...suffixes.map((suffix) => join(directory, `${commandName}${suffix.toLowerCase()}`)),
+  ];
+}
+
 function conductorResolvePathInterpreter(commandName: string, state: ShellPosixState): string | null {
   const path = getConductorShellBinding(state, "PATH").value;
   if (!path || path === CONDUCTOR_UNKNOWN_SHELL_BINDING) return null;
-  for (const entry of path.split(":")) {
+  for (const entry of path.split(conductorPathListDelimiter())) {
     if (!entry || !isAbsolute(entry) || isConductorStaticDirectoryInvalidated(state, resolve(entry))) return null;
-    const candidate = join(entry, commandName);
-    try {
-      accessSync(candidate, fsConstants.X_OK);
-      return candidate;
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-      return null;
+    const candidates = conductorExecutablePathCandidates(entry, commandName);
+    if (!candidates) return null;
+    for (const candidate of candidates) {
+      try {
+        accessSync(candidate, fsConstants.X_OK);
+        return candidate;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
+        return null;
+      }
     }
   }
   return null;
@@ -15488,7 +17236,7 @@ function conductorPathMayResolveRepositoryExecutable(
   } catch {
     return true;
   }
-  for (const entry of path.split(":")) {
+  for (const entry of path.split(conductorPathListDelimiter())) {
     if (!entry || !isAbsolute(entry)) return true;
     let canonical: string;
     try {
@@ -15504,16 +17252,23 @@ function conductorPathMayResolveRepositoryExecutable(
       }
     }
 
-    const candidate = join(entry, commandName);
-    if (!existsSync(candidate)) {
+    const candidates = conductorExecutablePathCandidates(entry, commandName);
+    if (!candidates) return true;
+    let candidate: string | undefined;
+    for (const candidatePath of candidates) {
+      if (existsSync(candidatePath)) {
+        candidate = candidatePath;
+        break;
+      }
       try {
-        lstatSync(candidate);
+        lstatSync(candidatePath);
         return true;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        return true;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return true;
       }
     }
+    if (!candidate) continue;
+
     // An invalidated PATH entry cannot affect resolution when it lacks this command.
     if (
       isConductorStaticDirectoryInvalidated(state, resolve(entry))
@@ -15598,7 +17353,7 @@ function conductorPackageCliHasTrustedNodeInterpreter(candidate: string, state: 
   }
   const path = getConductorShellBinding(state, "PATH").value;
   if (!path || path === CONDUCTOR_UNKNOWN_SHELL_BINDING) return false;
-  for (const entry of path.split(":")) {
+  for (const entry of path.split(conductorPathListDelimiter())) {
     if (!isAbsolute(entry) || isConductorStaticDirectoryInvalidated(state, resolve(entry))) return false;
     try {
       if (!statSync(realpathSync(entry)).isDirectory()) return false;
@@ -15606,16 +17361,22 @@ function conductorPackageCliHasTrustedNodeInterpreter(candidate: string, state: 
       if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
       return false;
     }
-    const nodeCandidate = join(entry, "node");
-    if (!existsSync(nodeCandidate)) {
+    const nodeCandidates = conductorExecutablePathCandidates(entry, "node");
+    if (!nodeCandidates) return false;
+    let nodeCandidate: string | undefined;
+    for (const candidatePath of nodeCandidates) {
+      if (existsSync(candidatePath)) {
+        nodeCandidate = candidatePath;
+        break;
+      }
       try {
-        lstatSync(nodeCandidate);
+        lstatSync(candidatePath);
         return false;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        return false;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
       }
     }
+    if (!nodeCandidate) continue;
     return conductorPackageCliNodeInterpreterIsTrusted(nodeCandidate, rootCwd);
   }
   return false;
@@ -15631,7 +17392,7 @@ function conductorResolvedPackageCliCandidateIsTrusted(
   const expectedCandidate = conductorKnownPackageCliPath(commandName);
   const path = getConductorShellBinding(state, "PATH").value;
   if (!path || path === CONDUCTOR_UNKNOWN_SHELL_BINDING) return false;
-  for (const entry of path.split(":")) {
+  for (const entry of path.split(conductorPathListDelimiter())) {
     if (!isAbsolute(entry)) return false;
     let binDirectory: string;
     try {
@@ -15645,16 +17406,22 @@ function conductorResolvedPackageCliCandidateIsTrusted(
         return false;
       }
     }
-    const candidate = join(binDirectory, commandName);
-    if (!existsSync(candidate)) {
+    const candidates = conductorExecutablePathCandidates(binDirectory, commandName);
+    if (!candidates) return false;
+    let candidate: string | undefined;
+    for (const candidatePath of candidates) {
+      if (existsSync(candidatePath)) {
+        candidate = candidatePath;
+        break;
+      }
       try {
-        lstatSync(candidate);
+        lstatSync(candidatePath);
         return false;
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue;
-        return false;
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false;
       }
     }
+    if (!candidate) continue;
     try {
       accessSync(candidate, fsConstants.X_OK);
       const trustedCli = expectedCandidate !== null && realpathSync(candidate) === expectedCandidate;
@@ -15980,11 +17747,15 @@ function conductorPathnameExpansionIsAmbiguous(path: string): boolean {
 
 function normalizeWgetMutationTargets(targets: string[], effectiveCwd: string, rootCwd: string): string[] | null {
   const normalized: string[] = [];
+  const canonicalEffectiveCwd = canonicalizeComparablePath(effectiveCwd);
+  const canonicalRootCwd = canonicalizeComparablePath(rootCwd);
   for (const target of targets) {
     if (isUnresolvedVariableTarget(target) || /[`$]/.test(target) || conductorPathnameExpansionIsAmbiguous(target)) return null;
     try {
-      const absoluteTarget = isAbsolute(target) ? resolve(target) : resolve(effectiveCwd, target);
-      normalized.push(relative(rootCwd, absoluteTarget).replace(/\\/g, "/") || ".");
+      const absoluteTarget = isAbsolute(target)
+        ? canonicalizeComparablePath(target)
+        : resolve(canonicalEffectiveCwd, target);
+      normalized.push(relative(canonicalRootCwd, absoluteTarget).replace(/\\/g, "/") || ".");
     } catch {
       return null;
     }
@@ -16610,10 +18381,11 @@ function scanConductorShellSegment(
       && (!CONDUCTOR_PATH_INDEPENDENT_BUILTINS.has(commandName) || invocation.childDispatch)
       && conductorCommandPathMayResolveRepositoryExecutable(words, commandStartIndex, commandIndex, activeState, rootCwd);
     const trustedOmxGjcPackageCliPath = isOmxGjcCommand
-      && commandIsBare
-      && conductorCommandResolvesTrustedPackageCli(words, commandStartIndex, commandIndex, activeState, rootCwd);
+      && (commandIsBare
+        ? conductorCommandResolvesTrustedPackageCli(words, commandStartIndex, commandIndex, activeState, rootCwd)
+        : conductorSlashCommandIsTrusted(commandWord, activeState, rootCwd));
     const bareCommandPathIsSafe = commandIsBare && !commandPathMayResolveRepositoryExecutable;
-    if (isOmxGjcCommand && (!commandIsBare || !trustedOmxGjcPackageCliPath)) {
+    if (isOmxGjcCommand && !trustedOmxGjcPackageCliPath) {
       mutations.push({ command: "PATH", targets: [] });
       continue;
     }
@@ -16623,7 +18395,7 @@ function scanConductorShellSegment(
     }
     const omxGjcPathIsSafeForStaticOrchestration = trustedOmxGjcPackageCliPath;
     const omxGjcStateWriteDestinationIsCanonical = activeState.effectiveCwd !== null
-      && resolve(activeState.effectiveCwd) === resolve(rootCwd)
+      && sameFilePath(activeState.effectiveCwd, rootCwd)
       && !conductorInvocationUsesEnvCwdChangingWrapper(words, commandStartIndex, commandIndex);
     const mainRootStructuredStateWrite = omxGjcInheritedRootsAreCanonical
       && omxGjcPrefixEnvironmentIsSafe
@@ -17730,7 +19502,7 @@ function conductorStateWriteTransportIsBoundToActiveSession(
     || safeString(statePayload.session_id).trim() !== authoritativeSessionId
     || !suppliedSessionAliasesMatch(statePayload, authoritativeSessionId)
     || safeString(statePayload.workingDirectory).trim() === ""
-    || resolve(safeString(statePayload.workingDirectory)) !== resolve(cwd)
+    || !sameFilePath(safeString(statePayload.workingDirectory), cwd)
   ) return false;
   // Inherited hook environment is process-authenticated; model-controlled shell
   // assignments must match the session resolved for this PreToolUse payload.
@@ -17789,7 +19561,22 @@ function evaluateConductorBashWrite(
   depth = 0,
   authoritativeSessionId = "",
   policyCwd = cwd,
+  // Authorizing evaluators must receive the untrimmed payload command
+  // explicitly; only diagnostic callers may reuse the analyzed command here.
+  rawCommand: string,
 ): { allowed: boolean; blockedDetail?: string } {
+  // Session-scoped cancellation is the owning session's documented recovery
+  // surface across planning workflows (parity with the ralplan/deep-interview
+  // boundaries). The allow admits only the exact bare `omx cancel [--force]`
+  // invocation, and only when the raw payload command is byte-identical to
+  // the analyzed command, so neither a presented cancellation nor a lossy
+  // normalization seam can smuggle a different executable, preload code, or
+  // redirect a state tree.
+  if (rawCommand === command && isDirectOmxCancelCommand(command, { allowForce: true })) {
+    return directOmxCancelCommandHasTrustedExecutionContext(command, cwd)
+      ? { allowed: true }
+      : { allowed: false, blockedDetail: "direct cancellation execution context is not trusted: inherited Bash startup, imported omx function, or Node loader environment overrides present" };
+  }
   const commandWithHeredocBodies = normalizeShellLineContinuations(command);
   const normalizedCommand = stripHeredocBodiesForCommandScan(commandWithHeredocBodies);
   if (authoritativeSessionId && !conductorStateWriteTransportIsBoundToActiveSession(commandWithHeredocBodies, authoritativeSessionId, policyCwd)) {
@@ -17810,6 +19597,10 @@ function evaluateConductorBashWrite(
       blockedDetail: "Bash arithmetic expansion is not statically numeric and cannot be validated for Main-root Conductor writes",
     };
   }
+  if (
+    rawCommand === command
+    && isDirectTrustedAbsoluteUltragoalCheckpoint(normalizedCommand, cwd)
+  ) return { allowed: true };
   if (commandHasUnsafeConductorShellState(normalizedCommand, cwd)) {
     return {
       allowed: false,
@@ -17828,6 +19619,10 @@ function evaluateConductorBashWrite(
       blockedDetail: "Bash unquoted heredoc expansion is not workflow state/ledger/mailbox/handoff metadata",
     };
   }
+  if (
+    rawCommand === command
+    && isAllowedTrustedAbsoluteOmxReadOnlyCommand(normalizedCommand, cwd)
+  ) return { allowed: true };
   const redirectTargets = extractDeepInterviewCommandRedirectTargets(commandWithHeredocBodies);
   if (!conductorMetadataRedirectsHaveBoundedProducers(commandWithHeredocBodies)) {
     return {
@@ -17977,28 +19772,43 @@ function isExactConductorMetadataRoot(cwd: string, target: string): boolean {
 
 
 function buildConductorBashBlockedDetail(cwd: string, command: string): string {
-  return evaluateConductorBashWrite(cwd, command).blockedDetail
+  return evaluateConductorBashWrite(cwd, command, 0, "", cwd, command).blockedDetail
     ?? "Bash write intent target <unresolved>; Main-root Conductor may write only workflow state/ledger/mailbox/handoff metadata";
 }
 
-function directConductorStateWritePayloadHasExactSchema(payload: CodexHookPayload, policyCwd: string, canonicalSessionId: string): boolean {
+async function directConductorStateWritePayloadHasExactSchema(
+  payload: CodexHookPayload,
+  policyCwd: string,
+  stateDir: string,
+  canonicalSessionId: string,
+): Promise<boolean> {
   const input = safeObject(payload.tool_input);
   if (!input || !conductorStateWritePayloadHasExactSchema(input)) return false;
   if (!canonicalSessionId) return false;
-  if (safeString(input.session_id).trim() !== canonicalSessionId) return false;
-  if (!suppliedSessionAliasesMatch(input, canonicalSessionId)) return false;
+  const verifiedAliases = new Set([canonicalSessionId]);
+  const currentSession = await readUsableSessionStateFromStateDir(policyCwd, stateDir).catch(() => null);
+  if (safeString(currentSession?.session_id).trim() === canonicalSessionId) {
+    for (const alias of sessionPointerAliases(currentSession)) verifiedAliases.add(alias);
+  }
+  // The top-level session_id selects the writable scope and is stripped by
+  // executeStateOperation. Other ownership fields can be persisted.
+  if (!verifiedAliases.has(safeString(input.session_id).trim())) return false;
+  if (![
+    input.owner_omx_session_id,
+    input.codex_session_id,
+    input.owner_codex_session_id,
+  ].filter((value) => value !== undefined)
+    .every((value) => safeString(value).trim() === canonicalSessionId)) return false;
   let nestedState = input.state === undefined ? null : safeObject(input.state);
   while (nestedState) {
     if (!suppliedSessionAliasesMatch(nestedState, canonicalSessionId)) return false;
-    const nestedSessionId = safeString(nestedState.session_id).trim();
-    if (nestedSessionId && nestedSessionId !== canonicalSessionId) return false;
     const nestedWorkingDirectory = safeString(nestedState.workingDirectory).trim();
-    if (nestedWorkingDirectory && resolve(nestedWorkingDirectory) !== resolve(policyCwd)) return false;
+    if (nestedWorkingDirectory && !sameFilePath(nestedWorkingDirectory, policyCwd)) return false;
     const nestedMode = safeString(nestedState.mode).trim();
     if (nestedMode && nestedMode !== safeString(input.mode).trim()) return false;
     nestedState = nestedState.state === undefined ? null : safeObject(nestedState.state);
   }
-  if (safeString(input.workingDirectory).trim() === "" || resolve(safeString(input.workingDirectory)) !== resolve(policyCwd)) return false;
+  if (safeString(input.workingDirectory).trim() === "" || !sameFilePath(safeString(input.workingDirectory), policyCwd)) return false;
   return true;
 }
 
@@ -18067,27 +19877,29 @@ export async function buildConductorPreToolUseWriteGuardOutput(
   let nativeChildMutationAttempt = false;
 
   if (toolName === "Bash") {
-    const shellMutations = extractConductorBashMutations(command, cwd, policyCwd);
-    const bashEvaluation = evaluateConductorBashWrite(cwd, command, 0, sessionId, policyCwd);
-    blocked = !bashEvaluation.allowed;
-    const canonicalStateCommand = canonicalizeOmxStateTransportCommand(command);
-    const bashStateOperations = collectOmxStateCommandOperations(canonicalStateCommand, "write");
-    if (bashStateOperations.length > 0) {
-      const bashStatePayload = readStateWriteInputPayload(policyCwd, canonicalStateCommand, command);
-      if (
-        !isStandaloneParsedOmxStateWriteTransport(policyCwd, command, sessionId)
-        || !conductorStatePayloadPreservesActiveGuard(bashStatePayload, activeState)
-      ) {
-        blocked = true;
-        blockedDetail = "Bash state writes must preserve the canonical active Conductor guard";
+    if (mutationTransport !== "read-only") {
+      const shellMutations = extractConductorBashMutations(command, cwd, policyCwd);
+      const bashEvaluation = evaluateConductorBashWrite(cwd, command, 0, sessionId, policyCwd, readPreToolUseRawCommand(payload));
+      blocked = !bashEvaluation.allowed;
+      const canonicalStateCommand = canonicalizeOmxStateTransportCommand(command);
+      const bashStateOperations = collectOmxStateCommandOperations(canonicalStateCommand, "write");
+      if (bashStateOperations.length > 0) {
+        const bashStatePayload = readStateWriteInputPayload(policyCwd, canonicalStateCommand, command);
+        if (
+          !isStandaloneParsedOmxStateWriteTransport(policyCwd, command, sessionId)
+          || !conductorStatePayloadPreservesActiveGuard(bashStatePayload, activeState)
+        ) {
+          blocked = true;
+          blockedDetail = "Bash state writes must preserve the canonical active Conductor guard";
+        }
       }
+      const safeExportedFunctionRead = !blocked
+        && shellMutations.length === 0
+        && /\b(?:export\s+(?:-[A-Za-z]*f[A-Za-z]*|--functions?)|(?:declare|typeset)\s+-[A-Za-z]*f[A-Za-z]*)\b/.test(command);
+      nativeChildMutationAttempt = (mutationTransport === "bash" || shellMutations.length > 0)
+        && !safeExportedFunctionRead;
+      if (blocked) blockedDetail = bashEvaluation.blockedDetail ?? buildConductorBashBlockedDetail(cwd, command);
     }
-    const safeExportedFunctionRead = !blocked
-      && shellMutations.length === 0
-      && /\b(?:export\s+(?:-[A-Za-z]*f[A-Za-z]*|--functions?)|(?:declare|typeset)\s+-[A-Za-z]*f[A-Za-z]*)\b/.test(command);
-    nativeChildMutationAttempt = (mutationTransport === "bash" || shellMutations.length > 0)
-      && !safeExportedFunctionRead;
-    if (blocked) blockedDetail = bashEvaluation.blockedDetail ?? buildConductorBashBlockedDetail(cwd, command);
   } else if (mutationTransport === "state") {
     nativeChildMutationAttempt = true;
     const directStateInput = safeObject(payload.tool_input);
@@ -18097,14 +19909,14 @@ export async function buildConductorPreToolUseWriteGuardOutput(
     } else if (
       toolName === "mcp__omx_state__state_write"
       && (
-        !directConductorStateWritePayloadHasExactSchema(payload, policyCwd, sessionId)
+        !await directConductorStateWritePayloadHasExactSchema(payload, policyCwd, stateDir, sessionId)
         || !conductorStatePayloadPreservesActiveGuard(directStateInput, activeState)
       )
     ) {
       blocked = true;
       blockedDetail = "Structured state writes must preserve the canonical active Conductor guard";
     }
-  } else if (mutationTransport === "orchestration") {
+  } else if (mutationTransport === "orchestration" || mutationTransport === "goal-lifecycle") {
     nativeChildMutationAttempt = true;
   } else if (mutationTransport === "path") {
     nativeChildMutationAttempt = true;
@@ -18149,11 +19961,11 @@ export async function buildConductorPreToolUseWriteGuardOutput(
       decision: "block",
       reason:
         `OWNER_CONFIRMATION_REQUIRED: Conductor mode is active (${activeState.mode} phase: ${formatPhase(activeState.phase, "active")}); `
-        + `native child/descendant provenance establishes same-session origin, not assigned write authority; ${blockedDetail}.`,
+        + `native child/descendant provenance establishes same-session origin, not product-write authority; ${blockedDetail}.`,
       hookSpecificOutput: {
         hookEventName: "PreToolUse",
         additionalContext:
-          "OWNER_CONFIRMATION_REQUIRED: Native child/descendant provenance establishes only session membership, not assigned write authority. "
+          "OWNER_CONFIRMATION_REQUIRED: Native child/descendant provenance establishes only session membership, not product-write authority. "
           + "Do not perform source, package, git, or other substantive writes; return control to the owning Conductor for explicit confirmation.",
       },
     };
@@ -18297,7 +20109,7 @@ function modeStateMatchesSkillStopContext(
   ).trim();
   if (stateCwd) {
     try {
-      if (resolve(stateCwd) !== resolve(cwd)) return false;
+      if (!sameFilePath(stateCwd, cwd)) return false;
     } catch {
       return false;
     }
@@ -18316,7 +20128,7 @@ function modeStateHasExplicitMatchingCwd(state: Record<string, unknown>, cwd: st
   if (!stateCwd) return false;
 
   try {
-    return resolve(stateCwd) === resolve(cwd);
+    return sameFilePath(stateCwd, cwd);
   } catch {
     return false;
   }
@@ -18376,6 +20188,7 @@ async function readBlockingSkillForStop(
   sessionId: string,
   threadId: string,
   requiredSkill?: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<{ skill: string; phase: string; latestPlanPath?: string; planningComplete?: boolean; runOutcome?: string } | null> {
   const canonicalState = await readVisibleSkillActiveStateForStateDir(stateDir, sessionId);
   const visibleEntries = canonicalState ? listActiveSkills(canonicalState) : [];
@@ -18394,7 +20207,7 @@ async function readBlockingSkillForStop(
     const modeSnapshot = getRunContinuationSnapshot(modeState);
     if (modeSnapshot?.terminal === true) continue;
 
-    if (await shouldIgnoreSessionSkillBlockerForCanonicalInactiveRoot(
+    if (!options.sessionScopedOnly && await shouldIgnoreSessionSkillBlockerForCanonicalInactiveRoot(
       cwd,
       stateDir,
       skill,
@@ -18735,8 +20548,11 @@ async function buildDeepInterviewQuestionStopOutput(
   stateDir: string,
   sessionId: string,
   threadId: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<{ output: Record<string, unknown>; obligationId: string } | null> {
-  await reconcileDeepInterviewQuestionEnforcementFromAnsweredRecords(cwd, sessionId);
+  if (!options.sessionScopedOnly) {
+    await reconcileDeepInterviewQuestionEnforcementFromAnsweredRecords(cwd, sessionId);
+  }
   if (await readAutopilotDeepInterviewQuestionWaitState(cwd, sessionId)) {
     return null;
   }
@@ -19128,11 +20944,21 @@ async function buildSkillStopOutput(
   stateDir: string,
   sessionId: string,
   threadId: string,
+  options: { sessionScopedOnly?: boolean } = {},
 ): Promise<Record<string, unknown> | null> {
-  const blocker = await readBlockingSkillForStop(cwd, stateDir, sessionId, threadId);
+  const blocker = await readBlockingSkillForStop(
+    cwd,
+    stateDir,
+    sessionId,
+    threadId,
+    undefined,
+    options,
+  );
   if (!blocker) return null;
 
-  const subagentSummary = await readSubagentSessionSummary(cwd, sessionId).catch(() => null);
+  const subagentSummary = options.sessionScopedOnly
+    ? null
+    : await readSubagentSessionSummary(cwd, sessionId).catch(() => null);
   const activeSubagentCount = subagentSummary?.activeSubagentThreadIds.length ?? 0;
 
   if (blocker.skill === "ralplan") {
@@ -19266,17 +21092,89 @@ async function buildStopHookOutput(
   payload: CodexHookPayload,
   cwd: string,
   stateDir: string,
-  options: { skipAutoNudge?: boolean; skipRalphStopBlock?: boolean; canonicalSessionId?: string } = {},
+  options: {
+    skipAutoNudge?: boolean;
+    skipRalphStopBlock?: boolean;
+    canonicalSessionId?: string;
+    teamWorkerOnly?: boolean;
+    sessionScopedOnly?: boolean;
+  } = {},
 ): Promise<Record<string, unknown> | null> {
   if (isStopExempt(payload)) {
     return null;
   }
 
+  if (options.teamWorkerOnly === true) {
+    const teamWorkerDecision = await resolveTeamWorkerStopDecision(cwd);
+    if (teamWorkerDecision.kind === "blocked") {
+      return await returnPersistentStopBlock(
+        payload,
+        stateDir,
+        "team-worker-stop",
+        safeString(teamWorkerDecision.output.stopReason),
+        teamWorkerDecision.output,
+        undefined,
+        { allowRepeatDuringStopHook: teamWorkerDecision.allowRepeatDuringStopHook },
+      );
+    }
+    if (teamWorkerDecision.kind === "allowed") {
+      try {
+        await maybeNudgeLeaderForAllowedWorkerStop({
+          stateDir: teamWorkerDecision.stateDir,
+          logsDir: join(cwd, ".omx", "logs"),
+          workerContext: teamWorkerDecision.workerContext,
+        });
+      } catch (err) {
+        void err;
+      }
+      return null;
+    }
+    return {
+      decision: "block",
+      stopReason: `team_worker_${readTeamWorkerEnvironment()?.workerName ?? "unknown"}_missing_worker_state`,
+      reason: "OMX cannot resolve authoritative Team worker state for Stop.",
+      systemMessage: "OMX cannot resolve authoritative Team worker state for Stop.",
+    };
+  }
   const sessionId = readPayloadSessionId(payload);
   const canonicalSessionId = options.canonicalSessionId
     ?? await resolveInternalSessionIdForPayload(cwd, sessionId);
   const threadId = readPayloadThreadId(payload);
   const suppressParentWorkflowStop = shouldSuppressParentWorkflowStopForSideConversation(payload);
+  if (options.sessionScopedOnly) {
+    if (!canonicalSessionId || suppressParentWorkflowStop) return null;
+    for (const mode of ["autopilot", "ultrawork", "ultraqa"] as const) {
+      const modeOutput = await buildModeBasedStopOutput(
+        mode,
+        cwd,
+        canonicalSessionId,
+        { sessionScopedOnly: true },
+      );
+      if (modeOutput) return modeOutput;
+    }
+    const teamOutput = await buildTeamStopOutput(
+      cwd,
+      canonicalSessionId,
+      threadId,
+      { sessionScopedOnly: true },
+    );
+    if (teamOutput) return teamOutput;
+    const deepInterviewQuestionOutput = await buildDeepInterviewQuestionStopOutput(
+      cwd,
+      stateDir,
+      canonicalSessionId,
+      threadId,
+      { sessionScopedOnly: true },
+    );
+    if (deepInterviewQuestionOutput) return deepInterviewQuestionOutput.output;
+    return await buildSkillStopOutput(
+      cwd,
+      stateDir,
+      canonicalSessionId,
+      threadId,
+      { sessionScopedOnly: true },
+    );
+  }
   if (canonicalSessionId) {
     await reconcileStaleRootSkillActiveStateForStop(cwd, stateDir, canonicalSessionId);
     if (await hasAuthoritativeInactiveSkillStopState(cwd, stateDir, "ralplan", canonicalSessionId, threadId)) {
@@ -19495,7 +21393,7 @@ async function buildStopHookOutput(
         safeString(goalWorkflowStopOutput.stopReason),
         goalWorkflowStopOutput,
         canonicalSessionId,
-        { allowRepeatDuringStopHook: true },
+        { allowRepeatDuringStopHook: safeString(goalWorkflowStopOutput.stopReason) !== "ultragoal_paused" },
       );
     }
     const ordinaryNoProgressOutput = await maybeBuildOrdinaryStopNoProgressOutput(
@@ -19530,18 +21428,14 @@ async function buildStopHookOutput(
       );
     }
 
-    const sloppyFallbackDiffFindings = findSloppyFallbackDiffFindings(cwd);
-    const sloppyFallbackDiffOutput = buildSloppyFallbackDiffStopOutput(sloppyFallbackDiffFindings);
-    if (sloppyFallbackDiffOutput) {
-      return await returnPersistentStopBlock(
-        payload,
-        stateDir,
-        "sloppy-fallback-diff-stop",
-        JSON.stringify(sloppyFallbackDiffFindings),
-        sloppyFallbackDiffOutput,
-        canonicalSessionId,
-        { allowRepeatDuringStopHook: true },
-      );
+    const sloppyFallbackDiffStopOutput = await maybeBuildSloppyFallbackDiffStopOutput(
+      payload,
+      cwd,
+      stateDir,
+      canonicalSessionId,
+    );
+    if (sloppyFallbackDiffStopOutput) {
+      return sloppyFallbackDiffStopOutput;
     }
 
     if (isFinalHandoffDocumentRefreshCandidate(lastAssistantMessage)) {
@@ -19619,18 +21513,12 @@ export async function dispatchCodexNativeHook(
 ): Promise<NativeHookDispatchResult> {
   const hookEventName = readHookEventName(payload);
   const cwd = options.cwd ?? (safeString(payload.cwd).trim() || process.cwd());
+  const omxEventName = mapCodexHookEventToOmxEvent(hookEventName);
   if (hookEventName === "PreToolUse" && safeString(payload.tool_name).trim() === "Bash") {
     const denial = evaluateCodex01445PreToolUse(payload, {
-      resolveInstalledRoleName: (role) => resolveInstalledRoleName(role, undefined, cwd),
+      resolveInstalledRoleName: (role: string) => resolveInstalledRoleName(role, undefined, cwd),
     });
-    if (denial) {
-      return {
-        hookEventName,
-        omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
-        skillState: null,
-        outputJson: denial,
-      };
-    }
+    if (denial) return { hookEventName, omxEventName, skillState: null, outputJson: denial };
   }
   if (hookEventName === "PostCompact" && process.env.OMX_NATIVE_HOOK_DOCTOR_SMOKE === "1") {
     return {
@@ -19638,6 +21526,14 @@ export async function dispatchCodexNativeHook(
       omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
       skillState: null,
       outputJson: null,
+    };
+  }
+  if (hookEventName === "Stop" && hasRawTeamWorkerDeclaration()) {
+    return {
+      hookEventName,
+      omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
+      skillState: null,
+      outputJson: await buildDeclaredTeamWorkerStopOutput(payload, cwd),
     };
   }
   if (hookEventName === "Stop" && !hasNativeStopRuntimeSurface(cwd)) {
@@ -19654,14 +21550,27 @@ export async function dispatchCodexNativeHook(
   const policyRoot = resolveConductorPolicyRoot(stateDir, cwd);
   const policyCwd = policyRoot.cwd;
 
-  const omxEventName = mapCodexHookEventToOmxEvent(hookEventName);
   let skillState: SkillActiveState | null = null;
   let triageAdditionalContext: string | null = null;
   let goalWorkflowAdditionalContext: string | null = null;
   let ultragoalSteeringAdditionalContext: string | null = null;
+  let teamNoticeAdditionalContext: string | null = null;
+  let teamNoticeTargetKey: string | null = null;
   let promptClassification: KeywordInputClassification | null = null;
 
-  const nativeSessionId = safeString(payload.session_id ?? payload.sessionId).trim();
+  const declaredTeamWorker = hasRawTeamWorkerDeclaration();
+  const candidateWorkerPayloadSessionId = declaredTeamWorker
+    ? readUnambiguousNormalizedPayloadSessionId(payload)
+    : "";
+  const sessionStartNativeCandidates = hookEventName === "SessionStart"
+    ? readSessionStartNativeCandidates(payload)
+    : [];
+  const nativeSessionId = declaredTeamWorker
+    ? candidateWorkerPayloadSessionId
+    : sessionStartNativeCandidates[0] ?? safeString(payload.session_id ?? payload.sessionId).trim();
+  const sessionStartTranscriptPath = hookEventName === "SessionStart"
+    ? safeString(payload.transcript_path ?? payload.transcriptPath).trim()
+    : "";
   const threadId = safeString(payload.thread_id ?? payload.threadId).trim();
   const turnId = safeString(payload.turn_id ?? payload.turnId).trim();
   const pointer = await readSessionPointer(pointerContext);
@@ -19700,15 +21609,33 @@ export async function dispatchCodexNativeHook(
   if (promptTurnContext?.status === "authorized") {
     canonicalSessionId = promptTurnContext.authorization.targetSessionId;
   }
-  const allowPromptGlobalSideEffects = promptTurnContext?.status !== "authorized"
+  let allowGlobalSideEffects = promptTurnContext?.status !== "authorized"
     || promptTurnContext.authorization.globalSideEffects === "allow";
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
   let isSubagentSessionStart = false;
+  const authoritativeTeamWorker = declaredTeamWorker && await hasAuthoritativeTeamWorkerContext(cwd);
+  const authoritativeWorkerPayloadSessionId = authoritativeTeamWorker
+    && candidateWorkerPayloadSessionId
+    && (!pointer.state || !payloadMatchesSessionPointer(candidateWorkerPayloadSessionId, pointer.state))
+      ? candidateWorkerPayloadSessionId
+      : "";
+  const declaredTeamWorkerStopOnly = hookEventName === "Stop" && declaredTeamWorker;
 
-  if (hookEventName === "SessionStart" && nativeSessionId) {
-    const transcriptPath = safeString(payload.transcript_path ?? payload.transcriptPath).trim();
+  if (hookEventName === "SessionStart" && declaredTeamWorker && !authoritativeWorkerPayloadSessionId) {
+    canonicalSessionId = "";
+    resolvedNativeSessionId = nativeSessionId;
+    skipCanonicalSessionStartContext = true;
+    allowImplicitSessionSideEffects = false;
+  } else if (hookEventName === "SessionStart" && (nativeSessionId || readNativeSubagentSessionStartMetadata(sessionStartTranscriptPath))) {
+    const transcriptPath = sessionStartTranscriptPath;
     const subagentSessionStart = readNativeSubagentSessionStartMetadata(transcriptPath);
+    const eventChildIdentity = readUnambiguousSessionStartNativeId(payload);
+    const implicatedChildThreadIds = [...new Set([
+      nativeSessionId,
+      subagentSessionStart?.childSessionId ?? "",
+      ...readSessionStartNativeCandidates(payload),
+    ].filter(Boolean))];
     if (subagentSessionStart) {
       // A native child/subagent SessionStart carries a parent_thread_id in its
       // transcript session_meta. Treat it as a child-agent lifecycle event for
@@ -19732,11 +21659,47 @@ export async function dispatchCodexNativeHook(
             nativeSessionId,
             subagentSessionStart,
             transcriptPath,
+            eventChildIdentity.ok
+              && eventChildIdentity.value === nativeSessionId
+              && subagentSessionStart.childSessionId === nativeSessionId
+              ? safeString(currentSessionState?.native_session_id).trim()
+              : "",
+            eventChildIdentity.ok
+              && eventChildIdentity.value === nativeSessionId
+              && subagentSessionStart.childSessionId === nativeSessionId
+              && safeString(currentSessionState?.native_session_id).trim()
+              ? "valid"
+              : "untrusted",
+            implicatedChildThreadIds,
           );
         } else {
           skipCanonicalSessionStartContext = true;
           resolvedNativeSessionId =
             safeString(currentSessionState?.native_session_id).trim() || nativeSessionId;
+          try {
+            revokeNativeSubagentAuthorities(cwd, implicatedChildThreadIds, "foreign_parent");
+          } catch {
+            // The negative identity observation could not be published. Fence
+            // the implicated ids durably so reopen consumption keeps denying
+            // them instead of leaving the old authority usable. A fence that
+            // also fails to persist is recorded so the failure is observable
+            // rather than silently dropped.
+            if (!fenceNativeSubagentAuthorities(cwd, implicatedChildThreadIds, "foreign_parent_revocation_failed")) {
+              // Both the tracker denial and the locked fence failed. Escalate
+              // to a lock-free global denial so the old authority cannot stay
+              // usable, and record whether even that succeeded.
+              const escalated = forceGlobalAuthorityDenial(cwd, "foreign_parent_denial_escalated");
+              await appendToLog(cwd, {
+                event: "subagent_authority_fence_failed",
+                session_id: canonicalSessionId,
+                native_session_id: nativeSessionId,
+                reason: "foreign_parent_revocation_failed",
+                implicated_thread_ids: implicatedChildThreadIds,
+                global_denial_escalated: escalated,
+                timestamp: new Date().toISOString(),
+              }).catch(() => {});
+            }
+          }
           await recordIgnoredNativeSubagentSessionStart(
             cwd,
             canonicalSessionId,
@@ -19758,14 +21721,37 @@ export async function dispatchCodexNativeHook(
           nativeSessionId,
           subagentSessionStart,
           transcriptPath,
+          "",
+          "absent",
+          implicatedChildThreadIds,
         );
       }
+    } else if (declaredTeamWorker) {
+      if (authoritativeWorkerPayloadSessionId && authoritativeWorkerPayloadSessionId === nativeSessionId) {
+        // Team workers share the leader's selected state root, but they do not own
+        // its compatibility pointer. Keep lifecycle state scoped to the explicit
+        // hook payload without reconciling or replacing the live leader pointer.
+        canonicalSessionId = authoritativeWorkerPayloadSessionId;
+        resolvedNativeSessionId = authoritativeWorkerPayloadSessionId;
+        allowImplicitSessionSideEffects = true;
+        stopAuthorizationFailure = null;
+      } else {
+        canonicalSessionId = "";
+        resolvedNativeSessionId = nativeSessionId;
+        skipCanonicalSessionStartContext = true;
+        allowImplicitSessionSideEffects = false;
+      }
     } else {
-      const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
+      let ownerState: SessionState | null = null;
       try {
+        const sessionOwnerPid = options.sessionOwnerPid ?? resolveSessionOwnerPid(payload);
+        ownerState = await writeNativeSessionOwner(cwd, nativeSessionId, {
+          pid: sessionOwnerPid,
+        });
+        const ownerOmxSessionId = await resolveVerifiedOwnerOmxSessionId();
         const sessionState = await reconcileNativeSessionStart(cwd, nativeSessionId, {
           context: pointerContext,
-          pid: options.sessionOwnerPid ?? resolveSessionOwnerPid(payload),
+          pid: sessionOwnerPid,
           ...options.sessionStartOptions,
           ...(ownerOmxSessionId
             ? { ownerOmxSessionId, ownerAliasVerified: true }
@@ -19775,49 +21761,91 @@ export async function dispatchCodexNativeHook(
         resolvedNativeSessionId = safeString(sessionState.native_session_id).trim() || nativeSessionId;
         allowImplicitSessionSideEffects = true;
         stopAuthorizationFailure = null;
-        // #3181: leader attestation is intentionally NOT performed here. This branch is
+        // #3181: adapted Ralplan authority is intentionally NOT evaluated here. This branch is
         // reached whenever readNativeSubagentSessionStartMetadata() returns null, which
         // conflates a genuine root start with an unreadable/malformed child transcript, so
-        // it cannot positively classify a leader (a legitimate leader may also carry no
-        // transcript). Leader attestation is performed only on the strictly-gated fresh
-        // leader PreToolUse path below, which fires before the first in-turn role-intent
-        // write. Fail closed here rather than risk a false-leader adoption.
+        // it cannot positively classify a documented leader (a legitimate leader may also carry no
+        // transcript). The strictly-gated PreToolUse denial path below evaluates adapted Ralplan
+        // authority before the first in-turn role-intent write. Fail closed here rather than risk
+        // a false-leader adoption.
       } catch (error) {
-        if (!isSessionPointerLaunchAbort(error)) throw error;
-        canonicalSessionId = "";
-        resolvedNativeSessionId = nativeSessionId;
-        skipCanonicalSessionStartContext = true;
-        allowImplicitSessionSideEffects = false;
-        stopAuthorizationFailure = {
-          stopReason: "session_pointer_unusable",
-          reason: `OMX cannot authorize Stop while the selected session pointer is ${pointer.status}; repair the pointer evidence before continuing.`,
-        };
+        if (
+          ownerState
+          && isSessionPointerLaunchAbort(error)
+          && error.code === "session_pointer_owner_conflict"
+        ) {
+          canonicalSessionId = ownerState.session_id;
+          resolvedNativeSessionId = ownerState.native_session_id ?? nativeSessionId;
+          allowImplicitSessionSideEffects = true;
+          allowGlobalSideEffects = false;
+          skipCanonicalSessionStartContext = true;
+          stopAuthorizationFailure = null;
+        } else {
+          if (!isSessionPointerLaunchAbort(error)) throw error;
+          canonicalSessionId = "";
+          resolvedNativeSessionId = nativeSessionId;
+          skipCanonicalSessionStartContext = true;
+          allowImplicitSessionSideEffects = false;
+          stopAuthorizationFailure = {
+            stopReason: "session_pointer_unusable",
+            reason: `OMX cannot authorize Stop while the selected session pointer is ${pointer.status}; repair the pointer evidence before continuing.`,
+          };
+        }
       }
     }
   } else if (!canonicalSessionId) {
     canonicalSessionId = safeString(currentSessionState?.session_id).trim();
   }
 
+
   if (hookEventName === "Stop") {
     const stopPayloadSessionId = readPayloadSessionId(payload);
-    const stopCanonicalSessionId = await resolveInternalSessionIdForPayload(
-      cwd,
-      stopPayloadSessionId,
-      undefined,
-      currentSessionState,
-      pointer.status === "absent",
-    );
-    if (stopPayloadSessionId && !stopCanonicalSessionId) {
-      canonicalSessionId = "";
-      allowImplicitSessionSideEffects = false;
-      if (!stopAuthorizationFailure) {
-        stopAuthorizationFailure = {
-          stopReason: "session_scope_unmatched",
-          reason: `OMX cannot authorize Stop for unmatched session id ${stopPayloadSessionId}; the selected session pointer remains authoritative.`,
-        };
+    const authorizedWorkerStopSessionId = authoritativeWorkerPayloadSessionId;
+    const stopCanonicalSessionId = declaredTeamWorker && !authorizedWorkerStopSessionId
+      ? ""
+      : await resolveInternalSessionIdForPayload(
+        cwd,
+        authorizedWorkerStopSessionId || stopPayloadSessionId,
+        undefined,
+        currentSessionState,
+        declaredTeamWorker
+          ? Boolean(authorizedWorkerStopSessionId)
+          : pointer.status === "absent",
+      );
+    if ((declaredTeamWorker && !authorizedWorkerStopSessionId) || (stopPayloadSessionId && !stopCanonicalSessionId)) {
+      const ownerState = !declaredTeamWorker && stopPayloadSessionId
+        ? await readNativeSessionOwner(cwd, stopPayloadSessionId)
+        : null;
+      if (
+        ownerState
+        && (pointer.status === "usable" || pointer.status === "stale-dead")
+      ) {
+        canonicalSessionId = ownerState.session_id;
+        resolvedNativeSessionId = ownerState.native_session_id ?? stopPayloadSessionId;
+        allowImplicitSessionSideEffects = true;
+        allowGlobalSideEffects = false;
+        stopAuthorizationFailure = null;
+      } else {
+        canonicalSessionId = "";
+        allowImplicitSessionSideEffects = false;
+        if (declaredTeamWorker && !authorizedWorkerStopSessionId) {
+          stopAuthorizationFailure = {
+            stopReason: "session_scope_unmatched",
+            reason: "OMX cannot authorize Team worker Stop without exactly one valid explicit session id.",
+          };
+        } else if (!stopAuthorizationFailure) {
+          stopAuthorizationFailure = {
+            stopReason: "session_scope_unmatched",
+            reason: `OMX cannot authorize Stop for unmatched session id ${stopPayloadSessionId}; the selected session pointer remains authoritative.`,
+          };
+        }
       }
     } else if (stopCanonicalSessionId) {
       canonicalSessionId = stopCanonicalSessionId;
+    }
+    if (authorizedWorkerStopSessionId && stopCanonicalSessionId === authorizedWorkerStopSessionId) {
+      allowImplicitSessionSideEffects = true;
+      stopAuthorizationFailure = null;
     }
     if (canonicalSessionId && safeString(currentSessionState?.session_id).trim() === canonicalSessionId) {
       resolvedNativeSessionId =
@@ -19855,7 +21883,11 @@ export async function dispatchCodexNativeHook(
         )),
     )).some(Boolean)
     : false;
-  if (isSubagentStop && stopAuthorizationFailure?.stopReason === "session_scope_unmatched") {
+  if (
+    isSubagentStop
+    && stopAuthorizationFailure?.stopReason === "session_scope_unmatched"
+    && !(declaredTeamWorker && !authoritativeWorkerPayloadSessionId)
+  ) {
     canonicalSessionId = normalizeSessionId(readPayloadSessionId(payload)) ?? "";
     allowImplicitSessionSideEffects = true;
     stopAuthorizationFailure = null;
@@ -19869,13 +21901,16 @@ export async function dispatchCodexNativeHook(
   if (hookEventName === "UserPromptSubmit") {
     const prompt = readPromptText(payload);
     if (!isSubagentPromptSubmit) {
+      teamNoticeTargetKey = parseTeamNoticeLedgerPrompt(prompt);
+    }
+    if (!isSubagentPromptSubmit) {
       promptClassification = classifyKeywordInput(prompt);
     }
-    goalWorkflowAdditionalContext = allowPromptGlobalSideEffects
+    goalWorkflowAdditionalContext = allowGlobalSideEffects
       ? await buildCompletedGoalCleanupPromptWarning(cwd, prompt).catch(() => null)
         ?? await buildGoalWorkflowReconciliationPromptWarning(cwd, prompt).catch(() => null)
       : null;
-    ultragoalSteeringAdditionalContext = prompt && !isSubagentPromptSubmit && allowImplicitSessionSideEffects && allowPromptGlobalSideEffects
+    ultragoalSteeringAdditionalContext = prompt && !isSubagentPromptSubmit && allowImplicitSessionSideEffects && allowGlobalSideEffects
       ? await applyUserPromptUltragoalSteering(cwd, prompt).catch((error) => `OMX native UserPromptSubmit rejected bounded .omx/ultragoal steering for G002-cli-and-prompt-submit-bridge: ${error instanceof Error ? error.message : String(error)}`)
       : null;
     let suppressActivationSeeding = !allowImplicitSessionSideEffects;
@@ -19905,6 +21940,14 @@ export async function dispatchCodexNativeHook(
         sessionIdForState || undefined,
         threadId || undefined,
         turnId || undefined,
+      ) ?? await buildNativeOutsideTmuxUltragoalPromptBlockState(
+        promptClassification,
+        cwd,
+        payload,
+        stateDir,
+        sessionIdForState || undefined,
+        threadId || undefined,
+        turnId || undefined,
       ) ?? await recordSkillActivation({
         stateDir,
         sourceCwd: cwd,
@@ -19925,7 +21968,7 @@ export async function dispatchCodexNativeHook(
       prompt
       && skillState === null
       && !isSubagentPromptSubmit
-      && allowPromptGlobalSideEffects
+      && allowGlobalSideEffects
       && promptClassification?.reservedInput === null
       && promptClassification.hasExplicitLikeInvocation === false
       && promptClassification.matches.length === 0
@@ -20005,7 +22048,7 @@ export async function dispatchCodexNativeHook(
     const skipHudReconcileForDoctorSmoke = process.env.OMX_NATIVE_HOOK_DOCTOR_SMOKE === "1";
     const skipHudReconcileForTeamWorkerPane = !isSubagentPromptSubmit
       && await isConfirmedTeamWorkerPromptSubmitPane(cwd).catch(() => false);
-    if (allowImplicitSessionSideEffects && allowPromptGlobalSideEffects && !skipHudReconcileForDoctorSmoke && !skipHudReconcileForTeamWorkerPane) {
+    if (allowImplicitSessionSideEffects && allowGlobalSideEffects && !skipHudReconcileForDoctorSmoke && !skipHudReconcileForTeamWorkerPane) {
       const reconcileHudForPromptSubmitFn = options.reconcileHudForPromptSubmitFn ?? reconcileHudForPromptSubmit;
       const hudSessionId = resolveHudReconcileSessionId(
         currentSessionState,
@@ -20022,7 +22065,10 @@ export async function dispatchCodexNativeHook(
     }
   }
 
-  if (omxEventName && allowImplicitSessionSideEffects && allowPromptGlobalSideEffects && !skipCanonicalSessionStartContext && !suppressNoisySubagentLifecycleDispatch) {
+  const bypassGenericPreToolUsePluginDispatch = hookEventName === "PreToolUse"
+    && safeString(payload.tool_name).trim() === "Bash"
+    && /^[ \t]*omx[ \t]+cancel\b/.test(readPreToolUseCommand(payload));
+  if (omxEventName && !bypassGenericPreToolUsePluginDispatch && allowImplicitSessionSideEffects && allowGlobalSideEffects && !skipCanonicalSessionStartContext && !suppressNoisySubagentLifecycleDispatch) {
     const baseContext = buildBaseContext(cwd, payload, hookEventName!, canonicalSessionId);
     if (resolvedNativeSessionId) {
       baseContext.native_session_id = resolvedNativeSessionId;
@@ -20047,6 +22093,31 @@ export async function dispatchCodexNativeHook(
       allowTeamWorkerSideEffects: false,
     });
   }
+  if (hookEventName === "UserPromptSubmit" && !isSubagentPromptSubmit && teamNoticeTargetKey) {
+    const reconciled = await reconcileTeamNoticeLedger({ stateRoot: stateDir, targetKey: teamNoticeTargetKey }).catch(() => null);
+    if (!reconciled || reconciled.context.length === 0) {
+      teamNoticeAdditionalContext = "OMX invalidated this queued Team wake immediately before model input because no active source-proven Team notices remain. Do not infer or reference a removed Team from the generic wake.";
+    } else {
+      const byTeam = new Map<string, Set<string>>();
+      for (const notice of reconciled.context) {
+        const classes = byTeam.get(notice.teamName) ?? new Set<string>();
+        classes.add(notice.noticeClass);
+        byTeam.set(notice.teamName, classes);
+      }
+      const entries = [...byTeam.entries()];
+      const visible = entries.slice(0, 12).map(([teamName, classes]) =>
+        `${teamName} (${[...classes].join(", ")}): run \`omx team status ${teamName}\`, read current messages/results, then assign, reconcile, or shut down.`
+      );
+      const overflow = entries.length > visible.length
+        ? `Also inspect the remaining ${entries.length - visible.length} active Team director${entries.length - visible.length === 1 ? "y" : "ies"} under .omx/state/team before concluding.`
+        : null;
+      teamNoticeAdditionalContext = [
+        `OMX reconciled ${reconciled.presented} queued Team notice generation(s) against current canonical state immediately before model input.`,
+        ...visible,
+        overflow,
+      ].filter(Boolean).join("\n");
+    }
+  }
 
   if (hookEventName === "PreCompact") {
     // Codex native PreCompact currently accepts only the common continuation fields.
@@ -20063,14 +22134,13 @@ export async function dispatchCodexNativeHook(
       })
       : isSubagentPromptSubmit
         ? null
-        : promptClassification
-          ? [
-            buildAdditionalContextMessage(promptClassification, skillState, cwd, payload),
-            ultragoalSteeringAdditionalContext,
-            goalWorkflowAdditionalContext,
-            triageAdditionalContext,
-          ].filter((entry): entry is string => Boolean(entry)).join("\n\n") || null
-          : null;
+        : [
+          teamNoticeAdditionalContext,
+          promptClassification ? buildAdditionalContextMessage(promptClassification, skillState, cwd, payload) : null,
+          ultragoalSteeringAdditionalContext,
+          goalWorkflowAdditionalContext,
+          triageAdditionalContext,
+        ].filter((entry): entry is string => Boolean(entry)).join("\n\n") || null;
     if (additionalContext) {
       outputJson = {
         hookSpecificOutput: {
@@ -20118,14 +22188,32 @@ export async function dispatchCodexNativeHook(
         payloadPolicyCwd,
       )
       : null;
-    if (!policyRoot.valid && policyRoot.statePresent && mutationTransport !== "read-only") {
+    const directCancelCommand = safeString(payload.tool_name).trim() === "Bash"
+      ? readPreToolUseCommand(payload)
+      : "";
+    if (/^[ \t]*omx[ \t]+cancel\b/.test(directCancelCommand)) {
+      const directCancel = await handleDirectOmxCancel({
+        command: directCancelCommand,
+        rawCommand: readPreToolUseRawCommand(payload),
+        cwd: policyCwd,
+        stateDir,
+        canonicalSessionId: sessionBinding.valid ? sessionBinding.canonicalSessionId : "",
+        payload,
+        allowForce: false,
+        activeState: sessionBinding.valid
+          ? (await readStopSessionPinnedState("autopilot-state.json", policyCwd, sessionBinding.canonicalSessionId, stateDir) ?? {})
+          : {},
+      });
+      if (directCancel.kind !== "not-direct-cancel") outputJson = directCancel.output;
+    }
+    if (!outputJson && !policyRoot.valid && policyRoot.statePresent && mutationTransport !== "read-only") {
       outputJson = buildConductorSessionProvenanceDeny(
         { mode: "conductor", phase: "active" },
         "the selected workflow state root has no usable canonical session cwd",
       );
-    } else if (foreignRootNativeChildDeny) {
+    } else if (!outputJson && foreignRootNativeChildDeny) {
       outputJson = foreignRootNativeChildDeny;
-    } else {
+    } else if (!outputJson) {
     const activeConductorState = sessionBinding.canonicalSessionId
       ? await readActiveConductorStateForPreToolUse(
         payload,
@@ -20231,7 +22319,13 @@ export async function dispatchCodexNativeHook(
       const preToolUseSessionId = sessionBinding.valid || preservesIdentitylessTeamWorkerExemption
         ? sessionBinding.canonicalSessionId
         : "";
-      outputJson = buildNativeUnknownRolePreToolUseOutput(payload, policyCwd)
+      const nativePreToolUseSpecificDeny = (() => {
+        if (safeString(payload.tool_name).trim() !== "Bash") return null;
+        const output = buildNativePreToolUseOutput(payload);
+        return output?.decision === "block" ? output : null;
+      })();
+      outputJson = nativePreToolUseSpecificDeny
+        ?? buildNativeUnknownRolePreToolUseOutput(payload, policyCwd)
         ?? await buildDeepInterviewPreToolUseBoundaryOutput(
           payload,
           policyCwd,
@@ -20251,6 +22345,13 @@ export async function dispatchCodexNativeHook(
           policyCwd,
           stateDir,
           rootPointerConflict,
+        )
+        ?? await buildUltragoalNoOwnerActivationGuardOutput(
+          payload,
+          cwd,
+          stateDir,
+          preToolUseSessionId,
+          policyCwd,
         )
         ?? await buildConductorPreToolUseWriteGuardOutput(
           payload,
@@ -20276,23 +22377,41 @@ export async function dispatchCodexNativeHook(
     }
     outputJson = buildNativePostToolUseOutput(payload);
   } else if (hookEventName === "Stop") {
-    if (allowImplicitSessionSideEffects) {
-      outputJson = await buildStopHookOutput(payload, cwd, stateDir, {
+    if (declaredTeamWorkerStopOnly) {
+      outputJson = await buildStopHookOutput(payload, cwd, stateDir, { teamWorkerOnly: true });
+    } else if (allowImplicitSessionSideEffects) {
+      const stopOutput = await buildStopHookOutput(payload, cwd, stateDir, {
         canonicalSessionId: canonicalSessionId || undefined,
         skipRalphStopBlock: isSubagentStop,
         skipAutoNudge: isSubagentStop,
-      }) ?? await buildCompletedGoalCleanupStopOutput(payload, cwd);
+        sessionScopedOnly: !allowGlobalSideEffects,
+      });
+      outputJson = stopOutput ?? (
+        allowGlobalSideEffects
+          ? await buildCompletedGoalCleanupStopOutput(payload, cwd)
+          : null
+      );
     } else {
       const failure = stopAuthorizationFailure ?? {
         stopReason: "session_pointer_unusable",
         reason: "OMX cannot authorize Stop without a writable session authority.",
       };
-      outputJson = {
-        decision: "block",
-        stopReason: failure.stopReason,
-        reason: failure.reason,
-        systemMessage: failure.reason,
-      };
+      const stopHookActive = payload.stop_hook_active === true || payload.stopHookActive === true;
+      const pointerCannotAuthorizeThisCwd = pointer.status === "foreign-cwd";
+      const unmatchedStopSession = failure.stopReason === "session_scope_unmatched";
+      // An unmatched payload or foreign-cwd pointer cannot authorize continuation.
+      // Return no output so Codex cannot reinterpret an authorization diagnostic as
+      // a new action request. Other unusable pointers retain their bounded replay behavior.
+      if (pointerCannotAuthorizeThisCwd || unmatchedStopSession || stopHookActive) {
+        outputJson = null;
+      } else {
+        outputJson = {
+          decision: "block",
+          stopReason: failure.stopReason,
+          reason: failure.reason,
+          systemMessage: failure.reason,
+        };
+      }
     }
   }
 
@@ -20350,8 +22469,7 @@ async function readStdinJson(): Promise<NativeHookCliReadResult> {
       const remaining = Math.max(0, MAX_NATIVE_STDIN_JSON_BYTES - (totalBytes - buffer.byteLength));
       if (remaining > 0) chunks.push(Buffer.from(buffer.subarray(0, remaining)));
       oversized = true;
-      process.stdin.destroy();
-      break;
+      continue;
     }
     chunks.push(buffer);
   }
@@ -20547,6 +22665,13 @@ function isDispatchFailureTestTrigger(): boolean {
     && process.env.OMX_NATIVE_HOOK_TEST_THROW_DISPATCH === "1";
 }
 
+function isPostCancelCommitTestTrigger(payload: CodexHookPayload, output: Record<string, unknown> | null): boolean {
+  return process.env.NODE_ENV === "test"
+    && process.env.OMX_NATIVE_HOOK_TEST_AFTER_CANCEL_COMMIT === "1"
+    && readHookEventName(payload) === "PreToolUse"
+    && safeString(safeObject(output?.hookSpecificOutput).permissionDecisionReason).trim() === "cancelled_exact_session";
+}
+
 function buildMalformedPreToolUseBlockTestOutput(payload: CodexHookPayload): Record<string, unknown> | null {
   if (process.env.NODE_ENV !== "test" || readHookEventName(payload) !== "PreToolUse") return null;
   switch (process.env.OMX_NATIVE_HOOK_TEST_MALFORMED_PRETOOL_BLOCK) {
@@ -20608,6 +22733,9 @@ export async function runCodexNativeHookCli(): Promise<void> {
     }
 
     const result = await dispatchCodexNativeHook(payload);
+    // This seam is after hook-owned cancellation has committed but before stdout.
+    // It deliberately does not re-dispatch, so Bash cannot execute or be retried.
+    if (isPostCancelCommitTestTrigger(payload, result.outputJson)) void 0;
     if (result.outputJson) {
       writeNativeHookJsonStdout(sanitizeCodexHookOutput(result.hookEventName, result.outputJson) ?? {});
     } else if (result.hookEventName !== "PreCompact" && result.hookEventName !== "PostCompact") {
