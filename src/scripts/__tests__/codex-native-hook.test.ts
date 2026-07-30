@@ -36718,6 +36718,152 @@ PY`,
     }
   });
 
+  it("trusts exact inherited non-repository PATH executables while keeping explicit resolution mutations fail-closed (#3370)", async () => {
+    if (process.platform === "win32") return;
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-conductor-inherited-path-"));
+    const hostBinDir = await mkdtemp(join(tmpdir(), "omx-native-hook-host-bin-"));
+    const emptyPrefixDir = await mkdtemp(join(tmpdir(), "omx-native-hook-empty-prefix-"));
+    const previousPath = process.env.PATH;
+    const previousPathext = process.env.PATHEXT;
+    try {
+      const bashPath = ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash", "/usr/bin/bash"].find((candidate) => existsSync(candidate));
+      const shPath = ["/bin/sh", "/usr/bin/sh"].find((candidate) => existsSync(candidate));
+      const perlPath = ["/opt/homebrew/bin/perl", "/usr/local/bin/perl", "/usr/bin/perl", "/bin/perl"].find((candidate) => existsSync(candidate));
+      const gitPath = ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git", "/bin/git"].find((candidate) => existsSync(candidate));
+      const catPath = ["/bin/cat", "/usr/bin/cat"].find((candidate) => existsSync(candidate));
+      assert.ok(bashPath, "host bash executable is required");
+      assert.ok(shPath, "host sh executable is required");
+      assert.ok(perlPath, "host perl executable is required");
+      assert.ok(gitPath, "host git executable is required");
+      assert.ok(catPath, "host cat executable is required");
+      await symlink(bashPath, join(hostBinDir, "bash"));
+      await symlink(bashPath, join(hostBinDir, "BASH"));
+      await symlink(shPath, join(hostBinDir, "ſh"));
+      await symlink(perlPath, join(hostBinDir, "perl"));
+      await symlink(gitPath, join(hostBinDir, "git"));
+      await symlink(catPath, join(hostBinDir, "cat"));
+      await symlink(bashPath, join(hostBinDir, "omx.exe"));
+      await symlink(bashPath, join(hostBinDir, "gjc.cmd"));
+
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-conductor-inherited-path";
+      const threadId = "thread-conductor-inherited-path";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      execFileSync("git", ["init", "-q"], { cwd });
+      await writeFile(join(stateDir, "conductor.log"), "old\n", "utf-8");
+      await writeJson(join(stateDir, "session.json"), { session_id: sessionId, native_session_id: threadId });
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: threadId,
+            threads: { [threadId]: { thread_id: threadId, kind: "leader" } },
+          },
+        },
+      });
+      await writeSessionSkillActiveState(stateDir, sessionId, "ralph", "executing");
+      await writeJson(join(stateDir, "sessions", sessionId, "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        session_id: sessionId,
+      });
+
+      process.env.PATH = `${hostBinDir}:/usr/bin:/bin`;
+      const dispatch = (command: string) => dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: threadId,
+          agent_id: threadId,
+          tool_name: "Bash",
+          tool_input: { command },
+        },
+        { cwd },
+      );
+      const hardenedGitStatus = "GIT_ATTR_NOSYSTEM=1 GIT_CONFIG_COUNT=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null GIT_EDITOR= GIT_EXTERNAL_DIFF= GIT_PAGER= GIT_SEQUENCE_EDITOR= PAGER= git --no-pager --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false -c pager.status=false status --short --branch --untracked-files=normal --ignore-submodules=all --no-renames";
+
+      for (const command of [
+        "bash --noprofile --norc -lc \"printf safe\"",
+        "perl -pi -e 's/old/new/' .omx/state/conductor.log",
+        hardenedGitStatus,
+        `PATH=${JSON.stringify(`${emptyPrefixDir}:${process.env.PATH}`)} cat .omx/state/conductor.log`,
+      ]) {
+        assert.equal((await dispatch(command)).outputJson, null, command);
+      }
+
+      const inheritedPath = process.env.PATH;
+      const metadataPerl = "perl -pi -e 's/old/new/' .omx/state/conductor.log";
+      const metadataCat = "cat .omx/state/conductor.log";
+      const inversePathCat = `ALT=${JSON.stringify(inheritedPath)}; declare -n PATH=ALT; ${metadataCat}`;
+      const lateInversePathCat = `declare -n PATH=ALT; ALT=${JSON.stringify(inheritedPath)}; ${metadataCat}`;
+      const functionInversePathCat = `f() { local ALT=${JSON.stringify(inheritedPath)}; local -n PATH=ALT; ${metadataCat}; }; f`;
+      const inversePathextCat = `ALT=.EVIL; declare -n PATHEXT=ALT; ${metadataCat}`;
+      for (const command of [
+        `PATH=${JSON.stringify(hostBinDir)} bash --noprofile --norc -lc \"printf safe\"`,
+        `PATH=${JSON.stringify(inheritedPath)} bash --noprofile --norc -lc \"printf safe\"`,
+        `PATH=${JSON.stringify(inheritedPath)}; bash --noprofile --norc -lc \"printf safe\"`,
+        `export PATH=${JSON.stringify(inheritedPath)}; bash --noprofile --norc -lc \"printf safe\"`,
+        `printf -v PATH '%s' ${JSON.stringify(inheritedPath)}; bash --noprofile --norc -lc \"printf safe\"`,
+        "PATHEXT=.EVIL bash --noprofile --norc -lc \"printf safe\"",
+        "BASH --noprofile --norc -lc \"printf safe\"",
+        "ſh -c \"printf safe\"",
+        "omx.exe --help",
+        "gjc.cmd --help",
+        `PATH=${JSON.stringify(`${cwd}/missing:${inheritedPath}`)} cat .omx/state/conductor.log`,
+        `f() { PATH=${JSON.stringify(inheritedPath)}; }; f; ${metadataPerl}`,
+        `f() { export PATH; }; f; ${metadataPerl}`,
+        `f() { local PATH=${JSON.stringify(inheritedPath)}; ${metadataPerl}; }; f`,
+        `f() { declare PATH=${JSON.stringify(inheritedPath)}; ${metadataPerl}; }; f`,
+        `f() { local PATHEXT=.EVIL; ${metadataPerl}; }; f`,
+        `f() { local PATH=${JSON.stringify(inheritedPath)}; printf -v PATH '%s' ${JSON.stringify(inheritedPath)}; ${metadataPerl}; }; f`,
+        `f() { local PATH=${JSON.stringify(inheritedPath)}; local -n path_ref=PATH; printf -v path_ref '%s' ${JSON.stringify(inheritedPath)}; ${metadataPerl}; }; f`,
+        `bash --noprofile --norc -lc ${JSON.stringify(inversePathCat)}`,
+        `env bash --noprofile --norc -lc ${JSON.stringify(inversePathCat)}`,
+        `exec bash --noprofile --norc -lc ${JSON.stringify(inversePathCat)}`,
+        `bash --noprofile --norc -lc ${JSON.stringify(lateInversePathCat)}`,
+        `bash --noprofile --norc -lc ${JSON.stringify(functionInversePathCat)}`,
+        `bash --noprofile --norc -lc ${JSON.stringify(inversePathextCat)}`,
+        `ALT=${JSON.stringify(inheritedPath)}; declare -n PATH=ALT; ${metadataCat}`,
+        `declare -n PATH=ALT; ALT=${JSON.stringify(inheritedPath)}; ${metadataCat}`,
+        `f() { local ALT=${JSON.stringify(inheritedPath)}; local -n PATH=ALT; ${metadataCat}; }; f`,
+        `declare -n PATHEXT=ALT; ALT=.EVIL; ${metadataCat}`,
+        `f() { local ALT=.EVIL; local -n PATHEXT=ALT; ${metadataCat}; }; f`,
+        `ALT=${JSON.stringify(inheritedPath)}; declare -n PATH=ALT; ${metadataPerl}`,
+        `declare -n PATH=ALT; ALT=${JSON.stringify(inheritedPath)}; ${metadataPerl}`,
+        `declare -n PATHEXT=ALT; ALT=.EVIL; ${metadataPerl}`,
+        `f() { local ALT=${JSON.stringify(inheritedPath)}; local -n PATH=ALT; ${metadataPerl}; }; f`,
+        `f() { local -n PATH=ALT; local ALT=${JSON.stringify(inheritedPath)}; ${metadataPerl}; }; f`,
+        `f() { local -n PATHEXT=ALT; local ALT=.EVIL; ${metadataPerl}; }; f`,
+        `f() { local -n ALT=PATH; ${metadataPerl}; }; f`,
+        `f() { local ALT=.EVIL; local -n PATHEXT=ALT; ${metadataPerl}; }; f`,
+        `f() { local -n ALT=PATHEXT; ${metadataPerl}; }; f`,
+        `f() { ${metadataPerl}; }; PATH=${JSON.stringify(inheritedPath)} f`,
+        `f() { ${metadataPerl}; }; PATHEXT=.EVIL f`,
+      ]) {
+        const result = await dispatch(command);
+        assert.equal(result.outputJson?.decision, "block", command);
+      }
+
+      const repoBinDir = join(cwd, "repo-bin");
+      await mkdir(repoBinDir, { recursive: true });
+      await symlink(bashPath, join(repoBinDir, "bash"));
+      process.env.PATH = `${repoBinDir}:${inheritedPath}`;
+      const repositoryPathCandidate = await dispatch("bash --noprofile --norc -lc \"printf safe\"");
+      assert.equal(repositoryPathCandidate.outputJson?.decision, "block");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousPathext === undefined) delete process.env.PATHEXT;
+      else process.env.PATHEXT = previousPathext;
+      await rm(emptyPrefixDir, { recursive: true, force: true });
+      await rm(hostBinDir, { recursive: true, force: true });
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it("allows autopilot rework implementation writes while conductor phases stay guarded", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-autopilot-rework-write-"));
     try {
