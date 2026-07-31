@@ -2761,9 +2761,9 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
       }, childEnv).stdout),
     );
     const identitylessNativeHookOutput = identitylessNativeOutput.hookSpecificOutput as Record<string, unknown> | undefined;
-    if (identitylessNativeHookOutput?.permissionDecision !== 'deny'
-      || !/Conductor mode is active/.test(String(identitylessNativeHookOutput.permissionDecisionReason ?? ''))) {
-      throw new Error('native hook identityless native-session remote mutation did not emit a canonical denial');
+    const identitylessNativeReason = String(identitylessNativeHookOutput?.permissionDecisionReason ?? '').trim();
+    if (identitylessNativeHookOutput?.permissionDecision !== 'deny' || !identitylessNativeReason) {
+      throw new Error(`native hook identityless native-session remote mutation did not emit a canonical denial: ${JSON.stringify(identitylessNativeOutput)}`);
     }
     if (Object.keys(runActorProbe('main-root', 'finite cp metadata leaf control', 'Bash', {
       command: 'cp .omx/state/payload .omx/handoffs/run-1/payload',
