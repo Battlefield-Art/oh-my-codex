@@ -2512,8 +2512,12 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
       probe: string,
       toolName: string,
       toolInput: Record<string, unknown>,
-      inheritedEnv: Record<string, string> = {},
+      inheritedEnv: Record<string, string | undefined> = {},
     ): { output: Record<string, unknown>; stdout: string } => {
+      const probeEnv: NodeJS.ProcessEnv = { ...childEnv, ...inheritedEnv };
+      for (const [key, value] of Object.entries(probeEnv)) {
+        if (value === undefined) delete probeEnv[key];
+      }
       const result = invokeAuthorizationProbe({
         hook_event_name: 'PreToolUse',
         cwd: smokeCwd,
@@ -2524,7 +2528,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
         tool_name: toolName,
         tool_use_id: `packed-install-${actor}-${probe.replace(/\W+/g, '-')}`,
         tool_input: toolInput,
-      }, { ...childEnv, ...inheritedEnv });
+      }, probeEnv);
       const stdout = String(result.stdout);
       return { output: parseNativeHookSmokeOutput(`PreToolUse ${actor} ${probe}`, stdout), stdout };
     };
