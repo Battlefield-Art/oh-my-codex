@@ -2749,21 +2749,22 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
       ),
       /Main-root Conductor mode is active/,
     );
-    requireNativeHookPermissionDeny(
-      'identityless native-session remote mutation',
-      parseNativeHookSmokeOutput(
-        'PreToolUse identityless native-session remote mutation',
-        String(invokeAuthorizationProbe({
-          hook_event_name: 'PreToolUse',
-          cwd: smokeCwd,
-          session_id: leaderAgentId,
-          tool_name: 'Bash',
-          tool_use_id: 'packed-install-identityless-native-session-remote-mutation',
-          tool_input: { command: 'PATH=/usr/bin:/bin gh issue create --title x --body y' },
-        }, childEnv).stdout),
-      ),
-      /Main-root Conductor mode is active/,
+    const identitylessNativeOutput = parseNativeHookSmokeOutput(
+      'PreToolUse identityless native-session remote mutation',
+      String(invokeAuthorizationProbe({
+        hook_event_name: 'PreToolUse',
+        cwd: smokeCwd,
+        session_id: leaderAgentId,
+        tool_name: 'Bash',
+        tool_use_id: 'packed-install-identityless-native-session-remote-mutation',
+        tool_input: { command: 'PATH=/usr/bin:/bin gh issue create --title x --body y' },
+      }, childEnv).stdout),
     );
+    const identitylessNativeHookOutput = identitylessNativeOutput.hookSpecificOutput as Record<string, unknown> | undefined;
+    if (identitylessNativeHookOutput?.permissionDecision !== 'deny'
+      || !/Main-root Conductor mode is active/.test(String(identitylessNativeHookOutput.permissionDecisionReason ?? ''))) {
+      throw new Error('native hook identityless native-session remote mutation did not emit a canonical denial');
+    }
     if (Object.keys(runActorProbe('main-root', 'finite cp metadata leaf control', 'Bash', {
       command: 'cp .omx/state/payload .omx/handoffs/run-1/payload',
     })).length !== 0) {
