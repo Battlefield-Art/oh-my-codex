@@ -1227,6 +1227,8 @@ export const PACKED_INSTALL_PLUGIN_MCP_TARGETS = [
 ] as const;
 
 const PACKED_INSTALL_OPERATIONAL_PROBE_TIMEOUT_MS = 5_000;
+const PACKED_INSTALL_COMMAND_TIMEOUT_MS = 120_000;
+
 
 function buildPackedProbeEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
@@ -2085,8 +2087,13 @@ function run(cmd: string, args: readonly string[], options: Record<string, unkno
   const result = spawnSync(cmd, [...args], {
     encoding: 'utf-8',
     stdio: 'pipe',
+    timeout: PACKED_INSTALL_COMMAND_TIMEOUT_MS,
+    killSignal: 'SIGKILL',
     ...options,
   });
+  if ((result.error as NodeJS.ErrnoException | undefined)?.code === 'ETIMEDOUT') {
+    throw new Error(`${cmd} ${args.join(' ')} exceeded ${PACKED_INSTALL_COMMAND_TIMEOUT_MS}ms`);
+  }
   if (result.status !== 0) {
     throw new Error(formatCommandFailure(cmd, [...args], result));
   }
@@ -3620,15 +3627,18 @@ PY`],
     }, null, 2));
     const packedCancelHookResult = invokeAuthorizationProbe({
       hook_event_name: 'PreToolUse',
-      cwd: smokeCwd,
-      session_id: leaderAgentId,
-      agent_id: leaderAgentId,
-      thread_id: leaderAgentId,
+      cwd: packedCancelCwd,
+      session_id: packedCancelSessionId,
+      agent_id: packedCancelNativeId,
+      thread_id: packedCancelNativeId,
       tool_name: 'Bash',
       tool_use_id: 'packed-install-issue-3280-cancel',
       tool_input: { command: 'omx cancel --force' },
     }, {
       ...childEnv,
+      OMX_ROOT: packedCancelCwd,
+      OMX_SOURCE_CWD: packedCancelCwd,
+      OMX_STARTUP_CWD: packedCancelCwd,
       PATH: packedNpmPath,
       NODE_EXTRA_CA_CERTS: '/nonexistent/enterprise-ca.pem',
     });
