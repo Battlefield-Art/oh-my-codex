@@ -2788,9 +2788,9 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
     })).length !== 0) {
       throw new Error('packed main-root bounded quoted heredoc metadata control should be allowed');
     }
-    if (Object.keys(runActorProbe('main-root', 'zsh fast startup control', 'Bash', {
+    if (Object.keys(runActorProbeResult('main-root', 'zsh fast startup control', 'Bash', {
       command: `zsh -f -c ':'`,
-    }, { BASH_ENV: '', ENV: '', ZDOTDIR: '' })).length !== 0) {
+    }, { BASH_ENV: undefined, ENV: undefined, ZDOTDIR: undefined }).output).length !== 0) {
       throw new Error('packed main-root zsh fast startup control should be allowed');
     }
     const boxedPlanningRoot = join(smokeCwd, 'boxed-planning-root');
