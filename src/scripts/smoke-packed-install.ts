@@ -2786,7 +2786,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
     }
     if (Object.keys(runActorProbe('main-root', 'zsh fast startup control', 'Bash', {
       command: `zsh -f -c ':'`,
-    })).length !== 0) {
+    }, { BASH_ENV: '', ENV: '', ZDOTDIR: '' })).length !== 0) {
       throw new Error('packed main-root zsh fast startup control should be allowed');
     }
     const boxedPlanningRoot = join(smokeCwd, 'boxed-planning-root');
