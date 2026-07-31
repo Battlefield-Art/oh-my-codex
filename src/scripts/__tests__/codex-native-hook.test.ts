@@ -4200,7 +4200,7 @@ PY`,
       process.env.OMX_SESSION_ID = sessionId;
       assert.equal(await neutralizeOwnedRoutingRalplan(cwd), true);
       const result = await dispatchCodexNativeHook({ hook_event_name: 'SessionStart', cwd, session_id: sessionId }, { cwd });
-      const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } }).hookSpecificOutput?.additionalContext ?? '');
+      const context = String((result.outputJson as { hookSpecificOutput?: { additionalContext?: string } } | null)?.hookSpecificOutput?.additionalContext ?? '');
       assert.doesNotMatch(context, /- ralplan phase:/);
     } finally {
       previousSessionId === undefined ? delete process.env.OMX_SESSION_ID : process.env.OMX_SESSION_ID = previousSessionId;
@@ -22067,7 +22067,7 @@ PY`,
       }
     }
   });
-  it("#3316: allows a registered child to message its owning leader via collaboration.send_message during active deep-interview", async () => {
+  it("#3316: denies collaboration.send_message during active deep-interview without host-authenticated caller-parent-target proof", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3316-di-send-message-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -22143,15 +22143,15 @@ PY`,
         { cwd },
       );
 
-      // Registered leader -> registered child: already allowed today (main-root actor bypasses the gate).
       const leaderToChild = await sendMessage(leaderThreadId, leaderThreadId, childThreadId);
-      assert.equal(leaderToChild.outputJson, null, "leader-to-child");
+      assert.equal(leaderToChild.outputJson?.decision, "block", "leader-to-child");
+      assert.match(String(leaderToChild.outputJson?.reason ?? ""), /not a recognized read-only or explicitly authorized deep-interview mutation transport|documented host-authenticated Main-root authority/, "leader-to-child");
 
-      // Registered child -> its owning leader, same authoritative session, target relation proven: now allowed.
       const childToLeader = await sendMessage(childThreadId, childThreadId, leaderThreadId);
-      assert.equal(childToLeader.outputJson, null, "child-to-leader");
+      assert.equal(childToLeader.outputJson?.decision, "block", "child-to-leader");
+      assert.match(String(childToLeader.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "child-to-leader");
 
-      // The flattened Codex CLI tool-name form must canonicalize identically.
+      // Flattened tool names remain equally denied without a host-authenticated caller-parent-target relation.
       const flattenedChildToLeader = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
@@ -22164,7 +22164,8 @@ PY`,
         },
         { cwd },
       );
-      assert.equal(flattenedChildToLeader.outputJson, null, "flattened-child-to-leader");
+      assert.equal(flattenedChildToLeader.outputJson?.decision, "block", "flattened-child-to-leader");
+      assert.match(String(flattenedChildToLeader.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "flattened-child-to-leader");
 
       // spawn/close/interrupt/followup/wait remain gated for the same registered child: no namespace-wide loosening.
       for (const toolName of [
@@ -22230,8 +22231,7 @@ PY`,
         assert.match(String(malformed.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, `malformed-target-${label}`);
       }
 
-      // No command/path execution rides along on message content: shell-metacharacter-laden
-      // message text from the registered child to its owning leader stays inert and allowed.
+      // Message content is inert, but transport authority is still absent and must fail closed.
       const messageWithShellPayload = await dispatchCodexNativeHook(
         {
           hook_event_name: "PreToolUse",
@@ -22244,13 +22244,14 @@ PY`,
         },
         { cwd },
       );
-      assert.equal(messageWithShellPayload.outputJson, null, "shell-payload-message-content");
+      assert.equal(messageWithShellPayload.outputJson?.decision, "block", "shell-payload-message-content");
+      assert.match(String(messageWithShellPayload.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "shell-payload-message-content");
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
   });
 
-  it("#3316: allows a registered child to message its owning leader via collaboration.send_message during active ralplan", async () => {
+  it("#3316: denies collaboration.send_message during active ralplan without host-authenticated caller-parent-target proof", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3316-ralplan-send-message-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -22306,10 +22307,12 @@ PY`,
       );
 
       const leaderToChild = await sendMessage(leaderThreadId, childThreadId);
-      assert.equal(leaderToChild.outputJson, null, "ralplan-leader-to-child");
+      assert.equal(leaderToChild.outputJson?.decision, "block", "ralplan-leader-to-child");
+      assert.match(String(leaderToChild.outputJson?.reason ?? ""), /not a recognized read-only or explicitly authorized planning mutation transport|documented host-authenticated Main-root authority/, "ralplan-leader-to-child");
 
       const childToLeader = await sendMessage(childThreadId, leaderThreadId);
-      assert.equal(childToLeader.outputJson, null, "ralplan-child-to-leader");
+      assert.equal(childToLeader.outputJson?.decision, "block", "ralplan-child-to-leader");
+      assert.match(String(childToLeader.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/, "ralplan-child-to-leader");
 
       const spawnAgentStillGated = await dispatchCodexNativeHook(
         {
@@ -22423,7 +22426,7 @@ PY`,
     return { sessionId, leaderThreadId, stateDir };
   };
 
-  it("allows flattened known collaboration tools under active ralplan while unknown flattened names stay blocked", async () => {
+  it("denies flattened collaboration tools under active ralplan without documented host authority", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-flattened-collab-ralplan-"));
     try {
       const { sessionId, leaderThreadId } = await writeFlattenedCollaborationRalplanFixture(cwd);
@@ -22444,7 +22447,12 @@ PY`,
           tool_name,
           tool_input,
         }, { cwd });
-        assert.equal(result.outputJson, null, tool_name);
+        assert.equal(result.outputJson?.decision, "block", tool_name);
+        assert.match(
+          String(result.outputJson?.reason ?? ""),
+          /not a recognized read-only or explicitly authorized planning mutation transport|OWNER_CONFIRMATION_REQUIRED/,
+          tool_name,
+        );
       }
 
       const blocked = await dispatchCodexNativeHook({
@@ -22457,8 +22465,7 @@ PY`,
       }, { cwd });
       assert.equal(blocked.outputJson?.decision, "block");
       const reason = String(blocked.outputJson?.reason ?? "");
-      assert.match(reason, /not a recognized read-only or explicitly authorized planning mutation transport/);
-      assert.match(reason, /collaborationbogus_thing/);
+      assert.match(reason, /not a recognized read-only or explicitly authorized planning mutation transport|OWNER_CONFIRMATION_REQUIRED/);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
@@ -32805,6 +32812,371 @@ PY`,
     }
   });
 
+  it("issue #3358 keeps Team and update_plan denied while hardening exact read-only discovery", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3358-transport-"));
+    try {
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-3358-transport";
+      const leaderThreadId = "thread-3358-transport";
+      const childThreadId = "child-3358-transport";
+      execFileSync("git", ["init", "-q"], {
+        cwd,
+        env: {
+          ...process.env,
+          GIT_CONFIG_COUNT: "0",
+          GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+          GIT_CONFIG_NOSYSTEM: "1",
+          GIT_CONFIG_SYSTEM: process.platform === "win32" ? "NUL" : "/dev/null",
+        },
+      });
+      await writeNativeMappedSessionState(cwd, stateDir, sessionId, sessionId, leaderThreadId);
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: leaderThreadId,
+            threads: {
+              [leaderThreadId]: { thread_id: leaderThreadId, kind: "leader" },
+              [childThreadId]: { thread_id: childThreadId, kind: "subagent", parent_thread_id: leaderThreadId },
+            },
+          },
+        },
+      });
+      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "planning");
+      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
+        active: true,
+        mode: "ultragoal",
+        current_phase: "planning",
+        session_id: sessionId,
+        workingDirectory: cwd,
+      });
+
+      await withCleanAmbientNodeRuntimeEnvironment(async () => {
+        await withTrustedWorkspaceOmxCli(cwd, async (_omxCommand, trustedPath) => {
+          const previousPath = process.env.PATH;
+          process.env.PATH = trustedPath;
+          try {
+            const rootPayload = (toolName: string, toolInput: Record<string, unknown>, overrides: Record<string, unknown> = {}) => ({
+              hook_event_name: "PreToolUse",
+              cwd,
+              session_id: sessionId,
+              turn_id: "turn-3358-transport",
+              tool_name: toolName,
+              tool_use_id: `tool-3358-${Math.random()}`,
+              tool_input: toolInput,
+              ...overrides,
+            });
+            const runBash = (command: string, overrides: Record<string, unknown> = {}) => dispatchCodexNativeHook(
+              rootPayload("Bash", { command }, overrides),
+              { cwd },
+            );
+            const safeGitEnvironment = {
+              GIT_ATTR_NOSYSTEM: "1",
+              GIT_CONFIG_COUNT: "0",
+              GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+              GIT_CONFIG_NOSYSTEM: "1",
+              GIT_CONFIG_SYSTEM: process.platform === "win32" ? "NUL" : "/dev/null",
+              GIT_EDITOR: "",
+              GIT_EXTERNAL_DIFF: "",
+              GIT_PAGER: "",
+              GIT_SEQUENCE_EDITOR: "",
+              PAGER: "",
+            };
+            const assignmentWord = (name: string, value: string) => value === "" ? `${name}=` : `${name}=${JSON.stringify(value)}`;
+            const hardenedGitStatus = (overrides: Record<string, string> = {}, extraAssignments: string[] = []) => {
+              const environment = { ...safeGitEnvironment, ...overrides };
+              return [
+                ...Object.entries(environment).map(([name, value]) => assignmentWord(name, value)),
+                ...extraAssignments,
+                "git --no-pager --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false -c pager.status=false status --short --branch --untracked-files=normal --ignore-submodules=all --no-renames",
+              ].join(" ");
+            };
+            const runFixtureGit = (args: string[]) => execFileSync("git", args, {
+              cwd,
+              env: {
+                ...process.env,
+                GIT_CONFIG_COUNT: "0",
+                GIT_CONFIG_GLOBAL: process.platform === "win32" ? "NUL" : "/dev/null",
+                GIT_CONFIG_NOSYSTEM: "1",
+                GIT_CONFIG_SYSTEM: process.platform === "win32" ? "NUL" : "/dev/null",
+                GIT_EXTERNAL_DIFF: "",
+                GIT_PAGER: "",
+                PAGER: "",
+              },
+            });
+            const assertAllowed = async (name: string, command: string) => {
+              const result = await runBash(command);
+              assert.equal(result.outputJson, null, `${name}: ${JSON.stringify(result)}`);
+            };
+            const assertBlocked = async (name: string, command: string) => {
+              const result = await runBash(command);
+              assert.equal(result.outputJson?.decision, "block", `${name}: ${JSON.stringify(result)}`);
+            };
+
+            await assertAllowed("hardened git status", hardenedGitStatus());
+            await assertAllowed("hardened git status command-local PATH", hardenedGitStatus({}, [assignmentWord("PATH", trustedPath)]));
+            await assertAllowed("bounded find files", "find . -maxdepth 2 -type f");
+            await assertAllowed("bounded find command-local PATH", `${assignmentWord("PATH", trustedPath)} find . -maxdepth 2 -type f`);
+            await assertAllowed("bounded find directories", "find . -mindepth 1 -maxdepth 3 -type d -print");
+            // The CI image does not guarantee ripgrep; assert the real trusted binary only when the authenticated PATH contains it.
+            if (existsSync("/usr/bin/rg") || existsSync("/bin/rg")) {
+              await assertAllowed("real rg", "rg -n \"transport\" README.md");
+            }
+
+            for (const [name, command] of [
+              ["plain git status", "git status --short --branch"],
+              ["git status path operand", `${hardenedGitStatus()} src`],
+              ["git status unmodeled option", "git status --porcelain"],
+              ["git status chain", `${hardenedGitStatus()}; true`],
+              ["git status redirect", `${hardenedGitStatus()} > status.txt`],
+              ["git status pipeline", `${hardenedGitStatus()} | cat`],
+              ["git status substituted executable", hardenedGitStatus().replace(/\bgit /, "$(printf git) ")],
+              ["git status wrapper", hardenedGitStatus().replace(/\bgit /, "command git ")],
+              ["git status function", `git() { printf x > pwned; }; ${hardenedGitStatus()}`],
+              ["git status alias", `shopt -s expand_aliases; alias git='printf x > pwned'; ${hardenedGitStatus()}`],
+              ["git status nested shell", `bash -c ${JSON.stringify(hardenedGitStatus())}`],
+              ["find exec", "find . -type f -exec sh -c 'printf x > pwned' \\;"],
+              ["find delete", "find . -type f -delete"],
+              ["find file output", "find . -type f -fprint pwned"],
+              ["find dynamic depth", "find . -maxdepth \"$DEPTH\" -type f"],
+              ["unbounded find", "find . -type f"],
+              ["outside workspace find", "find .. -maxdepth 2 -type f"],
+              ["absolute workspace escape find", "find /tmp -maxdepth 2 -type f"],
+              ["excessive find depth", "find . -maxdepth 33 -type f"],
+              ["huge find depth", "find . -maxdepth 999999999 -type f"],
+              ["find wrapper", "command find . -maxdepth 2 -type f"],
+              ["find function", "find() { printf x > pwned; }; find . -maxdepth 2 -type f"],
+              ["find alias", "shopt -s expand_aliases; alias find='printf x > pwned'; find . -maxdepth 2 -type f"],
+              ["find nested shell", "bash -c 'find . -maxdepth 2 -type f'"],
+              ["find chain", "find . -maxdepth 2 -type f; true"],
+              ["find redirect", "find . -maxdepth 2 -type f > files.txt"],
+              ["find pipeline", "find . -maxdepth 2 -type f | cat"],
+              ["find substitution", "find \"$(printf .)\" -maxdepth 2 -type f"],
+              ["find brace expansion", "find . {-exec,sh,-c,'touch pwned',';'} -maxdepth 0"],
+              ["find pathname expansion", "find . -maxdepth 2 -name *"],
+              ["find extglob expansion", "find . -maxdepth 2 -name @(src|docs)"],
+            ] as const) await assertBlocked(name, command);
+
+            const outsideFindRoot = await mkdtemp(join(tmpdir(), "omx-3358-find-outside-"));
+            const outsideFindLink = join(cwd, "outside-find-link");
+            try {
+              await mkdir(join(outsideFindRoot, "nested"), { recursive: true });
+              await symlink(outsideFindRoot, outsideFindLink, process.platform === "win32" ? "junction" : "dir");
+              await assertBlocked("symlinked find workspace escape", "find outside-find-link/nested -maxdepth 2 -type f");
+            } finally {
+              await rm(outsideFindLink, { force: true });
+              await rm(outsideFindRoot, { recursive: true, force: true });
+            }
+
+            process.env["BASH_FUNC_git%%"] = "() { printf x > pwned; }";
+            process.env["BASH_FUNC_find%%"] = "() { printf x > pwned; }";
+            try {
+              await assertBlocked("exported git function", hardenedGitStatus());
+              await assertBlocked("exported find function", "find . -maxdepth 2 -type f");
+            } finally {
+              delete process.env["BASH_FUNC_git%%"];
+              delete process.env["BASH_FUNC_find%%"];
+            }
+
+            for (const [name, overrides] of [
+              ["GIT_PAGER override", { GIT_PAGER: "cat" }],
+              ["PAGER override", { PAGER: "cat" }],
+              ["external diff override", { GIT_EXTERNAL_DIFF: "sh -c 'printf x > pwned'" }],
+              ["config count override", { GIT_CONFIG_COUNT: "1" }],
+              ["GIT_DIR override", { GIT_DIR: join(cwd, "foreign-git-dir") }],
+            ] as const) await assertBlocked(name, hardenedGitStatus(overrides));
+
+            const previousExternalDiff = process.env.GIT_EXTERNAL_DIFF;
+            const previousGitPager = process.env.GIT_PAGER;
+            process.env.GIT_EXTERNAL_DIFF = "sh -c 'printf x > pwned'";
+            process.env.GIT_PAGER = "sh -c 'printf x > pwned'";
+            try {
+              await assertBlocked(
+                "append external diff neutralizer",
+                hardenedGitStatus().replace("GIT_EXTERNAL_DIFF=", "GIT_EXTERNAL_DIFF+="),
+              );
+              await assertBlocked(
+                "append pager neutralizer",
+                hardenedGitStatus().replace("GIT_PAGER=", "GIT_PAGER+="),
+              );
+            } finally {
+              if (previousExternalDiff === undefined) delete process.env.GIT_EXTERNAL_DIFF;
+              else process.env.GIT_EXTERNAL_DIFF = previousExternalDiff;
+              if (previousGitPager === undefined) delete process.env.GIT_PAGER;
+              else process.env.GIT_PAGER = previousGitPager;
+            }
+
+            const configPath = join(cwd, ".git", "config");
+            const originalGitConfig = await readFile(configPath, "utf-8");
+            for (const [name, config] of [
+              ["git alias config", "[alias]\n  status-safe = !printf x > pwned\n"],
+              ["core pager config", "[core]\n  pager = sh -c 'printf x > pwned'\n"],
+              ["core fsmonitor config", "[core]\n  fsmonitor = sh -c 'printf x > pwned'\n"],
+              ["core worktree config", `[core]\n  worktree = ${join(cwd, "foreign-worktree")}\n`],
+              ["core excludes config", `[core]\n  excludesFile = ${join(cwd, "foreign-excludes")}\n`],
+              ["core hooks config", `[core]\n  hooksPath = ${join(cwd, "foreign-hooks")}\n`],
+              ["core attributes config", `[core]\n  attributesFile = ${join(cwd, "foreign-attributes")}\n`],
+              ["include config", `[include]\n  path = ${join(cwd, "foreign-config")}\n`],
+              ["conditional include config", `[includeIf \"gitdir:${cwd}/\"]\n  path = ${join(cwd, "foreign-config")}\n`],
+              ["interactive diff filter config", "[interactive]\n  diffFilter = sh -c 'printf x > pwned'\n"],
+              ["status submodule summary config", "[status]\n  submoduleSummary = true\n"],
+              ["diff driver command config", "[diff \"evil\"]\n  command = sh -c 'printf x > pwned'\n"],
+              ["diff textconv config", "[diff \"evil\"]\n  textconv = sh -c 'printf x > pwned'\n"],
+              ["external diff config", "[diff]\n  external = sh -c 'printf x > pwned'\n"],
+              ["filter helper config", "[filter \"evil\"]\n  clean = sh -c 'printf x > pwned'\n"],
+              ["submodule helper config", "[submodule \"child\"]\n  update = !printf x > pwned\n"],
+            ] as const) {
+              await writeFile(configPath, `${originalGitConfig}\n${config}`);
+              await assertBlocked(name, hardenedGitStatus());
+              await writeFile(configPath, originalGitConfig);
+            }
+
+            await writeFile(join(cwd, ".gitmodules"), "[submodule \"child\"]\n  path = child\n  url = ./child\n");
+            runFixtureGit(["add", "--", ".gitmodules"]);
+            await assertBlocked("gitmodules submodule", hardenedGitStatus());
+            runFixtureGit(["rm", "--cached", "-q", "--", ".gitmodules"]);
+            await rm(join(cwd, ".gitmodules"), { force: true });
+            await writeFile(join(cwd, ".gitattributes"), "*.txt filter=evil\n");
+            await assertBlocked("untracked worktree attributes helper", hardenedGitStatus());
+            runFixtureGit(["add", "--", ".gitattributes"]);
+            await assertBlocked("tracked worktree attributes helper", hardenedGitStatus());
+            runFixtureGit(["rm", "--cached", "-q", "--", ".gitattributes"]);
+            await rm(join(cwd, ".gitattributes"), { force: true });
+            await mkdir(join(cwd, "nested"), { recursive: true });
+            await writeFile(join(cwd, "nested", "tracked.txt"), "tracked\n");
+            runFixtureGit(["add", "--", "nested/tracked.txt"]);
+            await writeFile(join(cwd, "nested", ".gitattributes"), "*.txt filter=evil\n");
+            await assertBlocked("nested untracked worktree attributes helper", hardenedGitStatus());
+            await rm(join(cwd, "nested", ".gitattributes"), { force: true });
+            runFixtureGit(["rm", "--cached", "-q", "--", "nested/tracked.txt"]);
+            await rm(join(cwd, "nested"), { recursive: true, force: true });
+            await mkdir(join(cwd, ".git", "info"), { recursive: true });
+            await writeFile(join(cwd, ".git", "info", "attributes"), "*.txt diff=evil\n");
+            await assertBlocked("git info attributes helper", hardenedGitStatus());
+            await rm(join(cwd, ".git", "info", "attributes"), { force: true });
+
+            const attackerDir = await mkdtemp(join(tmpdir(), "omx-3358-discovery-shadow-"));
+            try {
+              for (const commandName of ["git", "find"]) {
+                await writeFile(join(attackerDir, commandName), "#!/bin/sh\nprintf x > pwned\n");
+                await chmod(join(attackerDir, commandName), 0o755);
+              }
+              const shadowedPath = `${attackerDir}:${trustedPath}`;
+              await assertBlocked("PATH-shadowed git", hardenedGitStatus({}, [assignmentWord("PATH", shadowedPath)]));
+              await assertBlocked("foreign absolute git", hardenedGitStatus().replace(/\bgit /, `${join(attackerDir, "git")} `));
+              await assertBlocked("PATH-shadowed find", `${assignmentWord("PATH", shadowedPath)} find . -maxdepth 2 -type f`);
+              await assertBlocked("foreign absolute find", `${join(attackerDir, "find")} . -maxdepth 2 -type f`);
+            } finally {
+              await rm(attackerDir, { recursive: true, force: true });
+            }
+
+            const trimPrefixDir = await mkdtemp(join(tmpdir(), "omx-3358-trim-prefix-"));
+            try {
+              for (const [name, prefix] of [["BOM", "\uFEFF"], ["NBSP", "\u00A0"], ["CR", "\r"]] as const) {
+                for (const executableName of [`${prefix}find`, `${prefix}GIT_ATTR_NOSYSTEM=1`]) {
+                  await writeFile(join(trimPrefixDir, executableName), "#!/bin/sh\nprintf x > pwned\n");
+                  await chmod(join(trimPrefixDir, executableName), 0o755);
+                }
+                process.env.PATH = `${trimPrefixDir}:${trustedPath}`;
+                await assertBlocked(`${name}-prefixed find`, `${prefix}find . -maxdepth 2 -type f`);
+                await assertBlocked(`${name}-prefixed git environment`, `${prefix}${hardenedGitStatus()}`);
+              }
+            } finally {
+              process.env.PATH = trustedPath;
+              await rm(trimPrefixDir, { recursive: true, force: true });
+            }
+
+            const updatePlan = await dispatchCodexNativeHook(
+              rootPayload("update_plan", {
+                explanation: "bounded metadata",
+                plan: [{ step: "reproduce transports", status: "in_progress" }],
+              }),
+              { cwd },
+            );
+            assert.equal(updatePlan.outputJson?.decision, "block", JSON.stringify(updatePlan));
+            assert.match(String(updatePlan.outputJson?.reason ?? ""), /not a recognized read-only or explicitly authorized Conductor mutation transport/);
+
+            const foreignUpdatePlan = await dispatchCodexNativeHook(
+              rootPayload("update_plan", { plan: [{ step: "foreign", status: "pending" }] }, { session_id: "foreign-session" }),
+              { cwd },
+            );
+            assert.equal(foreignUpdatePlan.outputJson?.decision, "block", JSON.stringify(foreignUpdatePlan));
+            assert.match(String(foreignUpdatePlan.outputJson?.reason ?? ""), /PROVENANCE_DENIED/);
+
+            const exactTeam = await runBash('omx team 1:executor "Implement the bounded issue 3358 slice"');
+            assert.equal(exactTeam.outputJson?.decision, "block", JSON.stringify(exactTeam));
+
+            for (const [toolName, toolInput] of [
+              ["collaboration.spawn_agent", { agent_type: "executor", message: "forged root spawn" }],
+              ["collaboration.send_message", { agent_id: childThreadId, message: "forged root report" }],
+              ["create_goal", { objective: "forged root lifecycle" }],
+              ["update_goal", { status: "complete" }],
+              ["mcp__omx_team__start", { workers: 1, role: "executor", task: "forged root team" }],
+            ] as const) {
+              const forgedLeader = await dispatchCodexNativeHook(
+                rootPayload(toolName, toolInput, {
+                  agent_id: leaderThreadId,
+                  thread_id: leaderThreadId,
+                }),
+                { cwd },
+              );
+              assert.equal(forgedLeader.outputJson?.decision, "block", `${toolName}: ${JSON.stringify(forgedLeader)}`);
+            }
+
+            const childWrite = await dispatchCodexNativeHook(
+              rootPayload("apply_patch", {
+                command: "*** Begin Patch\n*** Add File: src/child.ts\n+export {};\n*** End Patch",
+              }, {
+                agent_id: childThreadId,
+                agent_type: "executor",
+                turn_id: "turn-3358-child",
+              }),
+              { cwd },
+            );
+            assert.equal(childWrite.outputJson?.decision, "block", JSON.stringify(childWrite));
+            assert.match(String(childWrite.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/);
+
+            const ownLeaderReport = await dispatchCodexNativeHook(
+              rootPayload("collaboration.send_message", {
+                agent_id: leaderThreadId,
+                message: "Verification complete; no mutation attempted.",
+              }, {
+                agent_id: childThreadId,
+                agent_type: "verifier",
+                turn_id: "turn-3358-child-report",
+              }),
+              { cwd },
+            );
+            assert.equal(ownLeaderReport.outputJson?.decision, "block", JSON.stringify(ownLeaderReport));
+            assert.match(String(ownLeaderReport.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED/);
+
+            for (const [name, overrides, targetAgentId] of [
+              ["cross-child report", { agent_id: childThreadId, agent_type: "verifier" }, childThreadId],
+              ["unregistered child report", { agent_id: "unknown-child", agent_type: "verifier" }, leaderThreadId],
+              ["foreign-session child report", { agent_id: childThreadId, agent_type: "verifier", session_id: "foreign-session" }, leaderThreadId],
+              ["contradictory parent report", {
+                agent_id: childThreadId,
+                agent_type: "verifier",
+                source: { subagent: { thread_spawn: { parent_thread_id: "foreign-parent" } } },
+              }, leaderThreadId],
+            ] as const) {
+              const result = await dispatchCodexNativeHook(
+                rootPayload("collaboration.send_message", { agent_id: targetAgentId, message: name }, overrides),
+                { cwd },
+              );
+              assert.equal(result.outputJson?.decision, "block", `${name}: ${JSON.stringify(result)}`);
+            }
+          } finally {
+            if (previousPath === undefined) delete process.env.PATH;
+            else process.env.PATH = previousPath;
+          }
+        });
+      });
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
   it("allows trusted omx state read with structured input under ultragoal conductor planning (#3343)", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3343-state-read-"));
     try {
@@ -33779,7 +34151,7 @@ PY`,
     }
   });
 
-  it("allows finite Codex goal tools under Main-root Ultragoal checkpointing while near-misses stay unknown-denied (#3300)", async () => {
+  it("allows finite Codex goal reads but denies lifecycle mutation without documented Main-root proof (#3300)", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3300-goal-tool-transport-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
@@ -33825,6 +34197,12 @@ PY`,
         ["get_goal", {}],
         ["functions.get_goal", {}],
         ["functionsget_goal", {}],
+      ] as const) {
+        const result = await dispatch(tool_name, tool_input);
+        assert.equal(result.outputJson, null, tool_name);
+      }
+
+      for (const [tool_name, tool_input] of [
         ["create_goal", { objective: "complete the ultragoal plan" }],
         ["update_goal", { status: "complete" }],
         ["functions.create_goal", { objective: "complete the ultragoal plan" }],
@@ -33833,15 +34211,15 @@ PY`,
         ["functionsupdate_goal", { status: "complete" }],
       ] as const) {
         const result = await dispatch(tool_name, tool_input);
-        assert.equal(result.outputJson, null, tool_name);
+        assert.equal(result.outputJson?.decision, "block", tool_name);
+        assert.match(String(result.outputJson?.reason ?? ""), /OWNER_CONFIRMATION_REQUIRED|documented host-authenticated Main-root authority/, tool_name);
       }
 
       for (const tool_name of ["getgoal", "get_goals", "updateGoal", "createGoal", "functions.get_goals"]) {
         const blocked = await dispatch(tool_name, {});
         assert.equal(blocked.outputJson?.decision, "block", tool_name);
         const reason = String(blocked.outputJson?.reason ?? "");
-        assert.match(reason, /Main-root Conductor mode is active \(ultragoal phase: checkpointing\)/);
-        assert.match(reason, /not a recognized read-only or explicitly authorized Conductor mutation transport/);
+        assert.match(reason, /OWNER_CONFIRMATION_REQUIRED|not a recognized read-only or explicitly authorized Conductor mutation transport/);
         assert.match(reason, new RegExp(tool_name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
       }
 
@@ -33861,25 +34239,30 @@ PY`,
     }
   });
 
-  it("allows session-scoped omx cancel under active ultragoal conductor while impostors stay blocked", async () => {
+  it("hook-owns session-scoped omx cancel under active ultragoal conductor while impostors stay blocked", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-ultragoal-conductor-cancel-"));
     try {
       const stateDir = join(cwd, ".omx", "state");
       const sessionId = "sess-ultragoal-conductor-cancel";
       const leaderThreadId = "thread-ultragoal-conductor-cancel";
-      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      const sessionDir = join(stateDir, "sessions", sessionId);
+      const ultragoalPath = join(sessionDir, "ultragoal-state.json");
+      await mkdir(sessionDir, { recursive: true });
       await writeJson(join(stateDir, "session.json"), {
         session_id: sessionId,
         native_session_id: leaderThreadId,
       });
       await writeJson(join(stateDir, "subagent-tracking.json"), { schemaVersion: 1, sessions: { [sessionId]: { session_id: sessionId, leader_thread_id: leaderThreadId, threads: { [leaderThreadId]: { thread_id: leaderThreadId, kind: "leader" } } } } });
-      await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "planning");
-      await writeJson(join(stateDir, "sessions", sessionId, "ultragoal-state.json"), {
-        active: true,
-        mode: "ultragoal",
-        current_phase: "planning",
-        session_id: sessionId,
-      });
+      const resetUltragoal = async () => {
+        await writeSessionSkillActiveState(stateDir, sessionId, "ultragoal", "planning");
+        await writeJson(ultragoalPath, {
+          active: true,
+          mode: "ultragoal",
+          current_phase: "planning",
+          session_id: sessionId,
+        });
+      };
+      await resetUltragoal();
 
       const bash = (command: string) => dispatchCodexNativeHook({
         hook_event_name: "PreToolUse",
@@ -33890,40 +34273,35 @@ PY`,
         tool_name: "Bash",
         tool_input: { command },
       }, { cwd });
-
-      const workspacePackageCli = realpathSync(resolve(process.cwd(), "dist", "cli", "omx.js"));
-      const trustedPackageBin = join(cwd, "node_modules", ".bin", "omx");
-      await mkdir(dirname(trustedPackageBin), { recursive: true });
-      await symlink(workspacePackageCli, trustedPackageBin);
-      const trustedPackagePath = `${dirname(trustedPackageBin)}:${dirname(process.execPath)}`;
-      const bashTrusted = async (command: string) => {
-        const inheritedPath = process.env.PATH;
-        process.env.PATH = trustedPackagePath;
-        try {
-          return await bash(command);
-        } finally {
-          if (inheritedPath === undefined) delete process.env.PATH;
-          else process.env.PATH = inheritedPath;
-        }
+      const assertHandled = async (command: string, label: string) => {
+        await resetUltragoal();
+        const result = await bash(command);
+        assert.equal(result.outputJson?.decision, "block", label);
+        assert.match(JSON.stringify(result.outputJson), /cancelled_exact_session/, label);
+        assert.equal(JSON.parse(await readFile(ultragoalPath, "utf8")).active, false, label);
       };
 
-      const cleanPositives = await withCleanRunnerNodeEnvironment(async () => ({
-        plain: await bashTrusted("omx cancel"),
-        force: await bashTrusted("omx cancel --force"),
-      }));
-      assert.equal(cleanPositives.plain.outputJson, null);
-      assert.equal(cleanPositives.force.outputJson, null);
-      const inheritedCaPositives = await withCleanRunnerNodeEnvironment(async () => {
-        process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
-        return {
-          plain: await bashTrusted("omx cancel"),
-          force: await bashTrusted("omx cancel --force"),
-        };
+      await withCleanRunnerNodeEnvironment(async () => {
+        await assertHandled("omx cancel", "plain cancellation");
+        await assertHandled("omx cancel --force", "force cancellation");
       });
-      assert.equal(inheritedCaPositives.plain.outputJson, null);
-      assert.equal(inheritedCaPositives.force.outputJson, null);
-      assert.equal((await bash("omx cancel")).outputJson?.decision, "block",
-        "ambient non-package omx resolution is not trusted");
+      for (const [label, envName, envValue] of [
+        ["inherited bash startup file", "BASH_ENV", "/tmp/prelude.sh"],
+        ["imported omx function shadow", "BASH_FUNC_omx%%", "() { printf owned > src/pwned.ts; }"],
+        ["inherited node loader override", "NODE_OPTIONS", "--require=./payload.cjs"],
+        ["inherited openssl config", "OPENSSL_CONF", "/tmp/evil.cnf"],
+        ["inherited dynamic loader preload", "LD_PRELOAD", "/tmp/payload.so"],
+        ["inherited node coverage output", "NODE_V8_COVERAGE", "/tmp/coverage-out"],
+      ] as const) {
+        const previousValue = process.env[envName];
+        process.env[envName] = envValue;
+        try {
+          await assertHandled("omx cancel --force", label);
+        } finally {
+          if (previousValue === undefined) delete process.env[envName];
+          else process.env[envName] = previousValue;
+        }
+      }
 
       for (const [label, command] of [
         ["openssl config injection", "OPENSSL_CONF=/tmp/evil.cnf omx cancel"],
@@ -33935,49 +34313,14 @@ PY`,
         ["carriage-return suffix lookalike", "omx cancel\r"],
         ["unicode nbsp separator", "omx\u00a0cancel"],
       ] as const) {
-        const impostor = await bashTrusted(command);
+        await resetUltragoal();
+        const impostor = await bash(command);
         assert.equal(impostor.outputJson?.decision, "block", label);
+        assert.doesNotMatch(JSON.stringify(impostor.outputJson), /cancelled_exact_session/, label);
+        assert.equal(JSON.parse(await readFile(ultragoalPath, "utf8")).active, true, label);
       }
 
-      for (const [label, envName, envValue] of [
-        ["inherited bash startup file", "BASH_ENV", "/tmp/prelude.sh"],
-        ["imported omx function shadow", "BASH_FUNC_omx%%", "() { printf owned > src/pwned.ts; }"],
-        ["inherited node loader override", "NODE_OPTIONS", "--require=./payload.cjs"],
-        ["inherited openssl config", "OPENSSL_CONF", "/tmp/evil.cnf"],
-        ["inherited dynamic loader preload", "LD_PRELOAD", "/tmp/payload.so"],
-        ["inherited node coverage output", "NODE_V8_COVERAGE", "/tmp/coverage-out"],
-      ] as const) {
-        const previousValue = process.env[envName];
-        process.env[envName] = envValue;
-        const previousCa = process.env.NODE_EXTRA_CA_CERTS;
-        process.env.NODE_EXTRA_CA_CERTS = "/nonexistent/enterprise-ca.pem";
-        try {
-          const poisoned = await bashTrusted("omx cancel");
-          assert.equal(poisoned.outputJson?.decision, "block", `${label} with inherited CA`);
-        } finally {
-          if (previousValue === undefined) delete process.env[envName];
-          else process.env[envName] = previousValue;
-          if (previousCa === undefined) delete process.env.NODE_EXTRA_CA_CERTS;
-          else process.env.NODE_EXTRA_CA_CERTS = previousCa;
-        }
-      }
-
-      const shadowBinDir = join(cwd, "shadow-bin");
-      await mkdir(shadowBinDir, { recursive: true });
-      await writeFile(join(shadowBinDir, "omx"), "#!/bin/sh\ntouch src/path-shadow-owned.ts\n", "utf-8");
-      await chmod(join(shadowBinDir, "omx"), 0o755);
-      {
-        const inheritedPath = process.env.PATH;
-        process.env.PATH = `${shadowBinDir}:${trustedPackagePath}`;
-        try {
-          const shadowed = await bash("omx cancel");
-          assert.equal(shadowed.outputJson?.decision, "block", "PATH-shadowed omx executable");
-        } finally {
-          if (inheritedPath === undefined) delete process.env.PATH;
-          else process.env.PATH = inheritedPath;
-        }
-      }
-
+      await resetUltragoal();
       const stateClear = await bash("omx state clear --force --mode ultragoal --json");
       assert.equal(stateClear.outputJson?.decision, "block");
     } finally {
@@ -36371,6 +36714,152 @@ PY`,
         assert.equal(result.outputJson, null, command);
       }
     } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("trusts exact inherited non-repository PATH executables while keeping explicit resolution mutations fail-closed (#3370)", async () => {
+    if (process.platform === "win32") return;
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-conductor-inherited-path-"));
+    const hostBinDir = await mkdtemp(join(tmpdir(), "omx-native-hook-host-bin-"));
+    const emptyPrefixDir = await mkdtemp(join(tmpdir(), "omx-native-hook-empty-prefix-"));
+    const previousPath = process.env.PATH;
+    const previousPathext = process.env.PATHEXT;
+    try {
+      const bashPath = ["/opt/homebrew/bin/bash", "/usr/local/bin/bash", "/bin/bash", "/usr/bin/bash"].find((candidate) => existsSync(candidate));
+      const shPath = ["/bin/sh", "/usr/bin/sh"].find((candidate) => existsSync(candidate));
+      const perlPath = ["/opt/homebrew/bin/perl", "/usr/local/bin/perl", "/usr/bin/perl", "/bin/perl"].find((candidate) => existsSync(candidate));
+      const gitPath = ["/opt/homebrew/bin/git", "/usr/local/bin/git", "/usr/bin/git", "/bin/git"].find((candidate) => existsSync(candidate));
+      const catPath = ["/bin/cat", "/usr/bin/cat"].find((candidate) => existsSync(candidate));
+      assert.ok(bashPath, "host bash executable is required");
+      assert.ok(shPath, "host sh executable is required");
+      assert.ok(perlPath, "host perl executable is required");
+      assert.ok(gitPath, "host git executable is required");
+      assert.ok(catPath, "host cat executable is required");
+      await symlink(bashPath, join(hostBinDir, "bash"));
+      await symlink(bashPath, join(hostBinDir, "BASH"));
+      await symlink(shPath, join(hostBinDir, "ſh"));
+      await symlink(perlPath, join(hostBinDir, "perl"));
+      await symlink(gitPath, join(hostBinDir, "git"));
+      await symlink(catPath, join(hostBinDir, "cat"));
+      await symlink(bashPath, join(hostBinDir, "omx.exe"));
+      await symlink(bashPath, join(hostBinDir, "gjc.cmd"));
+
+      const stateDir = join(cwd, ".omx", "state");
+      const sessionId = "sess-conductor-inherited-path";
+      const threadId = "thread-conductor-inherited-path";
+      await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+      execFileSync("git", ["init", "-q"], { cwd });
+      await writeFile(join(stateDir, "conductor.log"), "old\n", "utf-8");
+      await writeJson(join(stateDir, "session.json"), { session_id: sessionId, native_session_id: threadId });
+      await writeJson(join(stateDir, "subagent-tracking.json"), {
+        schemaVersion: 1,
+        sessions: {
+          [sessionId]: {
+            session_id: sessionId,
+            leader_thread_id: threadId,
+            threads: { [threadId]: { thread_id: threadId, kind: "leader" } },
+          },
+        },
+      });
+      await writeSessionSkillActiveState(stateDir, sessionId, "ralph", "executing");
+      await writeJson(join(stateDir, "sessions", sessionId, "ralph-state.json"), {
+        active: true,
+        mode: "ralph",
+        current_phase: "executing",
+        session_id: sessionId,
+      });
+
+      process.env.PATH = `${hostBinDir}:/usr/bin:/bin`;
+      const dispatch = (command: string) => dispatchCodexNativeHook(
+        {
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: threadId,
+          agent_id: threadId,
+          tool_name: "Bash",
+          tool_input: { command },
+        },
+        { cwd },
+      );
+      const hardenedGitStatus = "GIT_ATTR_NOSYSTEM=1 GIT_CONFIG_COUNT=0 GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_SYSTEM=/dev/null GIT_EDITOR= GIT_EXTERNAL_DIFF= GIT_PAGER= GIT_SEQUENCE_EDITOR= PAGER= git --no-pager --no-optional-locks -c core.fsmonitor=false -c core.untrackedCache=false -c pager.status=false status --short --branch --untracked-files=normal --ignore-submodules=all --no-renames";
+
+      for (const command of [
+        "bash --noprofile --norc -lc \"printf safe\"",
+        "perl -pi -e 's/old/new/' .omx/state/conductor.log",
+        hardenedGitStatus,
+        `PATH=${JSON.stringify(`${emptyPrefixDir}:${process.env.PATH}`)} cat .omx/state/conductor.log`,
+      ]) {
+        assert.equal((await dispatch(command)).outputJson, null, command);
+      }
+
+      const inheritedPath = process.env.PATH;
+      const metadataPerl = "perl -pi -e 's/old/new/' .omx/state/conductor.log";
+      const metadataCat = "cat .omx/state/conductor.log";
+      const inversePathCat = `ALT=${JSON.stringify(inheritedPath)}; declare -n PATH=ALT; ${metadataCat}`;
+      const lateInversePathCat = `declare -n PATH=ALT; ALT=${JSON.stringify(inheritedPath)}; ${metadataCat}`;
+      const functionInversePathCat = `f() { local ALT=${JSON.stringify(inheritedPath)}; local -n PATH=ALT; ${metadataCat}; }; f`;
+      const inversePathextCat = `ALT=.EVIL; declare -n PATHEXT=ALT; ${metadataCat}`;
+      for (const command of [
+        `PATH=${JSON.stringify(hostBinDir)} bash --noprofile --norc -lc \"printf safe\"`,
+        `PATH=${JSON.stringify(inheritedPath)} bash --noprofile --norc -lc \"printf safe\"`,
+        `PATH=${JSON.stringify(inheritedPath)}; bash --noprofile --norc -lc \"printf safe\"`,
+        `export PATH=${JSON.stringify(inheritedPath)}; bash --noprofile --norc -lc \"printf safe\"`,
+        `printf -v PATH '%s' ${JSON.stringify(inheritedPath)}; bash --noprofile --norc -lc \"printf safe\"`,
+        "PATHEXT=.EVIL bash --noprofile --norc -lc \"printf safe\"",
+        "BASH --noprofile --norc -lc \"printf safe\"",
+        "ſh -c \"printf safe\"",
+        "omx.exe --help",
+        "gjc.cmd --help",
+        `PATH=${JSON.stringify(`${cwd}/missing:${inheritedPath}`)} cat .omx/state/conductor.log`,
+        `f() { PATH=${JSON.stringify(inheritedPath)}; }; f; ${metadataPerl}`,
+        `f() { export PATH; }; f; ${metadataPerl}`,
+        `f() { local PATH=${JSON.stringify(inheritedPath)}; ${metadataPerl}; }; f`,
+        `f() { declare PATH=${JSON.stringify(inheritedPath)}; ${metadataPerl}; }; f`,
+        `f() { local PATHEXT=.EVIL; ${metadataPerl}; }; f`,
+        `f() { local PATH=${JSON.stringify(inheritedPath)}; printf -v PATH '%s' ${JSON.stringify(inheritedPath)}; ${metadataPerl}; }; f`,
+        `f() { local PATH=${JSON.stringify(inheritedPath)}; local -n path_ref=PATH; printf -v path_ref '%s' ${JSON.stringify(inheritedPath)}; ${metadataPerl}; }; f`,
+        `bash --noprofile --norc -lc ${JSON.stringify(inversePathCat)}`,
+        `env bash --noprofile --norc -lc ${JSON.stringify(inversePathCat)}`,
+        `exec bash --noprofile --norc -lc ${JSON.stringify(inversePathCat)}`,
+        `bash --noprofile --norc -lc ${JSON.stringify(lateInversePathCat)}`,
+        `bash --noprofile --norc -lc ${JSON.stringify(functionInversePathCat)}`,
+        `bash --noprofile --norc -lc ${JSON.stringify(inversePathextCat)}`,
+        `ALT=${JSON.stringify(inheritedPath)}; declare -n PATH=ALT; ${metadataCat}`,
+        `declare -n PATH=ALT; ALT=${JSON.stringify(inheritedPath)}; ${metadataCat}`,
+        `f() { local ALT=${JSON.stringify(inheritedPath)}; local -n PATH=ALT; ${metadataCat}; }; f`,
+        `declare -n PATHEXT=ALT; ALT=.EVIL; ${metadataCat}`,
+        `f() { local ALT=.EVIL; local -n PATHEXT=ALT; ${metadataCat}; }; f`,
+        `ALT=${JSON.stringify(inheritedPath)}; declare -n PATH=ALT; ${metadataPerl}`,
+        `declare -n PATH=ALT; ALT=${JSON.stringify(inheritedPath)}; ${metadataPerl}`,
+        `declare -n PATHEXT=ALT; ALT=.EVIL; ${metadataPerl}`,
+        `f() { local ALT=${JSON.stringify(inheritedPath)}; local -n PATH=ALT; ${metadataPerl}; }; f`,
+        `f() { local -n PATH=ALT; local ALT=${JSON.stringify(inheritedPath)}; ${metadataPerl}; }; f`,
+        `f() { local -n PATHEXT=ALT; local ALT=.EVIL; ${metadataPerl}; }; f`,
+        `f() { local -n ALT=PATH; ${metadataPerl}; }; f`,
+        `f() { local ALT=.EVIL; local -n PATHEXT=ALT; ${metadataPerl}; }; f`,
+        `f() { local -n ALT=PATHEXT; ${metadataPerl}; }; f`,
+        `f() { ${metadataPerl}; }; PATH=${JSON.stringify(inheritedPath)} f`,
+        `f() { ${metadataPerl}; }; PATHEXT=.EVIL f`,
+      ]) {
+        const result = await dispatch(command);
+        assert.equal(result.outputJson?.decision, "block", command);
+      }
+
+      const repoBinDir = join(cwd, "repo-bin");
+      await mkdir(repoBinDir, { recursive: true });
+      await symlink(bashPath, join(repoBinDir, "bash"));
+      process.env.PATH = `${repoBinDir}:${inheritedPath}`;
+      const repositoryPathCandidate = await dispatch("bash --noprofile --norc -lc \"printf safe\"");
+      assert.equal(repositoryPathCandidate.outputJson?.decision, "block");
+    } finally {
+      if (previousPath === undefined) delete process.env.PATH;
+      else process.env.PATH = previousPath;
+      if (previousPathext === undefined) delete process.env.PATHEXT;
+      else process.env.PATHEXT = previousPathext;
+      await rm(emptyPrefixDir, { recursive: true, force: true });
+      await rm(hostBinDir, { recursive: true, force: true });
       await rm(cwd, { recursive: true, force: true });
     }
   });
