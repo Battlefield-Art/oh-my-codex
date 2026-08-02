@@ -30029,6 +30029,11 @@ PY`,
           },
         },
       });
+      const ralphStatePath = join(stateDir, "sessions", "sess-dead", "ralph-state.json");
+      const skillStatePath = join(stateDir, "skill-active-state.json");
+      const ralphStateBefore = await readFile(ralphStatePath, "utf-8");
+      const skillStateBefore = await readFile(skillStatePath, "utf-8");
+
       const nativeStopStateBefore = await readFile(nativeStopStatePath, "utf-8");
       const payload = {
         hook_event_name: "Stop" as const,
@@ -30047,11 +30052,12 @@ PY`,
       );
 
       assert.equal(first.omxEventName, "stop");
-      assert.equal(first.outputJson?.decision, "block");
-      assert.equal(first.outputJson?.stopReason, "session_pointer_unusable");
+      assert.equal(first.outputJson, null);
       assert.equal(replay.omxEventName, "stop");
       assert.equal(replay.outputJson, null);
       assert.equal(await readFile(nativeStopStatePath, "utf-8"), nativeStopStateBefore);
+      assert.equal(await readFile(ralphStatePath, "utf-8"), ralphStateBefore);
+      assert.equal(await readFile(skillStatePath, "utf-8"), skillStateBefore);
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }

@@ -23225,10 +23225,11 @@ export async function dispatchCodexNativeHook(
       const stopHookActive = payload.stop_hook_active === true || payload.stopHookActive === true;
       const pointerCannotAuthorizeThisCwd = pointer.status === "foreign-cwd";
       const unmatchedStopSession = failure.stopReason === "session_scope_unmatched";
-      // An unmatched payload or foreign-cwd pointer cannot authorize continuation.
-      // Return no output so Codex cannot reinterpret an authorization diagnostic as
-      // a new action request. Other unusable pointers retain their bounded replay behavior.
-      if (pointerCannotAuthorizeThisCwd || unmatchedStopSession || stopHookActive) {
+      // An unmatched payload, foreign-cwd pointer, or identity-indeterminate pointer
+      // cannot authorize continuation. Return no output so Codex cannot reinterpret an
+      // authorization diagnostic as a new action request. Other unusable pointers retain
+      // their bounded replay behavior.
+      if (pointerCannotAuthorizeThisCwd || pointer.status === "identity-indeterminate" || unmatchedStopSession || stopHookActive) {
         outputJson = null;
       } else {
         outputJson = {
