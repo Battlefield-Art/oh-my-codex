@@ -113,10 +113,9 @@ export {
 import {
   SKILL_ACTIVE_STATE_MODE,
   extractSessionIdFromInitializedStatePath,
-  getSkillActiveStatePathsForStateDir,
   listActiveSkills,
-  readSkillActiveState,
   syncCanonicalSkillStateForMode,
+  updateRootSkillActiveStateForStateDir,
   type SkillActiveStateLike,
 } from "../state/skill-active.js";
 import { isTrackedWorkflowMode } from "../state/workflow-transition.js";
@@ -5348,6 +5347,10 @@ interface PostLaunchModeCleanupDependencies {
   readFile?: typeof import("fs/promises").readFile;
   writeFile?: typeof import("fs/promises").writeFile;
   sleep?: (ms: number) => Promise<void>;
+  writeRootState?: (
+    stateDir: string,
+    update: (currentRoot: SkillActiveStateLike | null) => SkillActiveStateLike | null,
+  ) => Promise<void>;
   writeWarn?: (line: string) => void;
   now?: () => Date;
 }
@@ -5462,42 +5465,42 @@ async function scrubPostLaunchRootSkillActiveForSession(
   stateDir: string,
   sessionId: string,
   nowIso: string,
-  writeFileFn: typeof import("fs/promises").writeFile,
-  rootStateBeforeCleanup?: SkillActiveStateLike | null,
+  writeRootStateFn: (
+    stateDir: string,
+    update: (currentRoot: SkillActiveStateLike | null) => SkillActiveStateLike | null,
+  ) => Promise<void>,
 ): Promise<void> {
   const normalizedSessionId = cleanPostLaunchString(sessionId);
   if (!normalizedSessionId) return;
 
-  const { rootPath } = getSkillActiveStatePathsForStateDir(stateDir);
-  const rootState = rootStateBeforeCleanup ?? await readSkillActiveState(rootPath);
-  if (!rootState) return;
+  await writeRootStateFn(stateDir, (rootState) => {
+    if (!rootState) return null;
+    const rootSessionIds = postLaunchUniqueStrings([
+      cleanPostLaunchString(rootState.session_id),
+      cleanPostLaunchString(extractSessionIdFromInitializedStatePath(rootState.initialized_state_path)),
+    ]);
+    const rootBelongsToSession = rootSessionIds.includes(normalizedSessionId);
+    const entries = listActiveSkills(rootState);
+    const keptEntries = entries.filter((entry) => {
+      const entrySessionId = cleanPostLaunchString(entry.session_id);
+      if (entrySessionId) return entrySessionId !== normalizedSessionId;
+      return !rootBelongsToSession;
+    });
 
-  const rootSessionIds = postLaunchUniqueStrings([
-    cleanPostLaunchString(rootState.session_id),
-    cleanPostLaunchString(extractSessionIdFromInitializedStatePath(rootState.initialized_state_path)),
-  ]);
-  const rootBelongsToSession = rootSessionIds.includes(normalizedSessionId);
-  const entries = listActiveSkills(rootState);
-  const keptEntries = entries.filter((entry) => {
-    const entrySessionId = cleanPostLaunchString(entry.session_id);
-    if (entrySessionId) return entrySessionId !== normalizedSessionId;
-    return !rootBelongsToSession;
+    if (keptEntries.length === entries.length && rootState.active !== true) return null;
+    if (keptEntries.length === entries.length && !rootBelongsToSession) return null;
+
+    return {
+      ...rootState,
+      active: keptEntries.length > 0,
+      skill: keptEntries[0]?.skill ?? (keptEntries.length > 0 ? cleanPostLaunchString(rootState.skill) : ""),
+      phase: keptEntries[0]?.phase ?? (keptEntries.length > 0 ? cleanPostLaunchString(rootState.phase) : "complete"),
+      updated_at: nowIso,
+      active_skills: keptEntries,
+      post_launch_reconciled_at: nowIso,
+      post_launch_reconciliation_reason: "terminal_session_cleanup",
+    };
   });
-
-  if (keptEntries.length === entries.length && rootState.active !== true) return;
-  if (keptEntries.length === entries.length && !rootBelongsToSession) return;
-
-  const nextRoot = {
-    ...rootState,
-    active: keptEntries.length > 0,
-    skill: keptEntries[0]?.skill ?? (keptEntries.length > 0 ? cleanPostLaunchString(rootState.skill) : ""),
-    phase: keptEntries[0]?.phase ?? (keptEntries.length > 0 ? cleanPostLaunchString(rootState.phase) : "complete"),
-    updated_at: nowIso,
-    active_skills: keptEntries,
-    post_launch_reconciled_at: nowIso,
-    post_launch_reconciliation_reason: "terminal_session_cleanup",
-  };
-  await writeFileFn(rootPath, JSON.stringify(nextRoot, null, 2));
 }
 
 function buildRecoveredPostLaunchModeState(
@@ -5561,9 +5564,16 @@ export async function cleanupPostLaunchModeStateFiles(
     ? [getStateDir(cwd, sessionId)]
     : [getBaseStateDir(cwd)];
   const rootStateDir = getBaseStateDir(cwd);
-  const rootSkillActiveStateBeforeCleanup = sessionId
-    ? await readSkillActiveState(getSkillActiveStatePathsForStateDir(rootStateDir).rootPath)
-    : null;
+  const writeRootState = dependencies.writeRootState ?? ((stateDir: string, update: (currentRoot: SkillActiveStateLike | null) => SkillActiveStateLike | null) => (
+    updateRootSkillActiveStateForStateDir(stateDir, update)
+  ));
+  const writeModeState = async (stateDir: string, mode: string, path: string, state: Record<string, unknown>): Promise<void> => {
+    if (stateDir === rootStateDir && mode === SKILL_ACTIVE_STATE_MODE) {
+      await writeRootState(stateDir, () => state);
+      return;
+    }
+    await writeFile(path, JSON.stringify(state, null, 2));
+  };
   let preserveSkillActiveForReviewPendingAutopilot = false;
 
   for (const stateDir of scopedDirs) {
@@ -5585,16 +5595,10 @@ export async function cleanupPostLaunchModeStateFiles(
         if (result.kind === "recoverable") {
           try {
             const completedAt = now().toISOString();
-            await writeFile(
-              path,
-              JSON.stringify(
-                mode === SKILL_ACTIVE_STATE_MODE
-                  ? buildRecoveredPostLaunchSkillActiveState(completedAt)
-                  : buildRecoveredPostLaunchModeState(mode, completedAt),
-                null,
-                2,
-              ),
-            );
+            const recoveredState = mode === SKILL_ACTIVE_STATE_MODE
+              ? buildRecoveredPostLaunchSkillActiveState(completedAt)
+              : buildRecoveredPostLaunchModeState(mode, completedAt);
+            await writeModeState(stateDir, mode, path, recoveredState);
             if (isTrackedWorkflowMode(mode)) {
               await syncCanonicalSkillStateForMode({
                 cwd,
@@ -5629,12 +5633,12 @@ export async function cleanupPostLaunchModeStateFiles(
           : normalizeTerminalWorkflowState(result.state, { mode, nowIso: completedAt });
         if (normalized.changed) {
           result.state = normalized.state;
-          await writeFile(path, JSON.stringify(result.state, null, 2));
+          await writeModeState(stateDir, mode, path, result.state);
         }
         if (mode === "ralph") {
           const completedAt = now().toISOString();
           if (markRalphCompletionAuditBlockedForPostLaunch(result.state, cwd, completedAt)) {
-            await writeFile(path, JSON.stringify(result.state, null, 2));
+            await writeModeState(stateDir, mode, path, result.state);
             await syncCanonicalSkillStateForMode({
               cwd,
               baseStateDir: rootStateDir,
@@ -5663,7 +5667,7 @@ export async function cleanupPostLaunchModeStateFiles(
           result.state.phase = "complete";
           result.state.updated_at = completedAt;
           result.state.active_skills = [];
-          await writeFile(path, JSON.stringify(result.state, null, 2));
+          await writeModeState(stateDir, mode, path, result.state);
           continue;
         }
         result.state.active = false;
@@ -5674,7 +5678,7 @@ export async function cleanupPostLaunchModeStateFiles(
           result.state.interrupted_at = completedAt;
           result.state.stop_reason = cleanPostLaunchString(result.state.stop_reason) || "session_exit";
         }
-        await writeFile(path, JSON.stringify(result.state, null, 2));
+        await writeModeState(stateDir, mode, path, result.state);
         if (isTrackedWorkflowMode(mode)) {
           await syncCanonicalSkillStateForMode({
             cwd,
@@ -5702,8 +5706,7 @@ export async function cleanupPostLaunchModeStateFiles(
           rootStateDir,
           sessionId,
           now().toISOString(),
-          writeFile,
-          rootSkillActiveStateBeforeCleanup,
+          writeRootState,
         );
       }
     } catch (err) {

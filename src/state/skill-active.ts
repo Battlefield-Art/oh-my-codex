@@ -1,6 +1,7 @@
+import { randomBytes } from 'crypto';
 import { existsSync } from 'fs';
-import { mkdir, readFile, readdir, unlink, writeFile } from 'fs/promises';
-import { dirname, join } from 'path';
+import { mkdir, readFile, readdir, rename, rm, rmdir, stat, unlink, writeFile } from 'fs/promises';
+import { basename, dirname, join } from 'path';
 import { getBaseStateDir, type BeforeWritableCommit } from '../mcp/state-paths.js';
 import { isTerminalRunOutcome, normalizeRunOutcome, normalizeTerminalLifecycleOutcome } from '../runtime/run-outcome.js';
 import {
@@ -12,6 +13,20 @@ import { readNeutralizedRoutingOverlay } from '../ralplan/documented-leader-pref
 
 export const SKILL_ACTIVE_STATE_MODE = 'skill-active';
 export const SKILL_ACTIVE_STATE_FILE = `${SKILL_ACTIVE_STATE_MODE}-state.json`;
+
+const ROOT_SKILL_ACTIVE_LOCK_TIMEOUT_MS = 2_000;
+const ROOT_SKILL_ACTIVE_LOCK_RETRY_MS = 10;
+const ROOT_SKILL_ACTIVE_LOCK_STALE_MS = 10_000;
+
+export class SkillActiveStateWriteError extends Error {
+  readonly code: 'lock-timeout' | 'lock-lost' | 'malformed-root' | 'atomic-replace-failed';
+
+  constructor(code: SkillActiveStateWriteError['code'], message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = 'SkillActiveStateWriteError';
+    this.code = code;
+  }
+}
 
 export const CANONICAL_WORKFLOW_SKILLS = [
   'autopilot',
@@ -326,6 +341,320 @@ export async function readSkillActiveState(path: string): Promise<SkillActiveSta
   }
 }
 
+async function readRootStateForWrite(rootPath: string): Promise<SkillActiveStateLike | null> {
+  let raw: string;
+  try {
+    raw = await readFile(rootPath, 'utf-8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') return null;
+    throw new SkillActiveStateWriteError('malformed-root', `unreadable root skill-active state: ${rootPath}`, { cause: error });
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (error) {
+    throw new SkillActiveStateWriteError('malformed-root', `malformed root skill-active state: ${rootPath}`, { cause: error });
+  }
+  if (!parsed || typeof parsed !== 'object') {
+    throw new SkillActiveStateWriteError('malformed-root', `malformed root skill-active state: ${rootPath}`);
+  }
+  return normalizeSkillActiveState(parsed) ?? parsed as SkillActiveStateLike;
+}
+
+interface RootSkillActiveLock {
+  path: string;
+  token: string;
+}
+
+function lockOwnerPath(lockPath: string, token?: string): string {
+  return join(lockPath, token ? `owner-${token}` : 'owner');
+}
+
+
+type LockOwnerMetadata =
+  | { kind: 'valid'; token: string }
+  | { kind: 'ownerless' }
+  | { kind: 'ambiguous' };
+
+async function inspectLockOwner(lockPath: string): Promise<LockOwnerMetadata> {
+  try {
+    const entries = await readdir(lockPath);
+    const ownerEntries = entries.filter((entry) => entry === 'owner' || entry.startsWith('owner-'));
+    const knownOwnerlessEntries = entries.filter((entry) => entry.startsWith('pending-') || entry.startsWith('released-'));
+    if (ownerEntries.length === 0) {
+      if (entries.length === 0) return { kind: 'ownerless' };
+      if (entries.length === 1 && knownOwnerlessEntries.length === 1) {
+        const entry = knownOwnerlessEntries[0];
+        const expectedToken = entry.slice(entry.indexOf('-') + 1);
+        const content = (await readFile(join(lockPath, entry), 'utf-8')).trim();
+        return content === expectedToken ? { kind: 'ownerless' } : { kind: 'ambiguous' };
+      }
+      return { kind: 'ambiguous' };
+    }
+    if (ownerEntries.length !== 1 || entries.length !== 1) return { kind: 'ambiguous' };
+    const ownerName = ownerEntries[0];
+    const owner = (await readFile(join(lockPath, ownerName), 'utf-8')).trim();
+    if (!owner) return { kind: 'ambiguous' };
+    if (ownerName === 'owner' || ownerName.slice('owner-'.length) === owner) {
+      return { kind: 'valid', token: owner };
+    }
+    return { kind: 'ambiguous' };
+  } catch {
+    return { kind: 'ambiguous' };
+  }
+}
+
+async function readLockOwner(lockPath: string): Promise<string | null> {
+  const metadata = await inspectLockOwner(lockPath);
+  return metadata.kind === 'valid' ? metadata.token : null;
+}
+
+async function assertRootSkillActiveLockOwner(lock: RootSkillActiveLock): Promise<void> {
+  if (await readLockOwner(lock.path) !== lock.token) {
+    throw new SkillActiveStateWriteError('lock-lost', `root skill-active lock ownership was lost: ${lock.path}`);
+  }
+}
+
+function ownerProcessIsDead(token: string): boolean {
+  const pid = Number.parseInt(token.split('-', 1)[0] ?? '', 10);
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return false;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === 'ESRCH';
+  }
+}
+
+function lockPendingPath(lockPath: string, token: string): string {
+  return join(lockPath, `pending-${token}`);
+}
+
+function lockReleasedPath(lockPath: string, token: string): string {
+  return `${lockPath}.released-${token}`;
+}
+
+async function reclaimOwnerlessStaleLock(lockPath: string): Promise<boolean> {
+  const firstStat = await stat(lockPath);
+  const firstMetadata = await inspectLockOwner(lockPath);
+  if (firstMetadata.kind !== 'ownerless') return false;
+  const firstEntries = await readdir(lockPath);
+  const pendingEntry = firstEntries.length === 1 && firstEntries[0].startsWith('pending-');
+  const markerPrefix = `${basename(lockPath)}.released-`;
+  const markerEntries = (await readdir(dirname(lockPath))).filter((entry) => entry.startsWith(markerPrefix));
+  if (markerEntries.length > 1) return false;
+  let releaseMarkerPath: string | undefined;
+  if (markerEntries.length === 1) {
+    const markerName = markerEntries[0];
+    const markerToken = markerName.slice(markerPrefix.length);
+    if ((await readFile(join(dirname(lockPath), markerName), 'utf-8')).trim() !== markerToken) return false;
+    releaseMarkerPath = join(dirname(lockPath), markerName);
+  }
+  if (!releaseMarkerPath && !pendingEntry && Date.now() - firstStat.mtimeMs <= ROOT_SKILL_ACTIVE_LOCK_STALE_MS) return false;
+
+  const confirmedStat = await stat(lockPath);
+  const confirmedMetadata = await inspectLockOwner(lockPath);
+  const confirmedEntries = await readdir(lockPath);
+  if (
+    confirmedMetadata.kind !== 'ownerless'
+    || confirmedStat.mtimeMs !== firstStat.mtimeMs
+    || confirmedStat.ctimeMs !== firstStat.ctimeMs
+    || confirmedEntries.length !== firstEntries.length
+    || confirmedEntries[0] !== firstEntries[0]
+  ) return false;
+
+  const stalePath = `${lockPath}.stale-${process.pid}-${randomBytes(6).toString('hex')}`;
+  try {
+    await rename(lockPath, stalePath);
+  } catch {
+    return false;
+  }
+
+  try {
+    if ((await inspectLockOwner(stalePath)).kind === 'ownerless') {
+      await rm(stalePath, { recursive: true, force: true });
+      if (releaseMarkerPath) await unlink(releaseMarkerPath).catch(() => undefined);
+    }
+  } catch {
+    // The path was replaced or removed; leave any successor untouched.
+  }
+  return true;
+}
+
+async function sleepForRootLock(): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, ROOT_SKILL_ACTIVE_LOCK_RETRY_MS));
+}
+
+async function acquireRootSkillActiveStateLock(rootPath: string): Promise<RootSkillActiveLock> {
+  const lockPath = `${rootPath}.lock`;
+  const token = `${process.pid}-${Date.now()}-${randomBytes(12).toString('hex')}`;
+  const deadline = Date.now() + ROOT_SKILL_ACTIVE_LOCK_TIMEOUT_MS;
+  await mkdir(dirname(rootPath), { recursive: true });
+
+  for (;;) {
+    let createdLockDirectory = false;
+    let createdLockStat: Awaited<ReturnType<typeof stat>> | undefined;
+    try {
+      await mkdir(lockPath);
+      createdLockDirectory = true;
+      createdLockStat = await stat(lockPath);
+      await writeFile(lockPendingPath(lockPath, token), token, { flag: 'wx' });
+      await rename(lockPendingPath(lockPath, token), lockOwnerPath(lockPath, token));
+      return { path: lockPath, token };
+    } catch {
+      if (createdLockDirectory) {
+        try {
+          const currentStat = await stat(lockPath);
+          if (
+            (await inspectLockOwner(lockPath)).kind === 'ownerless'
+            && (await readdir(lockPath)).length === 0
+            && createdLockStat
+            && currentStat.mtimeMs === createdLockStat.mtimeMs
+            && currentStat.ctimeMs === createdLockStat.ctimeMs
+          ) {
+            await rmdir(lockPath);
+          }
+        } catch {
+          // The path may have been atomically taken over or removed; retry without cleanup.
+        }
+        continue;
+      }
+      try {
+        const observedToken = await readLockOwner(lockPath);
+        if (!observedToken) {
+          await reclaimOwnerlessStaleLock(lockPath);
+        } else if (ownerProcessIsDead(observedToken)) {
+          const firstStat = await stat(lockPath);
+          if (Date.now() - firstStat.mtimeMs > ROOT_SKILL_ACTIVE_LOCK_STALE_MS) {
+            const confirmedToken = await readLockOwner(lockPath);
+            const confirmedStat = await stat(lockPath);
+            if (confirmedToken === observedToken && confirmedStat.mtimeMs === firstStat.mtimeMs) {
+              const stalePath = `${lockPath}.stale-${process.pid}-${randomBytes(6).toString('hex')}`;
+              try {
+                await rename(lockPath, stalePath);
+                if (await readLockOwner(stalePath) === observedToken) {
+                  await rm(stalePath, { recursive: true, force: true });
+                }
+              } catch {
+                // Another process won the stale-lock takeover race; retry.
+              }
+            }
+          }
+        }
+      } catch {
+        // The lock may have been released between observations; retry.
+      }
+      if (Date.now() >= deadline) {
+        throw new SkillActiveStateWriteError('lock-timeout', `timed out waiting for root skill-active lock: ${lockPath}`);
+      }
+      await sleepForRootLock();
+    }
+  }
+}
+
+async function releaseRootSkillActiveStateLock(lock: RootSkillActiveLock): Promise<void> {
+  if (await readLockOwner(lock.path) !== lock.token) return;
+  const releasedPath = lockReleasedPath(lock.path, lock.token);
+  try {
+    await writeFile(releasedPath, lock.token, { flag: 'wx' });
+    await unlink(lockOwnerPath(lock.path, lock.token));
+  } catch {
+    await unlink(releasedPath).catch(() => undefined);
+    return;
+  }
+
+}
+
+async function withRootSkillActiveStateLock<T>(rootPath: string, operation: (lock: RootSkillActiveLock) => Promise<T>): Promise<T> {
+  const lock = await acquireRootSkillActiveStateLock(rootPath);
+  try {
+    await assertRootSkillActiveLockOwner(lock);
+    return await operation(lock);
+  } finally {
+    await releaseRootSkillActiveStateLock(lock);
+  }
+}
+function stateWithActiveEntries(
+  base: SkillActiveStateLike | null,
+  entries: SkillActiveEntry[],
+  fallbackMode: string,
+): SkillActiveStateLike {
+  const inherited = entries.length > 0 ? clearTerminalSkillActiveMarkers({ ...(base ?? {}) }) : { ...(base ?? {}) };
+  const primarySkill = pickPrimaryWorkflowMode(safeString(inherited.skill).trim(), entries.map((entry) => entry.skill), fallbackMode);
+  const primaryEntry = entries.find((entry) => entry.skill === primarySkill) ?? entries[0];
+  return {
+    ...inherited,
+    version: 1,
+    active: entries.length > 0,
+    skill: primaryEntry?.skill || primarySkill || fallbackMode,
+    phase: primaryEntry?.phase || safeString(inherited.phase).trim(),
+    activated_at: primaryEntry?.activated_at || safeString(inherited.activated_at).trim(),
+    active_skills: entries,
+  };
+}
+
+function mergeRootStateForSession(
+  currentRoot: SkillActiveStateLike | null,
+  sessionState: SkillActiveStateLike,
+  sessionId: string,
+): SkillActiveStateLike {
+  const currentEntries = listActiveSkills(currentRoot ?? {});
+  const hasCurrentSessionEntry = currentEntries.some((entry) => safeString(entry.session_id).trim() === sessionId);
+  const incomingEntries = hasCurrentSessionEntry
+    ? listActiveSkills(sessionState).filter((entry) => safeString(entry.session_id).trim() === sessionId)
+    : [];
+  const mergedEntries = [
+    ...currentEntries.filter((entry) => safeString(entry.session_id).trim() !== sessionId),
+    ...incomingEntries,
+  ];
+  return stateWithActiveEntries(currentRoot ?? sessionState, mergedEntries, sessionState.skill || 'skill-active');
+}
+
+async function writeRootSkillActiveStateAtomically(
+  rootPath: string,
+  rootState: SkillActiveStateLike,
+  beforeCommit?: BeforeWritableCommit,
+  lock?: RootSkillActiveLock,
+): Promise<void> {
+  const tempPath = `${rootPath}.tmp-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`;
+  const payload = `${JSON.stringify({ version: 1, ...rootState }, null, 2)}\n`;
+  await beforeCommit?.({ site: 'skill-active.root-copy', kind: 'write', path: rootPath });
+  try {
+    if (lock) await assertRootSkillActiveLockOwner(lock);
+    await writeFile(tempPath, payload);
+    if (lock) await assertRootSkillActiveLockOwner(lock);
+    await rename(tempPath, rootPath);
+  } catch (error) {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+    if (error instanceof SkillActiveStateWriteError) throw error;
+    throw new SkillActiveStateWriteError('atomic-replace-failed', `failed to atomically replace root skill-active state: ${rootPath}`, { cause: error });
+  }
+}
+
+
+async function restoreRootSkillActiveStateBytesIfOwned(
+  rootPath: string,
+  previousRoot: Buffer | null,
+  lock: RootSkillActiveLock,
+): Promise<void> {
+  await assertRootSkillActiveLockOwner(lock);
+  if (previousRoot === null) {
+    await unlink(rootPath).catch((error: unknown) => {
+      if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error;
+    });
+    return;
+  }
+  const tempPath = `${rootPath}.rollback-${process.pid}-${Date.now()}-${randomBytes(4).toString('hex')}`;
+  try {
+    await writeFile(tempPath, previousRoot);
+    await assertRootSkillActiveLockOwner(lock);
+    await rename(tempPath, rootPath);
+  } finally {
+    await rm(tempPath, { force: true }).catch(() => undefined);
+  }
+}
+
 export async function writeSkillActiveStateCopies(
   cwd: string,
   state: SkillActiveStateLike,
@@ -341,10 +670,74 @@ export async function writeSkillActiveStateCopiesForStateDir(
   state: SkillActiveStateLike,
   sessionId?: string,
   rootState?: SkillActiveStateLike | null,
+  options: { beforeCommit?: BeforeWritableCommit; sessionOnlyWhenRootMissing?: boolean } = {},
+): Promise<void> {
+  const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
+  await writeSkillActiveStateCopiesToPaths(
+    rootPath,
+    sessionPath,
+    state,
+    rootState,
+    options.beforeCommit,
+    undefined,
+    options.sessionOnlyWhenRootMissing,
+  );
+}
+
+export async function updateRootSkillActiveStateForStateDir(
+  stateDir: string,
+  update: (currentRoot: SkillActiveStateLike | null) => SkillActiveStateLike | null,
+  options: { beforeCommit?: BeforeWritableCommit } = {},
+): Promise<void> {
+  const { rootPath } = getSkillActiveStatePathsForStateDir(stateDir);
+  await withRootSkillActiveStateLock(rootPath, async (lock) => {
+    const currentRoot = await readRootStateForWrite(rootPath);
+    const nextRoot = update(currentRoot);
+    if (nextRoot === null) return;
+    await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
+  });
+}
+
+export async function writeSkillActiveStateWithPrimaryTransactionForStateDir(
+  stateDir: string,
+  state: SkillActiveStateLike,
+  sessionId: string,
+  primaryPath: string,
+  primaryWrite: () => Promise<void>,
   options: { beforeCommit?: BeforeWritableCommit } = {},
 ): Promise<void> {
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(stateDir, sessionId);
-  await writeSkillActiveStateCopiesToPaths(rootPath, sessionPath, state, rootState, options.beforeCommit);
+  if (sessionPath !== primaryPath) throw new Error('skill-active primary path is not session-scoped');
+  const normalized = { version: 1, ...state };
+  const sessionPayload = `${JSON.stringify(normalized, null, 2)}\n`;
+
+  await withRootSkillActiveStateLock(rootPath, async (lock) => {
+    const currentRoot = await readRootStateForWrite(rootPath);
+    const nextRoot = mergeRootStateForSession(currentRoot, normalized, safeString(normalized.session_id).trim());
+    const previousPrimary = existsSync(primaryPath) ? await readFile(primaryPath) : null;
+    const previousRoot = existsSync(rootPath) ? await readFile(rootPath) : null;
+    let primaryCommitted = false;
+    try {
+      await primaryWrite();
+      primaryCommitted = true;
+      await writeRootSkillActiveStateAtomically(rootPath, nextRoot, options.beforeCommit, lock);
+      await options.beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
+      await assertRootSkillActiveLockOwner(lock);
+      await writeFile(sessionPath, sessionPayload);
+    } catch (error) {
+      let rollbackError: unknown;
+      if (primaryCommitted) {
+        if (previousPrimary === null) await unlink(primaryPath).catch(() => undefined);
+        else await writeFile(primaryPath, previousPrimary);
+      }
+      try {
+        await restoreRootSkillActiveStateBytesIfOwned(rootPath, previousRoot, lock);
+      } catch (ownershipOrRestoreError) {
+        rollbackError = ownershipOrRestoreError;
+      }
+      throw rollbackError ?? error;
+    }
+  });
 }
 
 async function writeSkillActiveStateCopiesToPaths(
@@ -353,23 +746,36 @@ async function writeSkillActiveStateCopiesToPaths(
   state: SkillActiveStateLike,
   rootState?: SkillActiveStateLike | null,
   beforeCommit?: BeforeWritableCommit,
+  lock?: RootSkillActiveLock,
+  sessionOnlyWhenRootMissing = false,
 ): Promise<void> {
   const normalized = { version: 1, ...state };
-  const normalizedRoot = rootState === null
-    ? null
-    : { version: 1, ...(rootState ?? normalized) };
-  if (normalizedRoot !== null) {
-    const rootPayload = JSON.stringify(normalizedRoot, null, 2);
-    await mkdir(dirname(rootPath), { recursive: true });
-    await beforeCommit?.({ site: 'skill-active.root-copy', kind: 'write', path: rootPath });
-    await writeFile(rootPath, rootPayload);
-  }
-
-  if (sessionPath) {
-    const sessionPayload = JSON.stringify(normalized, null, 2);
+  const writeSessionCopy = async (): Promise<void> => {
+    if (!sessionPath) return;
+    const sessionPayload = `${JSON.stringify(normalized, null, 2)}\n`;
     await mkdir(dirname(sessionPath), { recursive: true });
     await beforeCommit?.({ site: 'skill-active.session-copy', kind: 'write', path: sessionPath });
     await writeFile(sessionPath, sessionPayload);
+  };
+  const writeRootTransaction = async (ownedLock: RootSkillActiveLock): Promise<void> => {
+    const currentRoot = await readRootStateForWrite(rootPath);
+    if (sessionPath && sessionOnlyWhenRootMissing && currentRoot === null) {
+      await writeSessionCopy();
+      return;
+    }
+    const nextRoot = sessionPath
+      ? mergeRootStateForSession(currentRoot, normalized, safeString(normalized.session_id).trim())
+      : { version: 1, ...(rootState ?? normalized) };
+    await writeRootSkillActiveStateAtomically(rootPath, nextRoot, beforeCommit, ownedLock);
+    await writeSessionCopy();
+  };
+
+  if (rootState !== null && lock) {
+    await writeRootTransaction(lock);
+  } else if (rootState !== null) {
+    await withRootSkillActiveStateLock(rootPath, writeRootTransaction);
+  } else {
+    await writeSessionCopy();
   }
 }
 
@@ -403,6 +809,17 @@ export function tracksCanonicalWorkflowSkill(mode: string): mode is CanonicalWor
 }
 
 export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkillStateOptions): Promise<void> {
+  const baseStateDir = options.baseStateDir ?? getBaseStateDir(options.cwd);
+  const { rootPath } = getSkillActiveStatePathsForStateDir(baseStateDir);
+  await withRootSkillActiveStateLock(rootPath, async (lock) => {
+    await syncCanonicalSkillStateForModeUnlocked({ ...options, baseStateDir }, lock);
+  });
+}
+
+async function syncCanonicalSkillStateForModeUnlocked(
+  options: SyncCanonicalSkillStateOptions,
+  lock: RootSkillActiveLock,
+): Promise<void> {
   const {
     cwd,
     baseStateDir = getBaseStateDir(cwd),
@@ -421,7 +838,7 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
   if (!tracksCanonicalWorkflowSkill(mode)) return;
 
   const { rootPath, sessionPath } = getSkillActiveStatePathsForStateDir(baseStateDir, sessionId);
-  const existingRoot = await readSkillActiveState(rootPath);
+  const existingRoot = await readRootStateForWrite(rootPath);
   const existingSession = sessionPath ? await readSkillActiveState(sessionPath) : null;
   if (!existingRoot && !existingSession && !active && !options.allSessions) return;
 
@@ -519,9 +936,15 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
         mode,
         normalizedSessionId,
       );
-    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState, {
-      beforeCommit: options.beforeCommit,
-    });
+    const sessionPaths = getSkillActiveStatePathsForStateDir(baseStateDir, sessionId);
+    await writeSkillActiveStateCopiesToPaths(
+      sessionPaths.rootPath,
+      sessionPaths.sessionPath,
+      nextSessionState,
+      nextRootState,
+      options.beforeCommit,
+      lock,
+    );
     return;
   }
 
@@ -548,9 +971,14 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
     : [...sessionScopedRootMirrorEntries, ...nextRootScopedEntries];
 
   const nextRootState = applyEntriesToState(existingRoot, nextRootEntries, mode);
-  await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextRootState, undefined, nextRootState, {
-    beforeCommit: options.beforeCommit,
-  });
+  await writeSkillActiveStateCopiesToPaths(
+    rootPath,
+    undefined,
+    nextRootState,
+    nextRootState,
+    options.beforeCommit,
+    lock,
+  );
 
   const sessionsDir = join(baseStateDir, 'sessions');
   if (!existsSync(sessionsDir)) return;
@@ -584,8 +1012,13 @@ export async function syncCanonicalSkillStateForMode(options: SyncCanonicalSkill
       nextSessionEntries[0]?.skill || mode,
       sessionId,
     );
-    await writeSkillActiveStateCopiesForStateDir(baseStateDir, nextSessionState, sessionId, nextRootState, {
-      beforeCommit: options.beforeCommit,
-    });
+    await writeSkillActiveStateCopiesToPaths(
+      rootPath,
+      sessionPath,
+      nextSessionState,
+      nextRootState,
+      options.beforeCommit,
+      lock,
+    );
   }
 }
