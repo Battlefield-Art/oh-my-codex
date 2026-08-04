@@ -775,6 +775,20 @@ function requireLiveTeamOwnedPaneSync(
   return requireLiveExactPaneSync(target, expectedPanePid);
 }
 
+function frozenWindowTopologyError(
+  teamTarget: string,
+  expectedPaneIds: ReadonlySet<string>,
+  actualPaneIds: ReadonlySet<string>,
+): Error {
+  const expected = [...expectedPaneIds].sort();
+  const actual = [...actualPaneIds].sort();
+  const unexpected = actual.filter((paneId) => !expectedPaneIds.has(paneId));
+  const missing = expected.filter((paneId) => !actualPaneIds.has(paneId));
+  return new Error(
+    `tmux window topology changed before layout mutation: target=${teamTarget}; expected=[${expected.join(',')}]; actual=[${actual.join(',')}]; unexpected=[${unexpected.join(',')}]; missing=[${missing.join(',')}]. Team requires an isolated tmux window with no host-owned foreign panes`,
+  );
+}
+
 function requireFrozenWindowTopologySync(
   teamTarget: string,
   expectedPanePids: ReadonlyMap<string, number>,
@@ -786,7 +800,7 @@ function requireFrozenWindowTopologySync(
   const actualPaneIds = new Set(topology.panes.map((pane) => pane.paneId));
   if (actualPaneIds.size !== expectedPanePids.size
     || [...expectedPanePids.keys()].some((paneId) => !actualPaneIds.has(paneId))) {
-    throw new Error('tmux window topology changed before layout mutation');
+    throw frozenWindowTopologyError(teamTarget, new Set(expectedPanePids.keys()), actualPaneIds);
   }
 
   for (const [paneId, expectedPanePid] of expectedPanePids) {
@@ -815,7 +829,7 @@ function requireFrozenWindowTopologySync(
   const finalPaneIds = new Set(finalTopology.panes.map((pane) => pane.paneId));
   if (finalPaneIds.size !== expectedPanePids.size
     || [...expectedPanePids.keys()].some((paneId) => !finalPaneIds.has(paneId))) {
-    throw new Error('tmux window topology changed before layout mutation');
+    throw frozenWindowTopologyError(teamTarget, new Set(expectedPanePids.keys()), finalPaneIds);
   }
 }
 
