@@ -5660,7 +5660,17 @@ esac
 
           assert.throws(
             () => createTeamSession('Owned HUD Startup', 1, cwd),
-            /tmux window topology changed before layout mutation/,
+            (error: unknown) => {
+              assert.ok(error instanceof Error);
+              assert.match(error.message, /tmux window topology changed before layout mutation/);
+              assert.match(error.message, /target=shared:0/);
+              assert.match(error.message, /expected=\[%1,%2\]/);
+              assert.match(error.message, /actual=\[%1,%2,%7,%8\]/);
+              assert.match(error.message, /unexpected=\[%7,%8\]/);
+              assert.match(error.message, /missing=\[\]/);
+              assert.match(error.message, /isolated tmux window with no host-owned foreign panes/);
+              return true;
+            },
           );
 
           const tmuxLog = await readFile(logPath, 'utf-8');
