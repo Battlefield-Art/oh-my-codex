@@ -14,6 +14,7 @@ import {
   assertInstalledRootReasoningRejection,
   assertInstalledTeamSkillContract,
   assertPackedInstallFileMetadata,
+  assertPackedRegressionWorkflowState,
   buildNativeHookSmokePayload,
   ensureRepoDependencies,
   hasUsableNodeModules,
@@ -44,6 +45,7 @@ import {
   resolveGitCommonDir,
   resolveReusableNodeModulesSource,
   validateHookStdout,
+  shouldPackedRegressionStopBlock,
   assertCodexBatchWriteResult,
   assertGeneratedTrustMatchesCodex,
   managedCodexHooksByEvent,
@@ -1044,11 +1046,37 @@ test('packed install smoke covers directive activation and terminal false-activa
     { name: 'percent-suffix', prompt: '$ralplan%docs', expectedSkill: null, expectedStopBlock: false },
     { name: 'fullwidth-percent-suffix', prompt: '$ralplan％docs', expectedSkill: null, expectedStopBlock: false },
     { name: 'g1a-ordered-multi-skill', prompt: '$ralplan, $autopilot; $team', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: ['autopilot', 'team'], expectedActiveSkills: ['ralplan'], insideTmux: true },
-    { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: ['autopilot'] },
+    { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: [] },
     { name: 'b3-longer-valid-fence', prompt: '```text\n$autopilot build it\n````\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
     { name: 'b4-shorter-invalid-fence', prompt: '````text\n$autopilot build it\n```\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
     { name: 'b5-different-marker-invalid-fence', prompt: '```text\n$autopilot build it\n~~~\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
   ]);
+});
+
+test('packed regression workflow expectations distinguish active activation from receipt-unavailable Autopilot termination', () => {
+  assert.doesNotThrow(() => assertPackedRegressionWorkflowState(
+    { name: 'active-ralplan', expectedSkill: 'ralplan' },
+    { active: true, skill: 'ralplan' },
+  ));
+  assert.doesNotThrow(() => assertPackedRegressionWorkflowState(
+    { name: 'failed-autopilot', expectedSkill: 'autopilot' },
+    {
+      active: false,
+      skill: 'autopilot',
+      phase: 'failed',
+      error: 'documented_host_consensus_receipt_unavailable',
+      active_skills: [],
+    },
+  ));
+  assert.throws(() => assertPackedRegressionWorkflowState(
+    { name: 'stale-active-autopilot', expectedSkill: 'autopilot' },
+    { active: true, skill: 'autopilot', phase: 'running', active_skills: [{ skill: 'autopilot' }] },
+  ), /persisted unexpected workflow state/);
+});
+
+test('packed regression Stop expectations release terminal receipt-unavailable Autopilot state', () => {
+  assert.equal(shouldPackedRegressionStopBlock({ expectedSkill: 'ralplan', expectedStopBlock: true }), true);
+  assert.equal(shouldPackedRegressionStopBlock({ expectedSkill: 'autopilot', expectedStopBlock: true }), false);
 });
 
 test('packed regression environment clears inherited Team routing state', () => {

@@ -202,11 +202,33 @@ export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
   { name: 'percent-suffix', prompt: '$ralplan%docs', expectedSkill: null, expectedStopBlock: false },
   { name: 'fullwidth-percent-suffix', prompt: '$ralplan％docs', expectedSkill: null, expectedStopBlock: false },
   { name: 'g1a-ordered-multi-skill', prompt: '$ralplan, $autopilot; $team', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: ['autopilot', 'team'], expectedActiveSkills: ['ralplan'], insideTmux: true },
-  { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: ['autopilot'] },
+  { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: [] },
   { name: 'b3-longer-valid-fence', prompt: '```text\n$autopilot build it\n````\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
   { name: 'b4-shorter-invalid-fence', prompt: '````text\n$autopilot build it\n```\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
   { name: 'b5-different-marker-invalid-fence', prompt: '```text\n$autopilot build it\n~~~\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
 ] as const;
+
+export function assertPackedRegressionWorkflowState(
+  testCase: { readonly name: string; readonly expectedSkill: string },
+  skillState: { readonly active?: boolean; readonly skill?: string; readonly phase?: string; readonly error?: string; readonly active_skills?: readonly unknown[] },
+): void {
+  const matchesExpectedState = testCase.expectedSkill === 'autopilot'
+    ? skillState.active === false
+      && skillState.skill === 'autopilot'
+      && skillState.phase === 'failed'
+      && skillState.error === 'documented_host_consensus_receipt_unavailable'
+      && skillState.active_skills?.length === 0
+    : skillState.active === true && skillState.skill === testCase.expectedSkill;
+  if (!matchesExpectedState) {
+    throw new Error(`packed regression ${testCase.name} persisted unexpected workflow state`);
+  }
+}
+
+export function shouldPackedRegressionStopBlock(
+  testCase: { readonly expectedSkill: string | null; readonly expectedStopBlock: boolean },
+): boolean {
+  return testCase.expectedSkill === 'autopilot' ? false : testCase.expectedStopBlock;
+}
 
 export function buildPackedRegressionEnvironment(
   testCase: { readonly name: string; readonly insideTmux?: boolean },
@@ -4503,10 +4525,8 @@ PY`],
         if (existsSync(skillStatePath)) throw new Error(`packed regression ${testCase.name} created workflow state`);
       } else {
         if (!existsSync(skillStatePath)) throw new Error(`packed regression ${testCase.name} did not create workflow state`);
-        const skillState = JSON.parse(readFileSync(skillStatePath, 'utf-8')) as { active?: boolean; skill?: string; deferred_skills?: string[]; active_skills?: Array<{ skill?: string }> };
-        if (!skillState.active || skillState.skill !== testCase.expectedSkill) {
-          throw new Error(`packed regression ${testCase.name} persisted unexpected workflow state`);
-        }
+        const skillState = JSON.parse(readFileSync(skillStatePath, 'utf-8')) as { active?: boolean; skill?: string; phase?: string; error?: string; deferred_skills?: string[]; active_skills?: Array<{ skill?: string }> };
+        assertPackedRegressionWorkflowState(testCase, skillState);
         if ('expectedDeferredSkills' in testCase && JSON.stringify(skillState.deferred_skills ?? []) !== JSON.stringify(testCase.expectedDeferredSkills)) {
           throw new Error(`packed regression ${testCase.name} persisted unexpected deferred workflows`);
         }
@@ -4521,10 +4541,11 @@ PY`],
         input: JSON.stringify({ ...promptPayload, hook_event_name: 'Stop', turn_id: `stop-${caseIndex}` }),
       });
       const stopOutput = JSON.parse(String(stopResult.stdout || '{}')) as { decision?: string };
-      if (testCase.expectedStopBlock && stopOutput.decision !== 'block') {
+      const expectedStopBlock = shouldPackedRegressionStopBlock(testCase);
+      if (expectedStopBlock && stopOutput.decision !== 'block') {
         throw new Error(`packed regression ${testCase.name} did not block Stop`);
       }
-      if (!testCase.expectedStopBlock && stopOutput.decision === 'block') {
+      if (!expectedStopBlock && stopOutput.decision === 'block') {
         throw new Error(`packed regression ${testCase.name} blocked Stop: ${JSON.stringify(stopOutput)}`);
       }
     }
