@@ -22485,7 +22485,6 @@ PY`,
     try {
       const { sessionId, leaderThreadId } = await writeFlattenedCollaborationRalplanFixture(cwd);
       for (const [tool_name, tool_input] of [
-        ["collaborationspawn_agent", { agent_type: "planner", message: "draft the plan" }],
         ["collaborationlist_agents", {}],
         ["collaborationfollowup_task", {}],
         ["collaborationwait_agent", {}],
@@ -22520,6 +22519,66 @@ PY`,
       assert.equal(blocked.outputJson?.decision, "block");
       const reason = String(blocked.outputJson?.reason ?? "");
       assert.match(reason, /not a recognized read-only or explicitly authorized planning mutation transport|OWNER_CONFIRMATION_REQUIRED/);
+    } finally {
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
+  it("allows installed-role spawn_agent consensus delegation during active ralplan planning (#3451-B)", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "omx-native-hook-3451-ralplan-consensus-spawn-"));
+    try {
+      const { sessionId, leaderThreadId } = await writeFlattenedCollaborationRalplanFixture(cwd);
+      // Spawn with an installed role (planner) should pass through the ralplan boundary
+      for (const [tool_name, tool_input] of [
+        ["collaborationspawn_agent", { agent_type: "planner", message: "draft the plan" }],
+        ["collaboration.spawn_agent", { agent_type: "architect", message: "review the plan" }],
+        ["spawn_agent", { agent_type: "critic", message: "critique the plan" }],
+      ] as const) {
+        const result = await dispatchCodexNativeHook({
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: leaderThreadId,
+          tool_name,
+          tool_input,
+        }, { cwd });
+        assert.equal(result.outputJson, null, `${tool_name} with installed role should not be blocked during ralplan`);
+      }
+
+      const customRole = "custom-consensus-bypass";
+      const agentsDir = join(cwd, ".codex", "agents");
+      await mkdir(agentsDir, { recursive: true });
+      await writeFile(join(agentsDir, `${customRole}.toml`), "# installed custom role\n");
+      for (const [agent_type, expectedReason] of [
+        ["executor", /not a recognized read-only or explicitly authorized planning mutation transport/],
+        ["debugger", /not a recognized read-only or explicitly authorized planning mutation transport/],
+        [customRole, /not a recognized read-only or explicitly authorized planning mutation transport/],
+        ["", /not a recognized read-only or explicitly authorized planning mutation transport/],
+        ["planner!", /unknown or not installed/],
+      ] as const) {
+        const result = await dispatchCodexNativeHook({
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: leaderThreadId,
+          tool_name: "collaborationspawn_agent",
+          tool_input: agent_type ? { agent_type, message: "must not bypass consensus role boundary" } : {},
+        }, { cwd });
+        assert.equal(result.outputJson?.decision, "block", `${agent_type || "empty"} role must be denied`);
+        assert.match(String(result.outputJson?.reason ?? ""), expectedReason, `${agent_type || "empty"} role deny reason`);
+      }
+      // Dotted and flattened non-spawn collaboration transports remain blocked.
+      for (const tool_name of ["collaborationlist_agents", "collaboration.list_agents"]) {
+        const blockedList = await dispatchCodexNativeHook({
+          hook_event_name: "PreToolUse",
+          cwd,
+          session_id: sessionId,
+          thread_id: leaderThreadId,
+          tool_name,
+          tool_input: {},
+        }, { cwd });
+        assert.equal(blockedList.outputJson?.decision, "block", `${tool_name} must remain blocked`);
+      }
     } finally {
       await rm(cwd, { recursive: true, force: true });
     }
