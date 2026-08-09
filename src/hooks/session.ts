@@ -2545,11 +2545,26 @@ function isAuthorizedBoundPointer(
   state: SessionState | undefined,
 ): boolean {
   const lease = bindingLeases.get(binding);
-  if (!lease || (binding.directoryIdentity.kind === 'supported' && lease.closed) || !state) return false;
-  if (!isValidToken(binding.launchLineageToken) || !isValidToken(state.launch_lineage_token)) return false;
-  if (candidateSessionId !== binding.canonicalSessionId) return false;
-  if (state.launch_lineage_token !== binding.launchLineageToken) return false;
-  if (state.started_at !== binding.startedAt) return false;
+  if (!lease || (binding.directoryIdentity.kind === 'supported' && lease.closed) || !state) {
+    traceSessionFinalizationOperation('bound-auth-fail:lease-or-state');
+    return false;
+  }
+  if (!isValidToken(binding.launchLineageToken) || !isValidToken(state.launch_lineage_token)) {
+    traceSessionFinalizationOperation('bound-auth-fail:token-shape');
+    return false;
+  }
+  if (candidateSessionId !== binding.canonicalSessionId) {
+    traceSessionFinalizationOperation('bound-auth-fail:candidate-session');
+    return false;
+  }
+  if (state.launch_lineage_token !== binding.launchLineageToken) {
+    traceSessionFinalizationOperation('bound-auth-fail:lineage-token');
+    return false;
+  }
+  if (state.started_at !== binding.startedAt) {
+    traceSessionFinalizationOperation('bound-auth-fail:started-at');
+    return false;
+  }
   const directCanonicalIdentity = state.session_id === binding.canonicalSessionId
     && ((state.owner_omx_session_id ?? undefined) === binding.ownerOmxSessionId
       || (binding.ownerOmxSessionId === undefined && state.owner_omx_session_id === binding.canonicalSessionId))
@@ -2557,12 +2572,20 @@ function isAuthorizedBoundPointer(
   const replacedNativeIdentity = state.owner_omx_session_id === binding.canonicalSessionId
     && normalizeSessionId(state.session_id) !== undefined
     && state.native_session_id === state.session_id;
-  if (!directCanonicalIdentity && !replacedNativeIdentity) return false;
-  return context.rootSource === binding.context.rootSource
-    && context.baseStateDir === binding.context.baseStateDir
-    && context.sessionPath === binding.context.sessionPath
-    && context.cwd === binding.context.cwd
-    && state.cwd === binding.context.cwd;
+  if (!directCanonicalIdentity && !replacedNativeIdentity) {
+    traceSessionFinalizationOperation('bound-auth-fail:session-identity');
+    return false;
+  }
+  if (context.rootSource !== binding.context.rootSource) traceSessionFinalizationOperation('bound-auth-fail:root-source');
+  else if (context.baseStateDir !== binding.context.baseStateDir) traceSessionFinalizationOperation('bound-auth-fail:base-state-dir');
+  else if (context.sessionPath !== binding.context.sessionPath) traceSessionFinalizationOperation('bound-auth-fail:session-path');
+  else if (context.cwd !== binding.context.cwd) traceSessionFinalizationOperation('bound-auth-fail:context-cwd');
+  else if (state.cwd !== binding.context.cwd) traceSessionFinalizationOperation('bound-auth-fail:state-cwd');
+  else {
+    traceSessionFinalizationOperation('bound-auth-success');
+    return true;
+  }
+  return false;
 }
 
 function isAuthorizedBoundStaleDeadPointer(
