@@ -11,6 +11,7 @@ import {
   buildDetachedSessionBootstrapSteps,
   DETACHED_LEADER_READY_TIMEOUT_MS,
   cleanupDetachedPreReportSession,
+  cleanupDetachedHudPane,
   decodeDetachedLeaderPayload,
   describeDetachedLeaderFailure,
   publishDetachedReleaseMarker,
@@ -300,6 +301,42 @@ describe('detached leader HUD teardown', () => {
       await poll('pre-report session destruction', () => !fixture.sessionExists(sessionName) ? true : undefined);
     });
   });
+  it('removes the proven HUD so the last leader pane closes the session without touching unrelated panes', async (t) => {
+    if (!skipUnlessTmux(t)) return;
+    await withTempTmuxSession(async (fixture) => {
+      const [leaderPaneId, leaderPidRaw] = fixture.run([
+        'display-message', '-p', '-t', fixture.sessionName, '#{pane_id}\t#{pane_pid}',
+      ]).split('\t');
+      const [paneId, panePidRaw, sessionId, windowId] = fixture.run([
+        'split-window', '-d', '-P', '-F', '#{pane_id}\t#{pane_pid}\t#{session_id}\t#{window_id}',
+        '-t', fixture.sessionName, 'sleep 120',
+      ]).split('\t');
+      if (!leaderPaneId || !paneId || !sessionId || !windowId) throw new Error('invalid HUD teardown fixture');
+      cleanupDetachedHudPane({ paneId, panePid: Number(panePidRaw), sessionId, windowId, operationMarker: randomUUID() });
+      await poll('proven HUD pane removal', () => !fixture.run(['list-panes', '-a', '-F', '#{pane_id}']).split('\n').includes(paneId) ? true : undefined);
+      process.kill(Number(leaderPidRaw), 'SIGTERM');
+      await poll('last-pane session destruction', () => !fixture.sessionExists() ? true : undefined);
+    });
+
+    await withTempTmuxSession(async (fixture) => {
+      const [, leaderPidRaw] = fixture.run([
+        'display-message', '-p', '-t', fixture.sessionName, '#{pane_id}\t#{pane_pid}',
+      ]).split('\t');
+      const [paneId, panePidRaw, sessionId, windowId] = fixture.run([
+        'split-window', '-d', '-P', '-F', '#{pane_id}\t#{pane_pid}\t#{session_id}\t#{window_id}',
+        '-t', fixture.sessionName, 'sleep 120',
+      ]).split('\t');
+      const userPaneId = fixture.run([
+        'split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.sessionName, 'sleep 120',
+      ]);
+      if (!paneId || !sessionId || !windowId) throw new Error('invalid unrelated-pane fixture');
+      cleanupDetachedHudPane({ paneId, panePid: Number(panePidRaw), sessionId, windowId, operationMarker: randomUUID() });
+      process.kill(Number(leaderPidRaw), 'SIGTERM');
+      await poll('unrelated pane survives leader exit', () => fixture.sessionExists() ? true : undefined);
+      assert.equal(fixture.run(['display-message', '-p', '-t', userPaneId, '#{pane_id}']), userPaneId);
+    });
+  });
+
   it('tears down the proven HUD pane and session after a zero-status child exit', async (t) => {
     if (!skipUnlessTmux(t)) return;
     const wd = mkdtempSync(join(tmpdir(), 'omx-detached-leader-zero-'));

@@ -1607,6 +1607,21 @@ function runDetachedHudMutation(
   if (output !== receipt) throw new Error("detached leader or HUD authority changed before tmux mutation");
 }
 
+export function cleanupDetachedHudPane(authority: DetachedHudAuthority): void {
+  execTmuxFileSync([
+    "if-shell", "-F", "-t", authority.paneId, detachedHudAuthorityCondition(authority, false),
+    `kill-pane -t ${quoteShellArg(authority.paneId)}`, "",
+  ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+  for (let attempt = 0; attempt < 50; attempt += 1) {
+    const panes = execTmuxFileSync(["list-panes", "-a", "-F", "#{pane_id}"], {
+      encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
+    }).split("\n").map((value) => value.trim()).filter(Boolean);
+    if (!panes.includes(authority.paneId)) return;
+    blockMs(20);
+  }
+  throw new Error("detached HUD topology changed before teardown");
+}
+
 function buildDeferredDetachedHudGuard(
   leaderAuthority: DetachedLeaderAuthority,
   hudAuthority: DetachedHudAuthority,
@@ -6874,7 +6889,7 @@ function parseDetachedHudAuthorityProof(value: unknown): DetachedHudAuthority | 
   return { paneId: proof.paneId, panePid: proof.panePid, sessionId: proof.sessionId, windowId: proof.windowId, operationMarker: proof.operationMarker };
 }
 
-function teardownDetachedOwnedHudPane(leaderPaneId: string, payload: DetachedLeaderPayload, hudProof: DetachedHudAuthority | undefined): void {
+function teardownDetachedOwnedHudPane(hudProof: DetachedHudAuthority | undefined): void {
   // #3266: on a normal child exit, kill exactly the bootstrap-proven OMX HUD pane so
   // the leader pane becomes the last live pane and the owned session closes naturally,
   // returning the attached client to its shell. Fail-closed: any doubt means zero mutations.
@@ -6884,8 +6899,7 @@ function teardownDetachedOwnedHudPane(leaderPaneId: string, payload: DetachedLea
   // panes remain.
   if (!hudProof) return;
   try {
-    const leaderAuthority = captureDetachedLeaderAuthority(leaderPaneId, payload.sessionName, payload.sessionId);
-    runDetachedHudMutation(leaderAuthority, hudProof, ["kill-pane", "-t", hudProof.paneId], false);
+    cleanupDetachedHudPane(hudProof);
   } catch (error) {
     logCliOperationFailure(error);
   }
@@ -7045,7 +7059,7 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       if (bytes === ownedRecord.bytes && digest === ownedRecord.digest) rmSync(activeRecordPath, { force: true });
     }
     if (!externalInterrupt && outcome.signal === null) {
-      teardownDetachedOwnedHudPane(pane, payload, detachedHudProof);
+      teardownDetachedOwnedHudPane(detachedHudProof);
     }
   } catch (error) {
     let failure: unknown = error;
