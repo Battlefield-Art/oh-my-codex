@@ -6009,7 +6009,7 @@ export type DegradedSetupOperation =
   | "derived-watcher"
   | "notification"
   | "native-lifecycle-event";
-export type MandatorySetupOperation = "overlay" | "session-instructions" | "session-metrics" | "detached-metadata";
+export type MandatorySetupOperation = "overlay" | "session-instructions" | "session-metrics";
 export type CompletionResult =
   | { kind: "success"; establishmentCleanup?: EstablishmentCleanupEvidence }
   | { kind: "degraded-success"; operations: readonly DegradedSetupOperation[]; establishmentCleanup?: EstablishmentCleanupEvidence }
@@ -6056,7 +6056,6 @@ async function completePreLaunchSetup(
   codexHomeOverride: string | undefined,
   enableNotifyFallbackAuthority: boolean,
   worktreeDirty: boolean,
-  commitDetachedMetadata?: () => Promise<void>,
 ): Promise<CompletionResult> {
   const degraded: DegradedSetupOperation[] = [];
   try {
@@ -6090,10 +6089,6 @@ async function completePreLaunchSetup(
     tagCurrentTmuxSessionWithInstance(sessionId);
   } catch (error) {
     return { kind: "failure", operation: "session-metrics", error };
-  }
-  if (commitDetachedMetadata) {
-    try { await commitDetachedMetadata(); }
-    catch (error) { return { kind: "failure", operation: "detached-metadata", error }; }
   }
 
   try { await startNotifyFallbackWatcher(cwd, { codexHomeOverride, enableAuthority: enableNotifyFallbackAuthority, sessionId }); }
@@ -6905,6 +6900,11 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
   let externalInterrupt: NodeJS.Signals | undefined;
 
   try {
+    const metadata = await updateDetachedSessionMetadata(binding, {
+      tmuxSessionName: payload.sessionName,
+      tmuxPaneId: pane,
+    });
+    if (metadata.kind !== "committed-released") throw new Error("detached leader metadata update denied");
     const completion = await completePreLaunchSetup(
       payload.cwd,
       payload.sessionId,
@@ -6912,13 +6912,6 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       payload.codexHomeOverride,
       payload.preLaunchOptions.enableNotifyFallbackAuthority,
       payload.preLaunchOptions.worktreeDirty,
-      async () => {
-        const metadata = await updateDetachedSessionMetadata(binding, {
-          tmuxSessionName: payload.sessionName,
-          tmuxPaneId: pane,
-        });
-        if (metadata.kind !== "committed-released") throw new Error("detached leader metadata update denied");
-      },
     );
     if (completion.kind === "failure") {
       const finalization = await finalizeBoundOnce(binding, "setup-failure", payload.cwd);
