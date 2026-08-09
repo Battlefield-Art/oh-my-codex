@@ -3561,6 +3561,27 @@ describe('bound launch authority', () => {
     }
   });
 
+  it('finalizes an exact bound current process when identity observation is unavailable', async () => {
+    const cwd = await mkdtemp(join(tmpdir(), 'omx-session-binding-indeterminate-current-'));
+    let binding: LaunchSessionBinding | undefined;
+    try {
+      const established = await establishLaunchSessionBinding(cwd, 'sess-binding-indeterminate-current');
+      assert.equal(established.kind, 'committed-released');
+      if (established.kind !== 'committed-released') return;
+      binding = established.binding;
+      await withPointerDependencies({
+        probePid: () => 'indeterminate',
+        observeProcess: () => ({ kind: 'error' }),
+      }, async () => {
+        await writeSessionEnd(cwd, binding!.canonicalSessionId, { binding });
+      });
+      assert.equal(await readSessionState(cwd), null);
+    } finally {
+      if (binding) await closeLaunchSessionBindingOnce(binding).catch(() => {});
+      await rm(cwd, { recursive: true, force: true });
+    }
+  });
+
   it('preserves usable and stale bound pointers without the exact valid lineage token before any mutation', async () => {
     const cwd = await mkdtemp(join(tmpdir(), 'omx-session-binding-token-gate-'));
     let binding: LaunchSessionBinding | undefined;

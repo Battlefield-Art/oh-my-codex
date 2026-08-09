@@ -274,6 +274,7 @@ describe('runPtyResult failure contracts', () => {
       syntheticServer: true,
       sessionName: 'omx-test-fixture',
       pollLimit: 1,
+      statusMarker: '__omx_pty_test_status__',
       sleep: () => undefined,
       run: (args) => {
         calls.push(args);
@@ -294,6 +295,21 @@ describe('runPtyResult failure contracts', () => {
     assert.equal(result.status, null);
     assert.match(result.error, /PTY command did not exit: 1 malformed/);
     assert.deepEqual(calls.slice(-2).map(([command]) => command), ['capture-pane', 'kill-pane']);
+    assert.deepEqual(
+      calls.find(([command]) => command === 'display-message'),
+      ['display-message', '-p', '-t', '%99', '#{pane_dead} #{pane_dead_status}'],
+    );
+    const newWindowCall = calls.find(([command]) => command === 'new-window');
+    assert.equal(newWindowCall?.length, 8, 'tmux new-window must receive one composed shell-command argument');
+    assert.match(newWindowCall?.at(-1) ?? '', /^'\/bin\/sh' '-c' '/);
+    assert.match(newWindowCall?.at(-1) ?? '', /__omx_pty_test_status__/);
+  });
+
+  it('prefers the inner shell status marker over the tmux pane wrapper status', () => {
+    const { result } = runWithDisplayState('1 1', {
+      'capture-pane': { status: 0, stdout: '__omx_pty_test_status__:0\n', stderr: '', error: '' },
+    });
+    assert.equal(result.status, 0);
   });
 
   it('reports missing pane status after the bounded poll and still cleans up', () => {

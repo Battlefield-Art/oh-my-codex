@@ -536,8 +536,19 @@ describe("detached launch state machine", () => {
     await assert.rejects(() => executeDetachedLaunchStateMachine(
       { preflight: { kind: "available", shouldAttach: true, report: { transitions: ["D0"], rollback: { attempted: [], failures: [] } } } },
       deps,
-    ));
+    ), /preLaunch session-instructions failed: instructions/);
     assert.deepEqual(events, ["D1", "D2", "finalize-setup-failure", "rollback"]);
+  });
+
+  it("rolls back proven pane authority when leader parsing fails before a report PID", async () => {
+    const events: string[] = [];
+    const deps = createDependencies(events, "D2");
+    deps.abortAndAwaitFinalization = async () => ({ acknowledged: false, rollbackAuthorized: true });
+    await assert.rejects(executeDetachedLaunchStateMachine(
+      { preflight: { kind: "available", shouldAttach: true, report: { transitions: ["D0"], rollback: { attempted: [], failures: [] } } } },
+      deps,
+    ));
+    assert.equal(events.includes("rollback"), true);
   });
 
   it("never rolls back, deletes records, or falls back after D10 attach failure", async () => {
