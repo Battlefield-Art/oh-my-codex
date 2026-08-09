@@ -6913,11 +6913,11 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       payload.preLaunchOptions.enableNotifyFallbackAuthority,
       payload.preLaunchOptions.worktreeDirty,
       async () => {
-        const name = await updateDetachedSessionMetadata(binding, { tmuxSessionName: payload.sessionName });
-        const paneUpdate = await updateDetachedSessionMetadata(binding, { tmuxPaneId: pane });
-        if (name.kind !== "committed-released" || paneUpdate.kind !== "committed-released") {
-          throw new Error("detached leader metadata update denied");
-        }
+        const metadata = await updateDetachedSessionMetadata(binding, {
+          tmuxSessionName: payload.sessionName,
+          tmuxPaneId: pane,
+        });
+        if (metadata.kind !== "committed-released") throw new Error("detached leader metadata update denied");
       },
     );
     if (completion.kind === "failure") {
