@@ -1517,6 +1517,20 @@ function captureDetachedLeaderAuthority(leaderPaneId: string, expectedSessionNam
   return { paneId, panePid: parsedPid, sessionName, sessionId, sessionCreated, windowId, windowIndex, ownerId };
 }
 
+/** Internal detached-launch seam. Exported solely for deterministic CLI tests. */
+export function parseDetachedLeaderPaneIdByPid(snapshot: string, leaderPid: number): string {
+  if (!Number.isSafeInteger(leaderPid) || leaderPid <= 0) throw new Error("invalid detached leader pid");
+  const matches = snapshot
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split("\t"))
+    .filter(([paneId, paneDead, panePid]) => /^%[0-9]+$/.test(paneId ?? "") && paneDead === "0" && Number(panePid) === leaderPid)
+    .map(([paneId]) => paneId!);
+  if (matches.length !== 1) throw new Error("detached leader pane identity is unavailable");
+  return matches[0]!;
+}
+
 function detachedLeaderAuthorityCondition(authority: DetachedLeaderAuthority, requireOwner = true): string {
   const conditions = [
     "#{==:#{pane_dead},0}",
@@ -6793,6 +6807,19 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
     if (isDetachedLaunchControlPlaneKey(key, process.platform === "win32")) continue;
     process.env[key] = value;
   }
+  let pane: string;
+  try {
+    const paneSnapshot = execTmuxFileSync(
+      ["list-panes", "-t", payload.sessionName, "-F", "#{pane_id}\t#{pane_dead}\t#{pane_pid}"],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+    pane = parseDetachedLeaderPaneIdByPid(paneSnapshot, process.pid);
+  } catch (error) {
+    const inheritedPane = process.env.TMUX_PANE?.trim();
+    if (!inheritedPane || !/^%[0-9]+$/.test(inheritedPane)) throw error;
+    pane = inheritedPane;
+  }
+  process.env.TMUX_PANE = pane;
   const established = await establishPreLaunchBinding(payload.cwd, payload.sessionId);
   const binding = established.binding;
   let ownedRecord: DetachedActiveRecordOwnership | undefined;
@@ -6818,8 +6845,6 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       if (!finalization.finalized) throw new Error(`bound setup finalization denied: ${finalization.cleanup.comparison?.reason ?? "unknown reason"}`);
       throw completion.error;
     }
-    const pane = process.env.TMUX_PANE;
-    if (!pane) throw new Error("detached leader has no tmux pane identity");
     const name = await updateDetachedSessionMetadata(binding, { tmuxSessionName: payload.sessionName });
     const paneUpdate = await updateDetachedSessionMetadata(binding, { tmuxPaneId: pane });
     if (name.kind !== "committed-released" || paneUpdate.kind !== "committed-released") throw new Error("detached leader metadata update denied");
