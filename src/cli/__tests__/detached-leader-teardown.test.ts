@@ -446,6 +446,7 @@ describe('detached leader HUD teardown', () => {
         assert.equal(terminal.exitStatus, 0);
         await poll('leader pane removal', () => !paneExists(fixture, started.leaderPaneId) ? true : undefined);
         await poll('HUD pane removal', () => !paneExists(fixture, started.hud.paneId) ? true : undefined);
+        await poll('HUD process exit', () => !processAlive(started.hud.panePid) ? true : undefined);
         assertProcessDead(started.hud.panePid);
         assert.equal(paneExists(fixture, foreignPaneId), true);
         assert.doesNotThrow(() => process.kill(foreignPanePid, 0));

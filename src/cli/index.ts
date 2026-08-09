@@ -7092,25 +7092,34 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       ? signalExitCodes[externalInterrupt] ?? 1
       : outcome.code ?? (outcome.signal ? signalExitCodes[outcome.signal] ?? 1 : 1);
     traceDetachedLeaderPhase("post-launch-start");
-    await postLaunch(payload.cwd, payload.sessionId, binding, payload.codexHomeOverride, payload.preLaunchOptions.enableNotifyFallbackAuthority, payload.projectLocalCodexHomeForCleanup);
+    await postLaunch(
+      payload.cwd,
+      payload.sessionId,
+      binding,
+      payload.codexHomeOverride,
+      payload.preLaunchOptions.enableNotifyFallbackAuthority,
+      payload.projectLocalCodexHomeForCleanup,
+      async () => {
+        if (payload.readyPath) writeDetachedLeaderReport(payload.readyPath, {
+          version: 1, kind: "terminal", nonce, sessionId: payload.sessionId, sessionName: payload.sessionName,
+          paneId: pane, leaderPid: process.pid, finalized: true,
+          ...(typeof process.exitCode === "number" ? { exitStatus: process.exitCode } : {}),
+        });
+        traceDetachedLeaderPhase("terminal-report-written");
+        if (ownedRecord) {
+          const bytes = readFileSync(activeRecordPath, "utf-8");
+          const digest = createHash("sha256").update(bytes).digest("hex");
+          if (bytes === ownedRecord.bytes && digest === ownedRecord.digest) rmSync(activeRecordPath, { force: true });
+        }
+        if (!externalInterrupt && outcome.code !== null) {
+          traceDetachedLeaderPhase("hud-teardown-start");
+          teardownDetachedOwnedHudPane(pane, payload, detachedHudProof);
+          traceDetachedLeaderPhase("hud-teardown-done");
+        }
+      },
+    );
     traceDetachedLeaderPhase("post-launch-done");
-    if (payload.readyPath) writeDetachedLeaderReport(payload.readyPath, {
-      version: 1, kind: "terminal", nonce, sessionId: payload.sessionId, sessionName: payload.sessionName,
-      paneId: pane, leaderPid: process.pid, finalized: true,
-      ...(typeof process.exitCode === "number" ? { exitStatus: process.exitCode } : {}),
-    });
-    traceDetachedLeaderPhase("terminal-report-written");
     await cleanupRuntimeCodexHome(payload.runtimeCodexHomeForCleanup, payload.projectLocalCodexHomeForCleanup);
-    if (ownedRecord) {
-      const bytes = readFileSync(activeRecordPath, "utf-8");
-      const digest = createHash("sha256").update(bytes).digest("hex");
-      if (bytes === ownedRecord.bytes && digest === ownedRecord.digest) rmSync(activeRecordPath, { force: true });
-    }
-    if (!externalInterrupt && outcome.code !== null) {
-      traceDetachedLeaderPhase("hud-teardown-start");
-      teardownDetachedOwnedHudPane(pane, payload, detachedHudProof);
-      traceDetachedLeaderPhase("hud-teardown-done");
-    }
     traceDetachedLeaderPhase("leader-return");
   } catch (error) {
     let failure: unknown = error;
@@ -7153,6 +7162,7 @@ export async function postLaunch(
   codexHomeOverride?: string,
   enableNotifyFallbackAuthority: boolean = false,
   projectLocalCodexHomeForCleanup?: string,
+  onFinalized?: () => void | Promise<void>,
 ): Promise<void> {
   const sessionStartedAt: string | undefined = binding.startedAt;
   // Pointer authority is consumed before any terminal cleanup. A denied or
@@ -7171,6 +7181,7 @@ export async function postLaunch(
     await closeLaunchSessionBindingOnce(binding);
     throw terminalError;
   }
+  await onFinalized?.();
 
 
 
