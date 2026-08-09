@@ -10,8 +10,11 @@ import {
   applyDetachedTerminalExitStatus,
   buildDetachedSessionBootstrapSteps,
   DETACHED_LEADER_READY_TIMEOUT_MS,
+  cleanupDetachedPreReportSession,
+  decodeDetachedLeaderPayload,
   publishDetachedReleaseMarker,
   parseDetachedLeaderPaneIdByPid,
+  isDetachedReadyReportAuthorized,
   probeExactDetachedSessionExists,
   resolveDetachedAttachExitStatus,
 } from '../index.js';
@@ -107,6 +110,7 @@ async function cleanupDetachedWorkdir(wd: string, hudPanePid?: number): Promise<
     while (processAlive(hudPanePid) && Date.now() < deadline) {
       await new Promise((resolve) => setTimeout(resolve, POLL_INTERVAL_MS));
     }
+    assertProcessDead(hudPanePid);
   }
   await rm(wd, { recursive: true, force: true, maxRetries: 10, retryDelay: POLL_INTERVAL_MS });
 }
@@ -195,6 +199,27 @@ describe('detached leader HUD teardown', () => {
     assert.equal(DETACHED_LEADER_READY_TIMEOUT_MS, 120_000);
   });
 
+  it('preserves and validates shouldAttach across detached payload encode and decode', () => {
+    const payload = {
+      cwd: '/tmp/project',
+      sessionName: 'omx-session',
+      sessionId: 'omx-session-id',
+      codexCmd: 'codex',
+      preLaunchOptions: {
+        enableNotifyFallbackAuthority: false,
+        worktreeDirty: false,
+        shouldAttach: false,
+      },
+    };
+    const encoded = Buffer.from(JSON.stringify(payload)).toString('base64url');
+    assert.equal(decodeDetachedLeaderPayload(encoded).preLaunchOptions.shouldAttach, false);
+    const invalid = Buffer.from(JSON.stringify({
+      ...payload,
+      preLaunchOptions: { ...payload.preLaunchOptions, shouldAttach: 'false' },
+    })).toString('base64url');
+    assert.throws(() => decodeDetachedLeaderPayload(invalid), /invalid detached leader payload/);
+  });
+
   it('derives the detached leader pane from the live pane PID instead of inherited TMUX_PANE', () => {
     const snapshot = [
       '%1\t0\t111',
@@ -207,6 +232,61 @@ describe('detached leader HUD teardown', () => {
       () => parseDetachedLeaderPaneIdByPid(`${snapshot}\n%4\t0\t333`, 333),
       /pane identity is unavailable/,
     );
+  });
+
+  it('authenticates normal detached and Hermes ready reports with separate authority contracts', () => {
+    const report = {
+      version: 1 as const,
+      kind: 'ready' as const,
+      nonce: 'nonce',
+      sessionId: 'session',
+      sessionName: 'name',
+      paneId: '%9',
+      leaderPid: 900,
+    };
+    const expected = {
+      nonce: 'nonce',
+      sessionId: 'session',
+      sessionName: 'name',
+      leaderPaneId: '%9',
+      leaderPanePid: 901,
+    };
+    assert.equal(isDetachedReadyReportAuthorized(report, { ...expected, shouldAttach: true }), false);
+    assert.equal(isDetachedReadyReportAuthorized(report, { ...expected, shouldAttach: false }), true);
+    assert.equal(
+      isDetachedReadyReportAuthorized({ ...report, paneId: '%8' }, { ...expected, shouldAttach: false }),
+      false,
+    );
+  });
+
+  it('cleans an exact retained dead pane without an owner tag and rejects changed topology', async (t) => {
+    if (!skipUnlessTmux(t)) return;
+    await withTempTmuxSession(async (fixture) => {
+      fixture.run(['set-option', '-g', 'remain-on-exit', 'on']);
+      const snapshot = fixture.run([
+        'display-message', '-p', '-t', fixture.sessionName,
+        '#{session_name}\t#{session_id}\t#{session_created}\t#{window_id}\t#{pane_id}\t#{pane_pid}',
+      ]).split('\t');
+      const [sessionName, sessionId, sessionCreated, windowId, paneId, panePidRaw] = snapshot;
+      const panePid = Number(panePidRaw);
+      if (!sessionName || !sessionId || !sessionCreated || !windowId || !paneId || !Number.isSafeInteger(panePid)) {
+        throw new Error('invalid retained-pane topology fixture');
+      }
+      fixture.runResult(['unset-option', '-t', fixture.sessionName, '@omx_instance_id']);
+      process.kill(panePid, 'SIGTERM');
+      await poll('retained dead pane', () => fixture.run(['display-message', '-p', '-t', paneId, '#{pane_dead}']) === '1' ? true : undefined);
+      const authority = {
+        paneId, panePid, sessionName, sessionId, sessionCreated, windowId,
+        windowIndex: '0', ownerId: 'missing-owner-tag',
+      };
+      assert.throws(
+        () => cleanupDetachedPreReportSession({ ...authority, windowId: '@999999' }),
+        /topology changed before cleanup/,
+      );
+      assert.equal(fixture.sessionExists(sessionName), true);
+      cleanupDetachedPreReportSession(authority);
+      await poll('pre-report session destruction', () => !fixture.sessionExists(sessionName) ? true : undefined);
+    });
   });
   it('tears down the proven HUD pane and session after a zero-status child exit', async (t) => {
     if (!skipUnlessTmux(t)) return;
@@ -223,6 +303,7 @@ describe('detached leader HUD teardown', () => {
         await poll('leader pane removal', () => !paneExists(fixture, started.leaderPaneId) ? true : undefined);
         await poll('HUD pane removal', () => !paneExists(fixture, started.hud.paneId) ? true : undefined);
         await poll('leader session destruction', () => !tmuxSessionExists(sessionName, fixture.serverName) ? true : undefined);
+        await poll('HUD process exit', () => !processAlive(started.hud.panePid) ? true : undefined);
         assertProcessDead(started.hud.panePid);
         assert.equal(fixture.sessionExists(), true);
       });
@@ -246,6 +327,7 @@ describe('detached leader HUD teardown', () => {
         await poll('leader pane removal', () => !paneExists(fixture, started.leaderPaneId) ? true : undefined);
         await poll('HUD pane removal', () => !paneExists(fixture, started.hud.paneId) ? true : undefined);
         await poll('leader session destruction', () => !tmuxSessionExists(sessionName, fixture.serverName) ? true : undefined);
+        await poll('HUD process exit', () => !processAlive(started.hud.panePid) ? true : undefined);
         assertProcessDead(started.hud.panePid);
         assert.equal(fixture.sessionExists(), true);
       });

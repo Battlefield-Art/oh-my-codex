@@ -1570,6 +1570,28 @@ function runDetachedLeaderMutation(authority: DetachedLeaderAuthority, args: str
   if (output !== receipt) throw new Error("detached leader authority changed before tmux mutation");
 }
 
+function detachedPreReportCleanupCondition(authority: DetachedLeaderAuthority): string {
+  const conditions = [
+    "#{==:#{pane_dead},1}",
+    `#{==:#{pane_id},${authority.paneId}}`,
+    `#{==:#{session_name},${authority.sessionName}}`,
+    `#{==:#{session_id},${authority.sessionId}}`,
+    `#{==:#{session_created},${authority.sessionCreated}}`,
+    `#{==:#{window_id},${authority.windowId}}`,
+  ];
+  return conditions.reduce((combined, condition) => `#{&&:${combined},${condition}}`);
+}
+
+export function cleanupDetachedPreReportSession(authority: DetachedLeaderAuthority): void {
+  const receipt = detachedAuthorityReceipt();
+  const success = `kill-session -t ${quoteShellArg(authority.sessionName)} ; display-message -p ${quoteShellArg(receipt)}`;
+  const output = execTmuxFileSync([
+    "if-shell", "-F", "-t", authority.paneId, detachedPreReportCleanupCondition(authority),
+    success, "display-message -p ''",
+  ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+  if (output !== receipt) throw new Error("detached pre-report topology changed before cleanup");
+}
+
 function runDetachedHudMutation(
   leaderAuthority: DetachedLeaderAuthority,
   hudAuthority: DetachedHudAuthority,
@@ -2981,6 +3003,8 @@ export type DetachedLaunchTerminal =
 export interface DetachedReleaseFailureResolution {
   /** True only after the leader authenticated and completed terminal finalization. */
   acknowledged: boolean;
+  /** True when pre-report tmux pane/session authority independently proves rollback scope. */
+  rollbackAuthorized?: boolean;
   nonce?: string;
   sessionId?: string;
   sessionName?: string;
@@ -3107,9 +3131,11 @@ export async function executeDetachedLaunchStateMachine<Binding, InertSession, P
     if (retainedAuthority && !rollbackAuthorized && !released) {
       try {
         const resolution = await deps.abortAndAwaitFinalization?.(error);
-        rollbackAuthorized = resolution?.acknowledged === true && Boolean(
-          resolution.nonce && resolution.sessionId && resolution.sessionName &&
-          Number.isSafeInteger(resolution.leaderPid) && resolution.kind,
+        rollbackAuthorized = resolution?.rollbackAuthorized === true || (
+          resolution?.acknowledged === true && Boolean(
+            resolution.nonce && resolution.sessionId && resolution.sessionName &&
+            Number.isSafeInteger(resolution.leaderPid) && resolution.kind
+          )
         );
         if (!rollbackAuthorized) released = true;
       } catch (abortError) {
@@ -4721,6 +4747,7 @@ interface DetachedLeaderPreLaunchOptions {
   notifyTempContract?: NotifyTempContract;
   enableNotifyFallbackAuthority: boolean;
   worktreeDirty: boolean;
+  shouldAttach?: boolean;
 }
 
 function buildDetachedSessionLeaderCommand(
@@ -4780,6 +4807,26 @@ interface DetachedLeaderReport {
   finalized?: boolean;
   exitStatus?: number;
   hud?: DetachedHudAuthority;
+}
+
+export function isDetachedReadyReportAuthorized(
+  report: DetachedLeaderReport | null | undefined,
+  expected: {
+    nonce: string;
+    sessionId: string;
+    sessionName: string;
+    shouldAttach: boolean;
+    leaderPaneId: string | null;
+    leaderPanePid: number | null;
+  },
+): boolean {
+  if (report?.kind !== "ready" || report.nonce !== expected.nonce
+    || report.sessionId !== expected.sessionId || report.sessionName !== expected.sessionName
+    || typeof report.leaderPid !== "number" || report.leaderPid <= 0) return false;
+  if (expected.shouldAttach && expected.leaderPanePid !== null) {
+    return report.leaderPid === expected.leaderPanePid;
+  }
+  return report.paneId === expected.leaderPaneId;
 }
 
 function writeDetachedLeaderReport(path: string, report: DetachedLeaderReport): void {
@@ -5260,6 +5307,7 @@ export function buildDetachedSessionBootstrapSteps(
   preLaunchOptions: DetachedLeaderPreLaunchOptions = {
     enableNotifyFallbackAuthority: false,
     worktreeDirty: false,
+    shouldAttach: true,
   },
   controlPlane?: DetachedLaunchControlPlane,
 ): DetachedSessionTmuxStep[] {
@@ -5961,7 +6009,7 @@ export type DegradedSetupOperation =
   | "derived-watcher"
   | "notification"
   | "native-lifecycle-event";
-export type MandatorySetupOperation = "overlay" | "session-instructions" | "session-metrics";
+export type MandatorySetupOperation = "overlay" | "session-instructions" | "session-metrics" | "detached-metadata";
 export type CompletionResult =
   | { kind: "success"; establishmentCleanup?: EstablishmentCleanupEvidence }
   | { kind: "degraded-success"; operations: readonly DegradedSetupOperation[]; establishmentCleanup?: EstablishmentCleanupEvidence }
@@ -6008,6 +6056,7 @@ async function completePreLaunchSetup(
   codexHomeOverride: string | undefined,
   enableNotifyFallbackAuthority: boolean,
   worktreeDirty: boolean,
+  commitDetachedMetadata?: () => Promise<void>,
 ): Promise<CompletionResult> {
   const degraded: DegradedSetupOperation[] = [];
   try {
@@ -6041,6 +6090,10 @@ async function completePreLaunchSetup(
     tagCurrentTmuxSessionWithInstance(sessionId);
   } catch (error) {
     return { kind: "failure", operation: "session-metrics", error };
+  }
+  if (commitDetachedMetadata) {
+    try { await commitDetachedMetadata(); }
+    catch (error) { return { kind: "failure", operation: "detached-metadata", error }; }
   }
 
   try { await startNotifyFallbackWatcher(cwd, { codexHomeOverride, enableAuthority: enableNotifyFallbackAuthority, sessionId }); }
@@ -6376,6 +6429,7 @@ async function runCodex(
     let detachedLeaderAuthority: DetachedLeaderAuthority | null = null;
     let detachedHudAuthority: DetachedHudAuthority | null = null;
     let detachedLeaderPid: number | null = null;
+    let rollbackFromPreReportAuthority = false;
 
     let attachStep: DetachedSessionTmuxStep | null = null;
 
@@ -6393,6 +6447,7 @@ async function runCodex(
             ...(preLaunchOptions.notifyTempContract.active ? { notifyTempContract: preLaunchOptions.notifyTempContract } : {}),
             enableNotifyFallbackAuthority: preLaunchOptions.enableNotifyFallbackAuthority,
             worktreeDirty: preLaunchOptions.worktreeDirty,
+            shouldAttach: detachedPreflight.shouldAttach,
           },
           detachedControlPlane,
         );
@@ -6452,8 +6507,15 @@ async function runCodex(
             const readyDeadline = Date.now() + DETACHED_LEADER_READY_TIMEOUT_MS;
             while (true) {
               const report = readDetachedLeaderReport(releaseMarkerPath);
-              if (report?.nonce === detachedLaunchNonce && report.sessionId === sessionId && report.sessionName === sessionName && report.paneId === detachedLeaderPaneId && report.leaderPid && report.kind === "ready") {
-                detachedLeaderPid = report.leaderPid;
+              if (isDetachedReadyReportAuthorized(report, {
+                nonce: detachedLaunchNonce,
+                sessionId,
+                sessionName,
+                shouldAttach: detachedPreflight.shouldAttach,
+                leaderPaneId: detachedLeaderPaneId,
+                leaderPanePid: detachedLeaderAuthority?.panePid ?? null,
+              })) {
+                detachedLeaderPid = report!.leaderPid!;
                 return { kind: "success" };
               }
               if (report?.nonce === detachedLaunchNonce && report.sessionId === sessionId && report.sessionName === sessionName && report.leaderPid && report.kind === "failed") {
@@ -6508,7 +6570,10 @@ async function runCodex(
             // The leader has the retained binding. Publishing abort is the only
             // outer action permitted after a D9 write failure; a mismatched or
             // missing report leaves every artifact and the tmux session intact.
-            if (!detachedLeaderPid) return { acknowledged: false };
+            if (!detachedLeaderPid) {
+              rollbackFromPreReportAuthority = detachedLeaderAuthority !== null;
+              return { acknowledged: false, rollbackAuthorized: rollbackFromPreReportAuthority };
+            }
             const current = readDetachedLeaderReport(releaseMarkerPath);
             if (current?.nonce === detachedLaunchNonce && current.sessionId === sessionId &&
               current.sessionName === sessionName && current.leaderPid === detachedLeaderPid &&
@@ -6551,6 +6616,10 @@ async function runCodex(
               for (const step of buildDetachedSessionRollbackSteps(sessionName, null, null, null)) {
                 await attempt(`session:${step.name}`, () => {
                   if (!detachedLeaderAuthority) throw new Error("detached leader authority missing before rollback");
+                  if (rollbackFromPreReportAuthority && step.name === "kill-session") {
+                    cleanupDetachedPreReportSession(detachedLeaderAuthority);
+                    return;
+                  }
                   runDetachedLeaderMutation(detachedLeaderAuthority, step.args);
                 });
               }
@@ -6741,7 +6810,7 @@ interface DetachedLeaderPayload {
   preLaunchOptions: DetachedLeaderPreLaunchOptions;
 }
 
-function decodeDetachedLeaderPayload(encoded: string | undefined): DetachedLeaderPayload {
+export function decodeDetachedLeaderPayload(encoded: string | undefined): DetachedLeaderPayload {
   if (!encoded || !/^[A-Za-z0-9_-]+$/.test(encoded)) throw new Error("invalid detached leader payload");
   let value: unknown;
   try { value = JSON.parse(Buffer.from(encoded, "base64url").toString("utf8")); } catch { throw new Error("invalid detached leader payload"); }
@@ -6751,7 +6820,8 @@ function decodeDetachedLeaderPayload(encoded: string | undefined): DetachedLeade
   if (typeof payload.cwd !== "string" || typeof payload.sessionName !== "string" || typeof payload.sessionId !== "string" ||
     typeof payload.codexCmd !== "string" || !options || typeof options !== "object" ||
     typeof (options as Record<string, unknown>).enableNotifyFallbackAuthority !== "boolean" ||
-    typeof (options as Record<string, unknown>).worktreeDirty !== "boolean") throw new Error("invalid detached leader payload");
+    typeof (options as Record<string, unknown>).worktreeDirty !== "boolean" ||
+    typeof (options as Record<string, unknown>).shouldAttach !== "boolean") throw new Error("invalid detached leader payload");
   const notifyTempContract = (options as Record<string, unknown>).notifyTempContract;
   if (notifyTempContract !== undefined && (!notifyTempContract || typeof notifyTempContract !== "object")) throw new Error("invalid detached leader payload");
   const parentEnv = payload.parentEnv;
@@ -6770,6 +6840,7 @@ function decodeDetachedLeaderPayload(encoded: string | undefined): DetachedLeade
       ...(notifyTempContract ? { notifyTempContract: notifyTempContract as NotifyTempContract } : {}),
       enableNotifyFallbackAuthority: (options as DetachedLeaderPreLaunchOptions).enableNotifyFallbackAuthority,
       worktreeDirty: (options as DetachedLeaderPreLaunchOptions).worktreeDirty,
+      shouldAttach: (options as DetachedLeaderPreLaunchOptions).shouldAttach,
     },
   };
 }
@@ -6808,16 +6879,18 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
     process.env[key] = value;
   }
   let pane: string;
-  try {
+  const inheritedPane = process.env.TMUX_PANE?.trim();
+  if (payload.preLaunchOptions.shouldAttach === false) {
+    if (!inheritedPane || !/^%[0-9]+$/.test(inheritedPane)) {
+      throw new Error("detached Hermes leader has no tmux pane identity");
+    }
+    pane = inheritedPane;
+  } else {
     const paneSnapshot = execTmuxFileSync(
       ["list-panes", "-t", payload.sessionName, "-F", "#{pane_id}\t#{pane_dead}\t#{pane_pid}"],
       { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
     );
     pane = parseDetachedLeaderPaneIdByPid(paneSnapshot, process.pid);
-  } catch (error) {
-    const inheritedPane = process.env.TMUX_PANE?.trim();
-    if (!inheritedPane || !/^%[0-9]+$/.test(inheritedPane)) throw error;
-    pane = inheritedPane;
   }
   process.env.TMUX_PANE = pane;
   const established = await establishPreLaunchBinding(payload.cwd, payload.sessionId);
@@ -6839,15 +6912,19 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       payload.codexHomeOverride,
       payload.preLaunchOptions.enableNotifyFallbackAuthority,
       payload.preLaunchOptions.worktreeDirty,
+      async () => {
+        const name = await updateDetachedSessionMetadata(binding, { tmuxSessionName: payload.sessionName });
+        const paneUpdate = await updateDetachedSessionMetadata(binding, { tmuxPaneId: pane });
+        if (name.kind !== "committed-released" || paneUpdate.kind !== "committed-released") {
+          throw new Error("detached leader metadata update denied");
+        }
+      },
     );
     if (completion.kind === "failure") {
       const finalization = await finalizeBoundOnce(binding, "setup-failure", payload.cwd);
       if (!finalization.finalized) throw new Error(`bound setup finalization denied: ${finalization.cleanup.comparison?.reason ?? "unknown reason"}`);
       throw completion.error;
     }
-    const name = await updateDetachedSessionMetadata(binding, { tmuxSessionName: payload.sessionName });
-    const paneUpdate = await updateDetachedSessionMetadata(binding, { tmuxPaneId: pane });
-    if (name.kind !== "committed-released" || paneUpdate.kind !== "committed-released") throw new Error("detached leader metadata update denied");
     const record: MadmaxDetachedActiveRecord = {
       version: 1, context_key: contextKey ?? payload.sessionId!, created_at: new Date().toISOString(),
       source_cwd: payload.cwd, argv: [payload.codexCmd], run_dir: process.env.OMX_ROOT ?? payload.cwd,
