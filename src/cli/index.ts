@@ -1516,6 +1516,20 @@ function captureDetachedLeaderAuthority(leaderPaneId: string, expectedSessionNam
   return { paneId, panePid: parsedPid, sessionName, sessionId, sessionCreated, windowId, windowIndex, ownerId };
 }
 
+/** Internal detached-launch seam. Exported solely for deterministic CLI tests. */
+export function parseDetachedLeaderPaneIdByPid(snapshot: string, leaderPid: number): string {
+  if (!Number.isSafeInteger(leaderPid) || leaderPid <= 0) throw new Error("invalid detached leader pid");
+  const matches = snapshot
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .map((line) => line.split("\t"))
+    .filter(([paneId, paneDead, panePid]) => /^%[0-9]+$/.test(paneId ?? "") && paneDead === "0" && Number(panePid) === leaderPid)
+    .map(([paneId]) => paneId!);
+  if (matches.length !== 1) throw new Error("detached leader pane identity is unavailable");
+  return matches[0]!;
+}
+
 function detachedLeaderAuthorityCondition(authority: DetachedLeaderAuthority, requireOwner = true): string {
   const conditions = [
     "#{==:#{pane_dead},0}",
@@ -2953,7 +2967,7 @@ export class DetachedLaunchSafetyError extends Error {
     readonly cause: unknown,
     readonly report: DetachedBootstrapReport,
   ) {
-    super(`detached launch safety failure during ${phase}`);
+    super(`detached launch safety failure during ${phase}${phase === "completion" && cause instanceof Error ? `: ${cause.message}` : ""}`);
   }
 }
 
@@ -3046,7 +3060,12 @@ export async function executeDetachedLaunchStateMachine<Binding, InertSession, P
         report.rollback.failures.push({ step: "setup-finalization", status: "failed", code: detachedFailureCode(finalizationError) });
         failures.push(finalizationError);
       }
-      throw new DetachedLaunchSafetyError("completion", new AggregateError(failures, `preLaunch ${completion.operation} failed`), report);
+      const completionMessage = completion.error instanceof Error ? completion.error.message : String(completion.error);
+      throw new DetachedLaunchSafetyError(
+        "completion",
+        new AggregateError(failures, `preLaunch ${completion.operation} failed: ${completionMessage}`),
+        report,
+      );
     }
     transition("D3");
     const inertSession = await deps.createInertSession();
@@ -5946,7 +5965,7 @@ export type DegradedSetupOperation =
   | "derived-watcher"
   | "notification"
   | "native-lifecycle-event";
-export type MandatorySetupOperation = "overlay" | "session-instructions" | "session-metrics";
+export type MandatorySetupOperation = "overlay" | "session-instructions" | "session-metrics" | "detached-metadata";
 export type CompletionResult =
   | { kind: "success"; establishmentCleanup?: EstablishmentCleanupEvidence }
   | { kind: "degraded-success"; operations: readonly DegradedSetupOperation[]; establishmentCleanup?: EstablishmentCleanupEvidence }
@@ -5993,6 +6012,7 @@ async function completePreLaunchSetup(
   codexHomeOverride: string | undefined,
   enableNotifyFallbackAuthority: boolean,
   worktreeDirty: boolean,
+  commitDetachedMetadata?: () => Promise<void>,
 ): Promise<CompletionResult> {
   const degraded: DegradedSetupOperation[] = [];
   try {
@@ -6026,6 +6046,10 @@ async function completePreLaunchSetup(
     tagCurrentTmuxSessionWithInstance(sessionId);
   } catch (error) {
     return { kind: "failure", operation: "session-metrics", error };
+  }
+  if (commitDetachedMetadata) {
+    try { await commitDetachedMetadata(); }
+    catch (error) { return { kind: "failure", operation: "detached-metadata", error }; }
   }
 
   try { await startNotifyFallbackWatcher(cwd, { codexHomeOverride, enableAuthority: enableNotifyFallbackAuthority, sessionId }); }
@@ -6792,6 +6816,19 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
     if (isDetachedLaunchControlPlaneKey(key, process.platform === "win32")) continue;
     process.env[key] = value;
   }
+  let pane: string;
+  try {
+    const paneSnapshot = execTmuxFileSync(
+      ["list-panes", "-t", payload.sessionName, "-F", "#{pane_id}\t#{pane_dead}\t#{pane_pid}"],
+      { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] },
+    );
+    pane = parseDetachedLeaderPaneIdByPid(paneSnapshot, process.pid);
+  } catch (error) {
+    const inheritedPane = process.env.TMUX_PANE?.trim();
+    if (!inheritedPane || !/^%[0-9]+$/.test(inheritedPane)) throw error;
+    pane = inheritedPane;
+  }
+  process.env.TMUX_PANE = pane;
   const established = await establishPreLaunchBinding(payload.cwd, payload.sessionId);
   const binding = established.binding;
   let ownedRecord: DetachedActiveRecordOwnership | undefined;
@@ -6811,17 +6848,19 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       payload.codexHomeOverride,
       payload.preLaunchOptions.enableNotifyFallbackAuthority,
       payload.preLaunchOptions.worktreeDirty,
+      async () => {
+        const name = await updateDetachedSessionMetadata(binding, { tmuxSessionName: payload.sessionName });
+        const paneUpdate = await updateDetachedSessionMetadata(binding, { tmuxPaneId: pane });
+        if (name.kind !== "committed-released" || paneUpdate.kind !== "committed-released") {
+          throw new Error("detached leader metadata update denied");
+        }
+      },
     );
     if (completion.kind === "failure") {
       const finalization = await finalizeBoundOnce(binding, "setup-failure", payload.cwd);
       if (!finalization.finalized) throw new Error(`bound setup finalization denied: ${finalization.cleanup.comparison?.reason ?? "unknown reason"}`);
       throw completion.error;
     }
-    const pane = process.env.TMUX_PANE;
-    if (!pane) throw new Error("detached leader has no tmux pane identity");
-    const name = await updateDetachedSessionMetadata(binding, { tmuxSessionName: payload.sessionName });
-    const paneUpdate = await updateDetachedSessionMetadata(binding, { tmuxPaneId: pane });
-    if (name.kind !== "committed-released" || paneUpdate.kind !== "committed-released") throw new Error("detached leader metadata update denied");
     const record: MadmaxDetachedActiveRecord = {
       version: 1, context_key: contextKey ?? payload.sessionId!, created_at: new Date().toISOString(),
       source_cwd: payload.cwd, argv: [payload.codexCmd], run_dir: process.env.OMX_ROOT ?? payload.cwd,
@@ -6938,7 +6977,12 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       finalized = true;
       await cleanupRuntimeCodexHome(payload.runtimeCodexHomeForCleanup, payload.projectLocalCodexHomeForCleanup);
     } catch (lifecycleError) {
-      failure = new AggregateError([error, lifecycleError], "detached leader failure finalization did not complete");
+      const launchMessage = error instanceof Error ? error.message : String(error);
+      const lifecycleMessage = lifecycleError instanceof Error ? lifecycleError.message : String(lifecycleError);
+      failure = new AggregateError(
+        [error, lifecycleError],
+        `detached leader failure finalization did not complete: launch=${launchMessage}; lifecycle=${lifecycleMessage}`,
+      );
     }
     if (finalized && ownedRecord) {
       try {

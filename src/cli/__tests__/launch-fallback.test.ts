@@ -2893,7 +2893,7 @@ exit 0
             'export OMX_HOOK_DERIVED_SIGNALS=0',
             'export TERM=xterm-256color',
           ].join('; ');
-          const command = `${envPrefix}; cd ${JSON.stringify(wd)} && exec ${JSON.stringify(process.execPath)} ${JSON.stringify(omxBin)} --tmux ${JSON.stringify('e2e prompt')}`;
+          const command = `${envPrefix}; cd ${JSON.stringify(wd)} || exit 125; ${JSON.stringify(process.execPath)} ${JSON.stringify(omxBin)} --tmux ${JSON.stringify('e2e prompt')}; child_status=$?; printf '\n%s:%s\n' 'omx-follow-up' "$child_status"; exit "$child_status"`;
           if (process.platform === 'darwin') {
             const result = fixture.runPtyResult(command);
             return { status: result.status, output: `${result.stdout}\n${result.stderr}\n${result.error}` };
@@ -2917,10 +2917,12 @@ exit 0
 
         const zero = runPtyLaunch(0, 'on');
         assert.equal(zero.status, 0, `zero-status attached launch must return to the shell successfully:\n${zero.output}`);
+        assert.match(zero.output, /omx-follow-up:0/, `zero-status launch must leave a usable shell for a follow-up command:\n${zero.output}`);
         assert.deepEqual(listOmxSessions(), [], 'zero-status exit must destroy the owned detached session despite remain-on-exit=on');
 
         const seven = runPtyLaunch(7, 'failed');
         assert.equal(seven.status, 7, `nonzero child status must propagate to the invoking shell:\n${seven.output}`);
+        assert.match(seven.output, /omx-follow-up:7/, `nonzero launch must leave a usable shell for a follow-up command:\n${seven.output}`);
         assert.deepEqual(listOmxSessions(), [], 'nonzero exit must destroy the owned detached session despite remain-on-exit=failed');
       });
     } finally {

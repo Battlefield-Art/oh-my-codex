@@ -232,6 +232,7 @@ export function runPtyResult(
     syntheticServer?: boolean;
     sessionName: string;
     pollLimit?: number;
+    statusMarker?: string;
   },
 ): PtyCommandResult {
   if ((options.platform ?? process.platform) !== 'darwin') {
@@ -241,7 +242,12 @@ export function runPtyResult(
     throw new Error('runPtyResult requires a private synthetic tmux server');
   }
   options.run(['set-option', '-g', 'remain-on-exit', 'on']);
-  const ptyCommand = buildPtyScriptCommand(command, 'darwin');
+  // A tmux pane already supplies the controlling PTY. Run the requested command
+  // in an inner shell so the outer shell can report its status even when the
+  // pane command wrapper itself exits differently on BSD tmux.
+  const statusMarker = options.statusMarker ?? `__omx_pty_exit_${process.pid}_${Date.now().toString(36)}__`;
+  const wrappedCommand = `/bin/sh -c ${shellQuote(command)}; status=$?; printf '\\n${statusMarker}:%s\\n' "$status"; exit "$status"`;
+  const shellCommand = ['/bin/sh', '-c', wrappedCommand].map(shellQuote).join(' ');
   const paneId = options.run([
     'new-window',
     '-d',
@@ -250,12 +256,12 @@ export function runPtyResult(
     '#{pane_id}',
     '-t',
     options.sessionName,
-    ...[ptyCommand.executable, ...ptyCommand.args].map(shellQuote),
+    shellCommand,
   ]);
   let status: number | null = null;
   let state = '';
-  for (let attempt = 0; attempt < (options.pollLimit ?? 240); attempt += 1) {
-    state = options.run(['display-message', '-p', '-t', paneId, '#{pane_dead} #{pane_exit_status}']);
+  for (let attempt = 0; attempt < (options.pollLimit ?? 1_200); attempt += 1) {
+    state = options.run(['display-message', '-p', '-t', paneId, '#{pane_dead} #{pane_dead_status}']);
     const [dead, exitStatus] = state.split(/\s+/, 2);
     if (dead === '1') {
       status = /^-?\d+$/.test(exitStatus ?? '') ? Number(exitStatus) : null;
@@ -264,6 +270,11 @@ export function runPtyResult(
     options.sleep?.();
   }
   const outputResult = options.runResult(['capture-pane', '-p', '-t', paneId, '-S', '-']);
+  for (const line of outputResult.stdout.split(/\r?\n/)) {
+    if (!line.startsWith(`${statusMarker}:`)) continue;
+    const explicitStatus = line.slice(statusMarker.length + 1);
+    if (/^\d+$/.test(explicitStatus)) status = Number(explicitStatus);
+  }
   const cleanupResult = options.runResult(['kill-pane', '-t', paneId]);
   const errors = [ptyRunnerFailure('capture-pane', outputResult), ptyRunnerFailure('kill-pane', cleanupResult)].filter(Boolean).join('; ');
   if (status === null) {

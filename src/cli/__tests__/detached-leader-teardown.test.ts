@@ -10,6 +10,7 @@ import {
   applyDetachedTerminalExitStatus,
   buildDetachedSessionBootstrapSteps,
   publishDetachedReleaseMarker,
+  parseDetachedLeaderPaneIdByPid,
   probeExactDetachedSessionExists,
   resolveDetachedAttachExitStatus,
 } from '../index.js';
@@ -321,6 +322,20 @@ describe('detached leader HUD teardown', () => {
       process.exitCode = previousExitCode;
       rmSync(wd, { recursive: true, force: true });
     }
+  });
+
+  it('derives the detached leader pane from the live pane PID instead of inherited TMUX_PANE', () => {
+    const snapshot = [
+      '%1\t0\t111',
+      '%2\t1\t222',
+      '%3\t0\t333',
+    ].join('\n');
+    assert.equal(parseDetachedLeaderPaneIdByPid(snapshot, 333), '%3');
+    assert.throws(() => parseDetachedLeaderPaneIdByPid(snapshot, 222), /pane identity is unavailable/);
+    assert.throws(
+      () => parseDetachedLeaderPaneIdByPid(`${snapshot}\n%4\t0\t333`, 333),
+      /pane identity is unavailable/,
+    );
   });
 
   it('publishes an optional HUD authority proof exactly', () => {
