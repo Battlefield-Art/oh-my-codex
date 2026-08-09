@@ -3382,6 +3382,7 @@ if (command !== "launch" && command !== "resume") {
       case "__detached-session-leader": {
         const payload = decodeDetachedLeaderPayload(launchArgs[0]);
         await runDetachedSessionLeader(payload);
+        process.exit(typeof process.exitCode === "number" ? process.exitCode : 0);
         break;
       }
       case "launch":
@@ -7058,7 +7059,7 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       const digest = createHash("sha256").update(bytes).digest("hex");
       if (bytes === ownedRecord.bytes && digest === ownedRecord.digest) rmSync(activeRecordPath, { force: true });
     }
-    if (!externalInterrupt && outcome.signal === null) {
+    if (!externalInterrupt && outcome.code !== null) {
       teardownDetachedOwnedHudPane(detachedHudProof);
     }
   } catch (error) {
