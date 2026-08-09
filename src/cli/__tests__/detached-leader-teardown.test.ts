@@ -337,7 +337,13 @@ describe('detached leader HUD teardown', () => {
       if (!paneId || !sessionId || !windowId) throw new Error('invalid unrelated-pane fixture');
       fixture.run(['set-option', '-pq', '-t', paneId, '@omx_hud_owner', 'owner-user-pane']);
       assert.equal(discoverDetachedHudAuthority(fixture.sessionName, 'owner-user-pane')?.paneId, paneId);
-      cleanupDetachedHudPane({ paneId, panePid: Number(panePidRaw), sessionId, windowId, operationMarker: randomUUID() }, 'owner-user-pane');
+      const staleHudProof = { paneId, panePid: Number(panePidRaw), sessionId, windowId, operationMarker: randomUUID() };
+      cleanupDetachedHudPane(staleHudProof, 'owner-user-pane');
+      const replacementPaneId = fixture.run([
+        'split-window', '-d', '-P', '-F', '#{pane_id}', '-t', fixture.sessionName, 'sleep 120',
+      ]);
+      assert.throws(() => cleanupDetachedHudPane(staleHudProof, 'owner-user-pane'));
+      assert.equal(fixture.run(['display-message', '-p', '-t', replacementPaneId, '#{pane_id}']), replacementPaneId);
       process.kill(Number(leaderPidRaw), 'SIGTERM');
       await poll('unrelated pane survives leader exit', () => fixture.sessionExists() ? true : undefined);
       assert.equal(fixture.run(['display-message', '-p', '-t', userPaneId, '#{pane_id}']), userPaneId);

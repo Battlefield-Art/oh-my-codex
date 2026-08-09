@@ -1607,15 +1607,16 @@ function runDetachedHudMutation(
   if (output !== receipt) throw new Error("detached leader or HUD authority changed before tmux mutation");
 }
 
-function detachedTaggedHudCleanupCondition(authority: DetachedHudAuthority, ownerId: string): string {
-  return `#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_id},${authority.paneId}},#{&&:#{==:#{session_id},${authority.sessionId}},#{==:#{@omx_hud_owner},${ownerId}}}}}`;
-}
 
 export function cleanupDetachedHudPane(authority: DetachedHudAuthority, ownerId?: string): void {
-  execTmuxFileSync([
-    "if-shell", "-F", "-t", authority.paneId, ownerId ? detachedTaggedHudCleanupCondition(authority, ownerId) : detachedHudAuthorityCondition(authority, false),
-    `kill-pane -t ${quoteShellArg(authority.paneId)}`, "",
-  ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+  if (ownerId) {
+    execTmuxFileSync(["kill-pane", "-t", authority.paneId], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+  } else {
+    execTmuxFileSync([
+      "if-shell", "-F", "-t", authority.paneId, detachedHudAuthorityCondition(authority, false),
+      `kill-pane -t ${quoteShellArg(authority.paneId)}`, "",
+    ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+  }
   for (let attempt = 0; attempt < 50; attempt += 1) {
     const panes = execTmuxFileSync(["list-panes", "-a", "-F", "#{pane_id}"], {
       encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"],
