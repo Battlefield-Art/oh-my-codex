@@ -2936,7 +2936,22 @@ exit 0
           const command = `${envPrefix}; cd ${JSON.stringify(wd)} || exit 125; ${JSON.stringify(process.execPath)} ${JSON.stringify(omxBin)} --tmux ${JSON.stringify('e2e prompt')}; child_status=$?; printf '\n%s:%s\n' 'omx-follow-up' "$child_status"; exit "$child_status"`;
           if (process.platform === 'darwin') {
             const result = fixture.runPtyResult(command);
-            return { status: result.status, output: `${result.stdout}\n${result.stderr}`, error: result.error };
+            let diagnostics = '';
+            if (result.error) {
+              const sessions = fixture.runResult(['list-sessions', '-F', '#{session_name}']);
+              for (const session of sessions.stdout.split('\n').filter((name) => name.startsWith('omx-'))) {
+                const panes = fixture.runResult([
+                  'list-panes', '-t', session, '-F', '#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_current_command}\t#{@omx_instance_id}',
+                ]);
+                diagnostics += `\n[${session}]\n${panes.stdout}`;
+                for (const paneLine of panes.stdout.split('\n').filter(Boolean)) {
+                  const [paneId] = paneLine.split('\t', 1);
+                  if (!paneId) continue;
+                  diagnostics += `\n[${paneLine}]\n${fixture.runResult(['capture-pane', '-p', '-t', paneId, '-S', '-']).stdout}`;
+                }
+              }
+            }
+            return { status: result.status, output: `${result.stdout}\n${result.stderr}${diagnostics}`, error: result.error };
           }
           const ptyCommand = buildPtyScriptCommand(command);
           const result = spawnSync(
