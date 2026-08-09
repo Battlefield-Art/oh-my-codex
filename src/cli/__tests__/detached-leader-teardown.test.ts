@@ -350,6 +350,7 @@ describe('detached leader HUD teardown', () => {
     });
   });
 
+
   it('tears down the proven HUD pane and session after a zero-status child exit', async (t) => {
     if (!skipUnlessTmux(t)) return;
     const wd = mkdtempSync(join(tmpdir(), 'omx-detached-leader-zero-'));
