@@ -36,7 +36,12 @@ export interface RalplanCommandDependencies {
   probeCodexVersionDetailed?: () => CodexVersionProbeResult | null | undefined;
 }
 
-const REVIEWED_ROOT_IDENTITY_ABSENT_VERSIONS = new Set(['0.144.5', '0.145.0', '0.146.1']);
+const REVIEWED_ROOT_IDENTITY_ABSENT_VERSIONS = new Set([
+  '0.144.5',
+  '0.145.0',
+  '0.146.1',
+  '0.148.0-alpha.5',
+]);
 
 type DocumentedRootIdentityStatus = 'missing' | 'unknown';
 
@@ -50,10 +55,11 @@ function normalizeDetectedVersion(result: CodexVersionProbeResult): string | nul
   if (result.status !== 'ok' || result.collected.truncated || result.collected.lineLimitExceeded) return null;
   for (const line of result.collected.output.split(/\r?\n/).slice(0, 8)) {
     for (const token of line.trim().split(/\s+/)) {
-      const match = /^(?:v)?(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(token);
+      if (token.length > 64) continue;
+      const match = /^(?:v)?(\d{1,3})\.(\d{1,3})\.(\d{1,3})(-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(token);
       if (!match) continue;
-      const normalized = `${match[1]}.${match[2]}.${match[3]}`;
-      return normalized.length <= 64 ? normalized : null;
+      const normalized = `${match[1]}.${match[2]}.${match[3]}${match[4] ?? ''}`;
+      return normalized;
     }
   }
   return null;
