@@ -2971,13 +2971,13 @@ exit 0
           .filter((name) => name.startsWith('omx-') && name !== fixture.sessionName);
 
         const zero = runPtyLaunch(0, 'on');
-        assert.equal(zero.error, '', `zero-status PTY capture and cleanup must succeed: ${zero.error}`);
+        assert.equal(zero.error, '', `zero-status PTY capture and cleanup must succeed: ${zero.error}\n${zero.output}`);
         assert.equal(zero.status, 0, `zero-status attached launch must return to the shell successfully:\n${zero.output}`);
         assert.match(zero.output, /omx-follow-up:0/, `zero-status launch must leave a usable shell for a follow-up command:\n${zero.output}`);
         assert.deepEqual(listOmxSessions(), [], 'zero-status exit must destroy the owned detached session despite remain-on-exit=on');
 
         const seven = runPtyLaunch(7, 'failed');
-        assert.equal(seven.error, '', `nonzero-status PTY capture and cleanup must succeed: ${seven.error}`);
+        assert.equal(seven.error, '', `nonzero-status PTY capture and cleanup must succeed: ${seven.error}\n${seven.output}`);
         assert.equal(seven.status, 7, `nonzero child status must propagate to the invoking shell:\n${seven.output}`);
         assert.match(seven.output, /omx-follow-up:7/, `nonzero launch must leave a usable shell for a follow-up command:\n${seven.output}`);
         assert.deepEqual(listOmxSessions(), [], 'nonzero exit must destroy the owned detached session despite remain-on-exit=failed');
