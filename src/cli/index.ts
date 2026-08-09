@@ -6920,7 +6920,7 @@ function teardownDetachedOwnedHudPane(payload: DetachedLeaderPayload, hudProof: 
   // session is deliberately preserved, which intentionally keeps that session (and any
   // attached client) alive; natural closure and shell return happen only when no other
   // panes remain.
-  const proof = hudProof ?? discoverDetachedHudAuthority(payload.sessionName, payload.sessionId);
+  const proof = discoverDetachedHudAuthority(payload.sessionName, payload.sessionId) ?? hudProof;
   if (!proof) return;
   try {
     cleanupDetachedHudPane(proof);
