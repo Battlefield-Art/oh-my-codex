@@ -2544,7 +2544,11 @@ function isAuthorizedBoundPointer(
   candidateSessionId: string,
   state: SessionState | undefined,
 ): boolean {
+  traceSessionFinalizationOperation('auth-function-enter');
+  traceSessionFinalizationOperation('lease-lookup-start');
   const lease = bindingLeases.get(binding);
+  traceSessionFinalizationOperation('lease-lookup-done');
+  traceSessionFinalizationOperation(`state-present:${state ? 'true' : 'false'}`);
   if (!lease || (binding.directoryIdentity.kind === 'supported' && lease.closed) || !state) {
     traceSessionFinalizationOperation('bound-auth-fail:lease-or-state');
     return false;
@@ -2609,6 +2613,32 @@ class BoundDirectoryComparisonDenied extends Error {
   constructor(readonly comparison: NonNullable<LifecycleCleanupEvidence['comparison']>, readonly capability: CapabilityCloseEvidence[]) {
     super(comparison.reason);
   }
+}
+
+function isAuthorizedBoundPointerForFinalization(
+  binding: LaunchSessionBinding,
+  context: SessionPointerContext,
+  candidateSessionId: string,
+  pointer: SessionPointerReadResult,
+  phase: 'preLock' | 'under-lock',
+): boolean {
+  traceSessionFinalizationOperation(`${phase}-status:${pointer.status}`);
+  if (pointer.status === 'usable') {
+    traceSessionFinalizationOperation(`${phase}-usable-branch-enter`);
+    return isAuthorizedBoundPointer(binding, context, candidateSessionId, pointer.state);
+  }
+  if (pointer.status === 'stale-dead') {
+    traceSessionFinalizationOperation(`${phase}-stale-dead-branch-enter`);
+    return isAuthorizedBoundStaleDeadPointer(binding, context, candidateSessionId, pointer.state);
+  }
+  if (pointer.status === 'identity-indeterminate') {
+    traceSessionFinalizationOperation(`${phase}-identity-indeterminate-branch-enter`);
+    const sameProcess = pointer.state?.pid === process.pid;
+    traceSessionFinalizationOperation(`${phase}-identity-indeterminate-current-pid:${sameProcess ? 'true' : 'false'}`);
+    return sameProcess && isAuthorizedBoundPointer(binding, context, candidateSessionId, pointer.state);
+  }
+  traceSessionFinalizationOperation(`${phase}-unsupported-status`);
+  return false;
 }
 
 async function authorizeBoundDirectoryBeforeTransaction(
@@ -3037,13 +3067,10 @@ export async function writeSessionEnd(
       lockPath: context.lockPath, reason: `Unable to read selected session pointer: ${errorMessage(error)}`, cause: error,
     });
   }
-  const preLockAuthorizedBoundUsable = preLockPointer.status === 'usable'
-    && isAuthorizedBoundPointer(options.binding, context, candidateSessionId, preLockPointer.state);
-  const preLockAuthorizedBoundStaleDead = preLockPointer.status === 'stale-dead'
-    && isAuthorizedBoundStaleDeadPointer(options.binding, context, candidateSessionId, preLockPointer.state);
-  if (!preLockAuthorizedBoundUsable && !preLockAuthorizedBoundStaleDead) {
-    throw unusablePointerAbort(context, candidateSessionId, preLockPointer);
-  }
+  const preLockAuthorized = isAuthorizedBoundPointerForFinalization(
+    options.binding, context, candidateSessionId, preLockPointer, 'preLock',
+  );
+  if (!preLockAuthorized) throw unusablePointerAbort(context, candidateSessionId, preLockPointer);
   traceSessionFinalizationOperation('pre-transaction-auth-start');
   await authorizeBoundDirectoryBeforeTransaction(
     options.binding,
@@ -3084,13 +3111,10 @@ export async function writeSessionEnd(
         cause: error,
       });
     }
-    const authorizedBoundUsable = pointer.status === 'usable'
-      && isAuthorizedBoundPointer(options.binding, context, candidateSessionId, pointer.state);
-    const authorizedBoundStaleDead = pointer.status === 'stale-dead'
-      && isAuthorizedBoundStaleDeadPointer(options.binding, context, candidateSessionId, pointer.state);
-    if (!authorizedBoundUsable && !authorizedBoundStaleDead) {
-      throw unusablePointerAbort(context, candidateSessionId, pointer);
-    }
+    const authorized = isAuthorizedBoundPointerForFinalization(
+      options.binding, context, candidateSessionId, pointer, 'under-lock',
+    );
+    if (!authorized) throw unusablePointerAbort(context, candidateSessionId, pointer);
     traceSessionFinalizationOperation('under-lock-auth-start');
     const authorization = await authorizeBoundDirectoryBeforeTransaction(
       options.binding,
