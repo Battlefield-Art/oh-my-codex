@@ -22,7 +22,7 @@ import {
   unlink as nodeUnlink,
   writeFile as nodeWriteFile,
 } from 'fs/promises';
-import { constants as fsConstants, readFileSync } from 'fs';
+import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from 'fs';
 import type { FileHandle } from 'fs/promises';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'crypto';
@@ -2609,22 +2609,22 @@ async function authorizeBoundDirectoryBeforeTransaction(
         pointerRaw: pointer.raw,
       };
     }
-    const retained = await lease.handle?.stat({ bigint: true });
+    const retained = fstatSync(lease.handle!.fd, { bigint: true });
     if (!retained || !retained.isDirectory() || retained.dev !== binding.directoryIdentity.dev || retained.ino !== binding.directoryIdentity.ino) {
       throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'retained-directory-identity-mismatch' }, capability);
     }
     const canonical = await realpath(binding.context.baseStateDir);
-    const handle = await open(canonical, 'r');
+    const fd = openSync(canonical, 'r');
     let matched = false;
     try {
-      const stats = await handle.stat({ bigint: true });
+      const stats = fstatSync(fd, { bigint: true });
       matched = canonical === binding.canonicalRealpath
         && stats.isDirectory()
         && stats.dev === binding.directoryIdentity.dev
         && stats.ino === binding.directoryIdentity.ino;
     } finally {
       try {
-        await handle.close();
+        closeSync(fd);
         capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'closed' });
       } catch (error) {
         capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'failed', error: safeError(error) });
@@ -2647,7 +2647,7 @@ async function consumeBoundDirectoryAuthorizationUnderLock(
   if (authorization.comparison?.status !== 'matched' || binding.directoryIdentity.kind !== 'supported') return authorization;
   const lease = bindingLeases.get(binding);
   try {
-    const retained = await lease?.handle?.stat({ bigint: true });
+    const retained = lease?.handle ? fstatSync(lease.handle.fd, { bigint: true }) : undefined;
     if (!retained || !retained.isDirectory() || retained.dev !== binding.directoryIdentity.dev || retained.ino !== binding.directoryIdentity.ino) {
       throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'retained-directory-identity-mismatch' }, authorization.capability);
     }
@@ -2658,17 +2658,17 @@ async function consumeBoundDirectoryAuthorizationUnderLock(
       );
     }
     const canonical = await realpath(binding.context.baseStateDir);
-    const handle = await open(canonical, 'r');
+    const fd = openSync(canonical, 'r');
     let matched = false;
     try {
-      const stats = await handle.stat({ bigint: true });
+      const stats = fstatSync(fd, { bigint: true });
       matched = canonical === binding.canonicalRealpath
         && stats.isDirectory()
         && stats.dev === binding.directoryIdentity.dev
         && stats.ino === binding.directoryIdentity.ino;
     } finally {
       try {
-        await handle.close();
+        closeSync(fd);
         authorization.capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'closed' });
       } catch (error) {
         authorization.capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'failed', error: safeError(error) });
