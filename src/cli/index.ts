@@ -1543,14 +1543,14 @@ function detachedLeaderAuthorityCondition(authority: DetachedLeaderAuthority, re
   return conditions.reduce((combined, condition) => `#{&&:${combined},${condition}}`);
 }
 
-function detachedHudAuthorityCondition(authority: DetachedHudAuthority): string {
+function detachedHudAuthorityCondition(authority: DetachedHudAuthority, requireMarker = true): string {
   const conditions = [
     "#{==:#{pane_dead},0}",
     `#{==:#{pane_id},${authority.paneId}}`,
     `#{==:#{pane_pid},${authority.panePid}}`,
     `#{==:#{session_id},${authority.sessionId}}`,
     `#{==:#{window_id},${authority.windowId}}`,
-    `#{m:*OMX_DETACHED_HUD_OPERATION=${authority.operationMarker}*,#{pane_start_command}}`,
+    ...(requireMarker ? [`#{m:*OMX_DETACHED_HUD_OPERATION=${authority.operationMarker}*,#{pane_start_command}}`] : []),
   ];
   return conditions.reduce((combined, condition) => `#{&&:${combined},${condition}}`);
 }
@@ -1595,10 +1595,11 @@ function runDetachedHudMutation(
   leaderAuthority: DetachedLeaderAuthority,
   hudAuthority: DetachedHudAuthority,
   args: string[],
+  requireMarker = true,
 ): void {
   const receipt = detachedAuthorityReceipt();
   const success = `${args.map(quoteShellArg).join(" ")} ; display-message -p ${quoteShellArg(receipt)}`;
-  const hudGuard = `if-shell -F -t ${quoteShellArg(hudAuthority.paneId)} ${quoteShellArg(detachedHudAuthorityCondition(hudAuthority))} ${quoteShellArg(success)} ${quoteShellArg("display-message -p ''")}`;
+  const hudGuard = `if-shell -F -t ${quoteShellArg(hudAuthority.paneId)} ${quoteShellArg(detachedHudAuthorityCondition(hudAuthority, requireMarker))} ${quoteShellArg(success)} ${quoteShellArg("display-message -p ''")}`;
   const output = execTmuxFileSync([
     "if-shell", "-F", "-t", leaderAuthority.paneId, detachedLeaderAuthorityCondition(leaderAuthority),
     hudGuard, "display-message -p ''",
@@ -6884,7 +6885,7 @@ function teardownDetachedOwnedHudPane(leaderPaneId: string, payload: DetachedLea
   if (!hudProof) return;
   try {
     const leaderAuthority = captureDetachedLeaderAuthority(leaderPaneId, payload.sessionName, payload.sessionId);
-    runDetachedHudMutation(leaderAuthority, hudProof, ["kill-pane", "-t", hudProof.paneId]);
+    runDetachedHudMutation(leaderAuthority, hudProof, ["kill-pane", "-t", hudProof.paneId], false);
   } catch (error) {
     logCliOperationFailure(error);
   }
