@@ -9,8 +9,8 @@ import { describe, it, type TestContext } from 'node:test';
 import {
   applyDetachedTerminalExitStatus,
   buildDetachedSessionBootstrapSteps,
+  DETACHED_LEADER_READY_TIMEOUT_MS,
   publishDetachedReleaseMarker,
-  parseDetachedLeaderPaneIdByPid,
   probeExactDetachedSessionExists,
   resolveDetachedAttachExitStatus,
 } from '../index.js';
@@ -190,6 +190,9 @@ function writeChild(wd: string, body: string): string {
 }
 
 describe('detached leader HUD teardown', () => {
+  it('keeps the detached readiness window above slow macOS prelaunch completion', () => {
+    assert.equal(DETACHED_LEADER_READY_TIMEOUT_MS, 120_000);
+  });
   it('tears down the proven HUD pane and session after a zero-status child exit', async (t) => {
     if (!skipUnlessTmux(t)) return;
     const wd = mkdtempSync(join(tmpdir(), 'omx-detached-leader-zero-'));
@@ -322,20 +325,6 @@ describe('detached leader HUD teardown', () => {
       process.exitCode = previousExitCode;
       rmSync(wd, { recursive: true, force: true });
     }
-  });
-
-  it('derives the detached leader pane from the live pane PID instead of inherited TMUX_PANE', () => {
-    const snapshot = [
-      '%1\t0\t111',
-      '%2\t1\t222',
-      '%3\t0\t333',
-    ].join('\n');
-    assert.equal(parseDetachedLeaderPaneIdByPid(snapshot, 333), '%3');
-    assert.throws(() => parseDetachedLeaderPaneIdByPid(snapshot, 222), /pane identity is unavailable/);
-    assert.throws(
-      () => parseDetachedLeaderPaneIdByPid(`${snapshot}\n%4\t0\t333`, 333),
-      /pane identity is unavailable/,
-    );
   });
 
   it('publishes an optional HUD authority proof exactly', () => {
