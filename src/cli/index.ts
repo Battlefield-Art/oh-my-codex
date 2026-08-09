@@ -136,7 +136,6 @@ import {
   readSessionPointer,
   readSessionState,
   resolveSessionPointerContext,
-  updateDetachedSessionMetadata,
   finalizeBoundOnce,
   isSessionPointerLaunchAbort,
   normalizeSessionId,
@@ -2983,6 +2982,20 @@ function detachedFailureCode(error: unknown): string {
 }
 
 
+export function describeDetachedLeaderFailure(error: unknown): string {
+  const describe = (value: unknown, depth: number): string => {
+    if (depth > 4) return "nested failure";
+    if (value instanceof AggregateError) {
+      return [value.message, ...[...value.errors].map((child) => describe(child, depth + 1))]
+        .filter(Boolean)
+        .join(": ");
+    }
+    if (value instanceof Error) return value.message;
+    return String(value);
+  };
+  return describe(error, 0).replace(/[\r\n\t]+/g, " ").slice(0, 1_024);
+}
+
 export class DetachedLaunchSafetyError extends Error {
   readonly name = "DetachedLaunchSafetyError";
   constructor(
@@ -2990,7 +3003,7 @@ export class DetachedLaunchSafetyError extends Error {
     readonly cause: unknown,
     readonly report: DetachedBootstrapReport,
   ) {
-    super(`detached launch safety failure during ${phase}`);
+    super(`detached launch safety failure during ${phase}${phase === "completion" && cause instanceof Error ? `: ${cause.message}` : ""}`);
   }
 }
 
@@ -3085,7 +3098,11 @@ export async function executeDetachedLaunchStateMachine<Binding, InertSession, P
         report.rollback.failures.push({ step: "setup-finalization", status: "failed", code: detachedFailureCode(finalizationError) });
         failures.push(finalizationError);
       }
-      throw new DetachedLaunchSafetyError("completion", new AggregateError(failures, `preLaunch ${completion.operation} failed`), report);
+      throw new DetachedLaunchSafetyError(
+        "completion",
+        new AggregateError(failures, `preLaunch ${completion.operation} failed: ${describeDetachedLeaderFailure(completion.error)}`),
+        report,
+      );
     }
     transition("D3");
     const inertSession = await deps.createInertSession();
@@ -6024,8 +6041,13 @@ interface EstablishedPreLaunchBinding {
   readonly cleanup: EstablishmentCleanupEvidence;
 }
 
-async function establishPreLaunchBinding(cwd: string, sessionId: string): Promise<EstablishedPreLaunchBinding> {
-  const established = await establishLaunchSessionBinding(cwd, sessionId, await resolvePreLaunchSessionPointerOptions());
+async function establishPreLaunchBinding(
+  cwd: string,
+  sessionId: string,
+  metadata: { tmuxSessionName?: string; tmuxPaneId?: string } = {},
+): Promise<EstablishedPreLaunchBinding> {
+  const pointerOptions = await resolvePreLaunchSessionPointerOptions();
+  const established = await establishLaunchSessionBinding(cwd, sessionId, { ...pointerOptions, ...metadata });
   if (established.kind === "committed-released") return { binding: established.binding, cleanup: established.cleanup };
   const error = established.kind === "precommit-aborted" ? established.abort : established.error;
   Object.assign(error, { establishmentCleanup: established.cleanup });
@@ -6888,7 +6910,10 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
     pane = parseDetachedLeaderPaneIdByPid(paneSnapshot, process.pid);
   }
   process.env.TMUX_PANE = pane;
-  const established = await establishPreLaunchBinding(payload.cwd, payload.sessionId);
+  const established = await establishPreLaunchBinding(payload.cwd, payload.sessionId, {
+    tmuxSessionName: payload.sessionName,
+    tmuxPaneId: pane,
+  });
   const binding = established.binding;
   let ownedRecord: DetachedActiveRecordOwnership | undefined;
   let detachedHudProof: DetachedHudAuthority | undefined;
@@ -6900,11 +6925,6 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
   let externalInterrupt: NodeJS.Signals | undefined;
 
   try {
-    const metadata = await updateDetachedSessionMetadata(binding, {
-      tmuxSessionName: payload.sessionName,
-      tmuxPaneId: pane,
-    });
-    if (metadata.kind !== "committed-released") throw new Error("detached leader metadata update denied");
     const completion = await completePreLaunchSetup(
       payload.cwd,
       payload.sessionId,
@@ -7034,7 +7054,10 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       finalized = true;
       await cleanupRuntimeCodexHome(payload.runtimeCodexHomeForCleanup, payload.projectLocalCodexHomeForCleanup);
     } catch (lifecycleError) {
-      failure = new AggregateError([error, lifecycleError], "detached leader failure finalization did not complete");
+      failure = new AggregateError(
+        [error, lifecycleError],
+        `detached leader failure finalization did not complete: launch=${describeDetachedLeaderFailure(error)}; lifecycle=${describeDetachedLeaderFailure(lifecycleError)}`,
+      );
     }
     if (finalized && ownedRecord) {
       try {

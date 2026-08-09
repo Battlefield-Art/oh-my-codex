@@ -536,7 +536,7 @@ describe("detached launch state machine", () => {
     await assert.rejects(() => executeDetachedLaunchStateMachine(
       { preflight: { kind: "available", shouldAttach: true, report: { transitions: ["D0"], rollback: { attempted: [], failures: [] } } } },
       deps,
-    ));
+    ), /preLaunch session-instructions failed: instructions/);
     assert.deepEqual(events, ["D1", "D2", "finalize-setup-failure", "rollback"]);
   });
 

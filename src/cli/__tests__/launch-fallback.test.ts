@@ -2858,7 +2858,12 @@ exit 0
       const descendantPid = Number.parseInt((await readFile(descendantPidPath, 'utf-8')).trim(), 10);
       assert.equal(Number.isSafeInteger(descendantPid) && descendantPid > 0, true);
       assert.equal(existsSync(readyPath), true);
-      assert.equal(existsSync(join(wd, '.omx', 'state', 'session.json')), true);
+      const sessionState = JSON.parse(await readFile(join(wd, '.omx', 'state', 'session.json'), 'utf-8')) as {
+        tmux_session_name?: string;
+        tmux_pane_id?: string;
+      };
+      assert.equal(sessionState.tmux_session_name, 'omx-detached-leader-process');
+      assert.equal(sessionState.tmux_pane_id, '%3202');
       assert.equal(existsSync(join(wd, '.omx', 'state', 'detached-active-record.json')), true);
       await writeFile(childRelease, 'release\n');
       const exitCode = await new Promise<number | null>((resolveExit, rejectExit) => {

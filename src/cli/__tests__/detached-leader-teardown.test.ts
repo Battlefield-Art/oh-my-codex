@@ -12,6 +12,7 @@ import {
   DETACHED_LEADER_READY_TIMEOUT_MS,
   cleanupDetachedPreReportSession,
   decodeDetachedLeaderPayload,
+  describeDetachedLeaderFailure,
   publishDetachedReleaseMarker,
   parseDetachedLeaderPaneIdByPid,
   isDetachedReadyReportAuthorized,
@@ -218,6 +219,17 @@ describe('detached leader HUD teardown', () => {
       preLaunchOptions: { ...payload.preLaunchOptions, shouldAttach: 'false' },
     })).toString('base64url');
     assert.throws(() => decodeDetachedLeaderPayload(invalid), /invalid detached leader payload/);
+  });
+
+  it('preserves bounded nested detached failure causes without control characters', () => {
+    const failure = new AggregateError(
+      [new Error('metadata bind denied'), new Error('session pointer unusable\nretry denied')],
+      'leader finalization failed',
+    );
+    assert.equal(
+      describeDetachedLeaderFailure(failure),
+      'leader finalization failed: metadata bind denied: session pointer unusable retry denied',
+    );
   });
 
   it('derives the detached leader pane from the live pane PID instead of inherited TMUX_PANE', () => {
