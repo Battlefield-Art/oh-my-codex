@@ -75,12 +75,14 @@ describe('#3194 ralplan CLI unsupported-only surface', () => {
     assert.deepEqual(JSON.parse(result.stdout.join('\n')), { ok: false, reason: 'unsupported_documented_leader_proof' });
   });
 
-  it('normalizes prefixed and bare reviewed versions with first-token precedence', async () => {
+  it('normalizes prefixed, bare, stable, and prerelease reviewed versions with first-token precedence', async () => {
     for (const [output, expected] of [
       ['codex-cli 0.145.0', '0.145.0'],
       ['codex 0.145.0', '0.145.0'],
       ['0.145.0', '0.145.0'],
       ['v0.146.1', '0.146.1'],
+      ['codex-cli 0.148.0-alpha.5', '0.148.0-alpha.5'],
+      ['v0.148.0-alpha.5', '0.148.0-alpha.5'],
       ['0.145.0\n0.144.5', '0.145.0'],
     ] as const) {
       const result = await invoke(['preflight', '--json'], {
@@ -92,22 +94,23 @@ describe('#3194 ralplan CLI unsupported-only surface', () => {
     }
   });
 
-  it('keeps malformed, future, and over-limit diagnostics non-authorizing', async () => {
+  it('keeps malformed, unreviewed, and over-limit diagnostics non-authorizing', async () => {
     const cases = [
-      { status: 'ok', collected: { output: 'codex-cli malformed', truncated: false, lineLimitExceeded: false } },
-      { status: 'ok', collected: { output: 'codex-cli 0.147.0', truncated: false, lineLimitExceeded: false } },
-      { status: 'ok', collected: { output: 'codex-cli 0.146.1', truncated: true, lineLimitExceeded: false } },
-      { status: 'ok', collected: { output: 'codex-cli 0.146.1', truncated: false, lineLimitExceeded: true } },
+      { probe: { status: 'ok', collected: { output: 'codex-cli malformed', truncated: false, lineLimitExceeded: false } }, detectedVersion: null },
+      { probe: { status: 'ok', collected: { output: 'codex-cli 0.147.0', truncated: false, lineLimitExceeded: false } }, detectedVersion: '0.147.0' },
+      { probe: { status: 'ok', collected: { output: 'codex-cli 0.148.0-alpha.4', truncated: false, lineLimitExceeded: false } }, detectedVersion: '0.148.0-alpha.4' },
+      { probe: { status: 'ok', collected: { output: 'codex-cli 0.148.0', truncated: false, lineLimitExceeded: false } }, detectedVersion: '0.148.0' },
+      { probe: { status: 'ok', collected: { output: `codex-cli 0.148.0-${'a'.repeat(65)}`, truncated: false, lineLimitExceeded: false } }, detectedVersion: null },
+      { probe: { status: 'ok', collected: { output: 'codex-cli 0.146.1', truncated: true, lineLimitExceeded: false } }, detectedVersion: null },
+      { probe: { status: 'ok', collected: { output: 'codex-cli 0.146.1', truncated: false, lineLimitExceeded: true } }, detectedVersion: null },
     ] as const;
-    for (const probeResult of cases) {
+    for (const { probe, detectedVersion } of cases) {
       const result = await invoke(['preflight', '--json'], {
-        probeCodexVersionDetailed: () => probeResult,
+        probeCodexVersionDetailed: () => probe,
       });
       const body = JSON.parse(result.stdout.join('\n'));
       assert.equal(body.diagnostics.documented_root_identity.status, 'unknown');
-      if (probeResult.status === 'ok' && (probeResult.collected.truncated || probeResult.collected.lineLimitExceeded)) {
-        assert.equal(body.diagnostics.detected_version, null);
-      }
+      assert.equal(body.diagnostics.detected_version, detectedVersion);
     }
   });
 
