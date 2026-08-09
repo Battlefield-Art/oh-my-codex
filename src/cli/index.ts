@@ -1607,9 +1607,13 @@ function runDetachedHudMutation(
   if (output !== receipt) throw new Error("detached leader or HUD authority changed before tmux mutation");
 }
 
-export function cleanupDetachedHudPane(authority: DetachedHudAuthority): void {
+function detachedTaggedHudCleanupCondition(authority: DetachedHudAuthority, ownerId: string): string {
+  return `#{&&:#{==:#{pane_dead},0},#{&&:#{==:#{pane_id},${authority.paneId}},#{&&:#{==:#{session_id},${authority.sessionId}},#{==:#{@omx_hud_owner},${ownerId}}}}}`;
+}
+
+export function cleanupDetachedHudPane(authority: DetachedHudAuthority, ownerId?: string): void {
   execTmuxFileSync([
-    "if-shell", "-F", "-t", authority.paneId, detachedHudAuthorityCondition(authority, false),
+    "if-shell", "-F", "-t", authority.paneId, ownerId ? detachedTaggedHudCleanupCondition(authority, ownerId) : detachedHudAuthorityCondition(authority, false),
     `kill-pane -t ${quoteShellArg(authority.paneId)}`, "",
   ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
   for (let attempt = 0; attempt < 50; attempt += 1) {
@@ -6920,10 +6924,11 @@ function teardownDetachedOwnedHudPane(payload: DetachedLeaderPayload, hudProof: 
   // session is deliberately preserved, which intentionally keeps that session (and any
   // attached client) alive; natural closure and shell return happen only when no other
   // panes remain.
-  const proof = discoverDetachedHudAuthority(payload.sessionName, payload.sessionId) ?? hudProof;
+  const discovered = discoverDetachedHudAuthority(payload.sessionName, payload.sessionId);
+  const proof = discovered ?? hudProof;
   if (!proof) return;
   try {
-    cleanupDetachedHudPane(proof);
+    cleanupDetachedHudPane(proof, discovered ? payload.sessionId : undefined);
   } catch (error) {
     logCliOperationFailure(error);
   }

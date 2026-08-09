@@ -317,7 +317,7 @@ describe('detached leader HUD teardown', () => {
       const discovered = discoverDetachedHudAuthority(fixture.sessionName, 'owner-zero');
       assert.equal(discovered?.paneId, paneId);
       assert.equal(discovered?.panePid, Number(panePidRaw));
-      cleanupDetachedHudPane({ paneId, panePid: Number(panePidRaw), sessionId, windowId, operationMarker: randomUUID() });
+      cleanupDetachedHudPane({ paneId, panePid: Number(panePidRaw), sessionId, windowId, operationMarker: randomUUID() }, 'owner-zero');
       await poll('proven HUD pane removal', () => !fixture.run(['list-panes', '-a', '-F', '#{pane_id}']).split('\n').includes(paneId) ? true : undefined);
       process.kill(Number(leaderPidRaw), 'SIGTERM');
       await poll('last-pane session destruction', () => !fixture.sessionExists() ? true : undefined);
@@ -337,7 +337,7 @@ describe('detached leader HUD teardown', () => {
       if (!paneId || !sessionId || !windowId) throw new Error('invalid unrelated-pane fixture');
       fixture.run(['set-option', '-pq', '-t', paneId, '@omx_hud_owner', 'owner-user-pane']);
       assert.equal(discoverDetachedHudAuthority(fixture.sessionName, 'owner-user-pane')?.paneId, paneId);
-      cleanupDetachedHudPane({ paneId, panePid: Number(panePidRaw), sessionId, windowId, operationMarker: randomUUID() });
+      cleanupDetachedHudPane({ paneId, panePid: Number(panePidRaw), sessionId, windowId, operationMarker: randomUUID() }, 'owner-user-pane');
       process.kill(Number(leaderPidRaw), 'SIGTERM');
       await poll('unrelated pane survives leader exit', () => fixture.sessionExists() ? true : undefined);
       assert.equal(fixture.run(['display-message', '-p', '-t', userPaneId, '#{pane_id}']), userPaneId);
