@@ -18,6 +18,7 @@ import {
 import { buildPtyScriptCommand, isRealScriptAvailable, isRealTmuxAvailable, withTempTmuxSession } from '../../team/__tests__/tmux-test-fixture.js';
 
 const CLI_SPAWN_TIMEOUT_MS = 60_000;
+const DARWIN_PTY_FINALIZATION_POLL_LIMIT = 600;
 function buildRunOmxEnv(envOverrides: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(env)) {
@@ -2937,7 +2938,7 @@ exit 0
           ].join('; ');
           const command = `${envPrefix}; cd ${JSON.stringify(wd)} || exit 125; ${JSON.stringify(process.execPath)} ${JSON.stringify(omxBin)} --tmux ${JSON.stringify('e2e prompt')}; child_status=$?; printf '\n%s:%s\n' 'omx-follow-up' "$child_status"; exit "$child_status"`;
           if (process.platform === 'darwin') {
-            const result = fixture.runPtyResult(command);
+            const result = fixture.runPtyResult(command, { pollLimit: DARWIN_PTY_FINALIZATION_POLL_LIMIT });
             let diagnostics = '';
             if (result.error) {
               const sessions = fixture.runResult(['list-sessions', '-F', '#{session_name}']);

@@ -26,7 +26,7 @@ export interface TempTmuxSessionFixture {
   sessionExists: (targetSessionName?: string) => boolean;
   run: (args: string[]) => string;
   runResult: (args: string[]) => { status: number | null; stdout: string; stderr: string; error: string };
-  runPtyResult: (command: string) => { status: number | null; stdout: string; stderr: string; error: string };
+  runPtyResult: (command: string, options?: { pollLimit?: number }) => { status: number | null; stdout: string; stderr: string; error: string };
   createPathShim: (directory: string, commandLogPath?: string) => Promise<string>;
   triggerClientResize: (
     targetSession: string,
@@ -334,10 +334,11 @@ export async function withTempTmuxSession<T>(
     runTmux(['set-environment', '-g', 'PATH', `${directory}${delimiter}${process.env.PATH ?? ''}`], tmuxOptions);
     return shimPath;
   };
-  const runPtyCommandResult = (command: string): PtyCommandResult => runPtyResult(command, {
+  const runPtyCommandResult = (command: string, options: { pollLimit?: number } = {}): PtyCommandResult => runPtyResult(command, {
     platform: process.platform,
     syntheticServer: serverKind === 'synthetic',
     sessionName,
+    pollLimit: options.pollLimit,
     run: (args) => runTmux(args, tmuxOptions),
     runResult: (args) => runTmuxResult(args, tmuxOptions),
     sleep: () => spawnSync('sleep', ['0.05'], { stdio: 'ignore' }),

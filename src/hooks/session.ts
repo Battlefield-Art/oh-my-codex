@@ -22,7 +22,7 @@ import {
   unlink as nodeUnlink,
   writeFile as nodeWriteFile,
 } from 'fs/promises';
-import { closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from 'fs';
+import { appendFileSync, closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from 'fs';
 import type { FileHandle } from 'fs/promises';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'crypto';
@@ -266,6 +266,13 @@ const LOCK_RETRY_DELAYS_MS = [25, 50, 100] as const;
 const DEFAULT_POINTER_TIMEOUT_MS = 5_000;
 const NATIVE_POINTER_TIMEOUT_MS = 2_000;
 
+
+function traceSessionFinalizationOperation(operation: string): void {
+  if (process.env.OMX_TEST_DETACHED_TRACE !== '1') return;
+  const tracePath = process.env.OMX_TEST_DETACHED_TRACE_PATH;
+  if (!tracePath) return;
+  appendFileSync(tracePath, `[omx-test-session-finalization] ${operation}\n`);
+}
 /**
  * Convert arbitrary input into a valid session ID without exposing validator
  * exceptions to lifecycle or hook inputs.
@@ -3001,8 +3008,10 @@ export async function writeSessionEnd(
   }
 
   let preLockPointer: SessionPointerReadResult;
+  traceSessionFinalizationOperation('preLock-read-start');
   try {
     preLockPointer = await readSessionPointer(context);
+    traceSessionFinalizationOperation('preLock-read-done');
   } catch (error) {
     throw resolvedAbort(context, {
       code: 'session_pointer_io_failure', operation: 'pointer-read', candidateSessionId,
@@ -3016,14 +3025,17 @@ export async function writeSessionEnd(
   if (!preLockAuthorizedBoundUsable && !preLockAuthorizedBoundStaleDead) {
     throw unusablePointerAbort(context, candidateSessionId, preLockPointer);
   }
+  traceSessionFinalizationOperation('pre-transaction-auth-start');
   await authorizeBoundDirectoryBeforeTransaction(
     options.binding,
     preLockPointer,
     options.postLaunchCwd ?? options.binding.context.cwd,
   );
+  traceSessionFinalizationOperation('pre-transaction-auth-done');
 
   const platform = options.platform ?? process.platform;
   const tracker: RegularFileDurabilityTracker = { degraded: false };
+  traceSessionFinalizationOperation('acquirePointerLock-start');
   const lock = await acquirePointerLock(
     context,
     candidateSessionId,
@@ -3032,14 +3044,17 @@ export async function writeSessionEnd(
     tracker,
     options.regularFileSync,
   );
+  traceSessionFinalizationOperation('acquirePointerLock-done');
   let primary: unknown;
   let revalidation: { comparison: LifecycleCleanupEvidence['comparison']; capability: CapabilityCloseEvidence[] } = {
     comparison: { status: 'not-run' }, capability: [],
   };
   try {
     let pointer: SessionPointerReadResult;
+    traceSessionFinalizationOperation('under-lock-read-start');
     try {
       pointer = await readSessionPointer(context);
+      traceSessionFinalizationOperation('under-lock-read-done');
     } catch (error) {
       throw resolvedAbort(context, {
         code: 'session_pointer_io_failure',
@@ -3057,12 +3072,16 @@ export async function writeSessionEnd(
     if (!authorizedBoundUsable && !authorizedBoundStaleDead) {
       throw unusablePointerAbort(context, candidateSessionId, pointer);
     }
+    traceSessionFinalizationOperation('under-lock-auth-start');
     const authorization = await authorizeBoundDirectoryBeforeTransaction(
       options.binding,
       pointer,
       options.postLaunchCwd ?? options.binding.context.cwd,
     );
+    traceSessionFinalizationOperation('under-lock-auth-done');
+    traceSessionFinalizationOperation('under-lock-consume-start');
     revalidation = await consumeBoundDirectoryAuthorizationUnderLock(options.binding, authorization, pointer);
+    traceSessionFinalizationOperation('under-lock-consume-done');
 
     const state = pointer.state!;
     const ownsCurrentSessionFile = true;
@@ -3082,12 +3101,19 @@ export async function writeSessionEnd(
       ...(!ownsCurrentSessionFile && state?.session_id ? { preserved_active_session_id: state.session_id } : {}),
     };
 
+    traceSessionFinalizationOperation('history-mkdir-start');
     await nodeMkdir(historyDirectory(context), { recursive: true });
+    traceSessionFinalizationOperation('history-mkdir-done');
+    traceSessionFinalizationOperation('history-append-start');
     await appendFile(historyPath(context), `${JSON.stringify(historyEntry)}\n`);
+    traceSessionFinalizationOperation('history-append-done');
+    traceSessionFinalizationOperation('hud-cleanup-start');
     await removeDeadSessionHudState(context, [
       ...(ownsCurrentSessionFile ? [state?.session_id, state?.native_session_id] : []),
       candidateSessionId,
     ]);
+    traceSessionFinalizationOperation('hud-cleanup-done');
+    traceSessionFinalizationOperation('session-unlink-start');
     if (ownsCurrentSessionFile) {
       try {
         await transactionDependencies.fs.unlink(context.sessionPath);
@@ -3095,6 +3121,8 @@ export async function writeSessionEnd(
         if (!isNotFound(error)) throw error;
       }
     }
+    traceSessionFinalizationOperation('session-unlink-done');
+    traceSessionFinalizationOperation('session-end-log-start');
     await appendToLogAtContext(context, {
       event: 'session_end',
       session_id: historyEntry.session_id,
@@ -3103,11 +3131,14 @@ export async function writeSessionEnd(
       ...(historyEntry.preserved_active_session_id ? { preserved_active_session_id: historyEntry.preserved_active_session_id } : {}),
       timestamp: endTime,
     }).catch(() => {});
+    traceSessionFinalizationOperation('session-end-log-done');
   } catch (error) {
     primary = error;
   }
 
+  traceSessionFinalizationOperation('lock-release-start');
   const releaseFailures = await releasePointerLock(lock);
+  traceSessionFinalizationOperation('lock-release-done');
   if (primary) {
     if (isSessionPointerLaunchAbort(primary) && releaseFailures.length > 0) {
       throw recoveryAbort(context, primary as ResolvedSessionPointerAbort, releaseFailures, 'lock-release');
