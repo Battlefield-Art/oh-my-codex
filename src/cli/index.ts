@@ -1634,9 +1634,10 @@ function tagDetachedHudPane(leaderAuthority: DetachedLeaderAuthority, authority:
   ], false);
 }
 
+
 export function discoverDetachedHudAuthority(sessionName: string, ownerId: string): DetachedHudAuthority | undefined {
   const rows = execTmuxFileSync([
-    "list-panes", "-t", sessionName, "-F",
+    "list-panes", "-a", "-F",
     "#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_name}\t#{session_id}\t#{session_created}\t#{window_id}\t#{@omx_hud_owner}",
   ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
   const matches = rows.split("\n").map((line) => line.trim()).filter(Boolean).flatMap((line) => {
