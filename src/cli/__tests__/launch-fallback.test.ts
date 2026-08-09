@@ -2942,7 +2942,7 @@ exit 0
               const sessions = fixture.runResult(['list-sessions', '-F', '#{session_name}']);
               for (const session of sessions.stdout.split('\n').filter((name) => name.startsWith('omx-'))) {
                 const panes = fixture.runResult([
-                  'list-panes', '-t', session, '-F', '#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_current_command}\t#{@omx_instance_id}',
+                  'list-panes', '-t', session, '-F', '#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t#{pane_current_command}\t#{@omx_instance_id}\t#{@omx_hud_owner}',
                 ]);
                 diagnostics += `\n[${session}]\n${panes.stdout}`;
                 for (const paneLine of panes.stdout.split('\n').filter(Boolean)) {
