@@ -2558,15 +2558,11 @@ function isAuthorizedBoundPointer(
     && normalizeSessionId(state.session_id) !== undefined
     && state.native_session_id === state.session_id;
   if (!directCanonicalIdentity && !replacedNativeIdentity) return false;
-  try {
-    return context.rootSource === binding.context.rootSource
-      && context.baseStateDir === binding.context.baseStateDir
-      && context.sessionPath === binding.context.sessionPath
-      && sameFilePath(context.cwd, binding.context.cwd)
-      && sameFilePath(state.cwd, binding.context.cwd);
-  } catch {
-    return false;
-  }
+  return context.rootSource === binding.context.rootSource
+    && context.baseStateDir === binding.context.baseStateDir
+    && context.sessionPath === binding.context.sessionPath
+    && context.cwd === binding.context.cwd
+    && state.cwd === binding.context.cwd;
 }
 
 function isAuthorizedBoundStaleDeadPointer(
