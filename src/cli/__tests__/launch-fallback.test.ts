@@ -1,6 +1,6 @@
 import { describe, it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
@@ -2927,6 +2927,7 @@ exit 0
           const envPrefix = [
             'unset TMUX TMUX_PANE',
             'export OMX_TEST_DETACHED_TRACE=1',
+            `export OMX_TEST_DETACHED_TRACE_PATH=${JSON.stringify(join(wd, 'detached-trace.log'))}`,
             `export HOME=${JSON.stringify(home)}`,
             `export PATH=${JSON.stringify(bin)}:$PATH`,
             'export OMX_AUTO_UPDATE=0',
@@ -2951,6 +2952,8 @@ exit 0
                   diagnostics += `\n[${paneLine}]\n${fixture.runResult(['capture-pane', '-p', '-t', paneId, '-S', '-']).stdout}`;
                 }
               }
+              const tracePath = join(wd, 'detached-trace.log');
+              if (existsSync(tracePath)) diagnostics += `\n[detached-trace]\n${readFileSync(tracePath, 'utf-8')}`;
             }
             return { status: result.status, output: `${result.stdout}\n${result.stderr}${diagnostics}`, error: result.error };
           }

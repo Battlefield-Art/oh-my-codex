@@ -5,7 +5,7 @@
 
 import { execFileSync, spawn } from "child_process";
 import { basename, dirname, isAbsolute, join, posix, relative, resolve, win32 } from "path";
-import { chmodSync, closeSync, constants as fsConstants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "fs";
+import { appendFileSync, chmodSync, closeSync, constants as fsConstants, existsSync, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, unlinkSync, writeFileSync } from "fs";
 import { copyFile, cp, lstat, mkdir, open, readFile, readdir, rm, stat, symlink, utimes, writeFile } from "fs/promises";
 import { constants as osConstants, homedir } from "os";
 import { createHash, randomUUID } from "crypto";
@@ -6935,12 +6935,17 @@ function teardownDetachedOwnedHudPane(leaderPaneId: string, payload: DetachedLea
     cleanupDetachedHudPane(proof, discovered ? payload.sessionId : undefined);
     execTmuxFileSync(["kill-pane", "-t", leaderPaneId], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
   } catch (error) {
+    traceDetachedLeaderPhase(`hud-teardown-error:${describeDetachedLeaderFailure(error)}`);
     logCliOperationFailure(error);
   }
 }
 
 function traceDetachedLeaderPhase(phase: string): void {
-  if (process.env.OMX_TEST_DETACHED_TRACE === "1") process.stderr.write(`[omx-test-detached] ${phase}\n`);
+  if (process.env.OMX_TEST_DETACHED_TRACE !== "1") return;
+  const line = `[omx-test-detached] ${phase}\n`;
+  process.stderr.write(line);
+  const tracePath = process.env.OMX_TEST_DETACHED_TRACE_PATH;
+  if (tracePath) appendFileSync(tracePath, line);
 }
 
 async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise<void> {
