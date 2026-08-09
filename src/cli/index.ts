@@ -1622,6 +1622,27 @@ export function cleanupDetachedHudPane(authority: DetachedHudAuthority): void {
   throw new Error("detached HUD topology changed before teardown");
 }
 
+function tagDetachedHudPane(leaderAuthority: DetachedLeaderAuthority, authority: DetachedHudAuthority, ownerId: string): void {
+  runDetachedHudMutation(leaderAuthority, authority, [
+    "set-option", "-pq", "-t", authority.paneId, "@omx_hud_owner", ownerId,
+  ], false);
+}
+
+export function discoverDetachedHudAuthority(sessionName: string, ownerId: string): DetachedHudAuthority | undefined {
+  const rows = execTmuxFileSync([
+    "list-panes", "-t", sessionName, "-F",
+    "#{pane_id}\t#{pane_dead}\t#{pane_pid}\t#{session_id}\t#{window_id}\t#{@omx_hud_owner}",
+  ], { encoding: "utf-8", stdio: ["ignore", "pipe", "ignore"] });
+  const matches = rows.split("\n").map((line) => line.trim()).filter(Boolean).flatMap((line) => {
+    const [paneId, paneDead, panePidRaw, sessionId, windowId, owner] = line.split("\t");
+    const panePid = Number(panePidRaw);
+    if (paneDead !== "0" || owner !== ownerId || !/^%\d+$/.test(paneId ?? "") || !/^\$\d+$/.test(sessionId ?? "") || !/^@\d+$/.test(windowId ?? "") || !Number.isSafeInteger(panePid) || panePid <= 0) return [];
+    return [{ paneId: paneId!, panePid, sessionId: sessionId!, windowId: windowId!, operationMarker: randomUUID() }];
+  });
+  if (matches.length > 1) throw new Error("multiple detached HUD ownership tags found");
+  return matches[0];
+}
+
 function buildDeferredDetachedHudGuard(
   leaderAuthority: DetachedLeaderAuthority,
   hudAuthority: DetachedHudAuthority,
@@ -6512,6 +6533,7 @@ async function runCodex(
               throw new Error(`unexpected detached bootstrap mutation: ${step.name}`);
             }
             detachedHudAuthority = runDetachedLeaderSplit(authority, step.args);
+            tagDetachedHudPane(authority, detachedHudAuthority, sessionId);
             for (const finalizeStep of buildDetachedSessionFinalizeSteps(
               authority.sessionName, detachedHudAuthority.paneId, authority.windowIndex, process.env.OMX_MOUSE !== "0",
               nativeWindows, detachedPreflight.shouldAttach, authority.paneId,
@@ -6890,7 +6912,7 @@ function parseDetachedHudAuthorityProof(value: unknown): DetachedHudAuthority | 
   return { paneId: proof.paneId, panePid: proof.panePid, sessionId: proof.sessionId, windowId: proof.windowId, operationMarker: proof.operationMarker };
 }
 
-function teardownDetachedOwnedHudPane(hudProof: DetachedHudAuthority | undefined): void {
+function teardownDetachedOwnedHudPane(payload: DetachedLeaderPayload, hudProof: DetachedHudAuthority | undefined): void {
   // #3266: on a normal child exit, kill exactly the bootstrap-proven OMX HUD pane so
   // the leader pane becomes the last live pane and the owned session closes naturally,
   // returning the attached client to its shell. Fail-closed: any doubt means zero mutations.
@@ -6898,9 +6920,10 @@ function teardownDetachedOwnedHudPane(hudProof: DetachedHudAuthority | undefined
   // session is deliberately preserved, which intentionally keeps that session (and any
   // attached client) alive; natural closure and shell return happen only when no other
   // panes remain.
-  if (!hudProof) return;
+  const proof = hudProof ?? discoverDetachedHudAuthority(payload.sessionName, payload.sessionId);
+  if (!proof) return;
   try {
-    cleanupDetachedHudPane(hudProof);
+    cleanupDetachedHudPane(proof);
   } catch (error) {
     logCliOperationFailure(error);
   }
@@ -7070,7 +7093,7 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
     }
     if (!externalInterrupt && outcome.code !== null) {
       traceDetachedLeaderPhase("hud-teardown-start");
-      teardownDetachedOwnedHudPane(detachedHudProof);
+      teardownDetachedOwnedHudPane(payload, detachedHudProof);
       traceDetachedLeaderPhase("hud-teardown-done");
     }
     traceDetachedLeaderPhase("leader-return");
