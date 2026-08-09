@@ -2926,6 +2926,7 @@ exit 0
           fixture.run(['set-option', '-g', 'remain-on-exit', remainOnExit]);
           const envPrefix = [
             'unset TMUX TMUX_PANE',
+            'export OMX_TEST_DETACHED_TRACE=1',
             `export HOME=${JSON.stringify(home)}`,
             `export PATH=${JSON.stringify(bin)}:$PATH`,
             'export OMX_AUTO_UPDATE=0',

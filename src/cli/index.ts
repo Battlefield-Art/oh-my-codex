@@ -6906,6 +6906,10 @@ function teardownDetachedOwnedHudPane(hudProof: DetachedHudAuthority | undefined
   }
 }
 
+function traceDetachedLeaderPhase(phase: string): void {
+  if (process.env.OMX_TEST_DETACHED_TRACE === "1") process.stderr.write(`[omx-test-detached] ${phase}\n`);
+}
+
 async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise<void> {
   for (const [key, value] of Object.entries(payload.parentEnv ?? {})) {
     if (isDetachedLaunchControlPlaneKey(key, process.platform === "win32")) continue;
@@ -7019,10 +7023,12 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
     process.once("SIGTERM", () => forward("SIGTERM"));
     process.once("SIGHUP", () => forward("SIGHUP"));
 
+    traceDetachedLeaderPhase("child-wait-start");
     const outcome = await new Promise<{ code: number | null; signal: NodeJS.Signals | null }>((resolveChild, rejectChild) => {
       child.once("error", rejectChild);
       child.once("exit", (code, signal) => resolveChild({ code, signal }));
     });
+    traceDetachedLeaderPhase(`child-exit:${String(outcome.code)}:${String(outcome.signal)}`);
     if (escalation) clearTimeout(escalation);
     if (process.platform !== "win32" && child.pid) {
       const waitForGroupExit = async (deadline: number): Promise<boolean> => {
@@ -7047,12 +7053,15 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
     process.exitCode = externalInterrupt
       ? signalExitCodes[externalInterrupt] ?? 1
       : outcome.code ?? (outcome.signal ? signalExitCodes[outcome.signal] ?? 1 : 1);
+    traceDetachedLeaderPhase("post-launch-start");
     await postLaunch(payload.cwd, payload.sessionId, binding, payload.codexHomeOverride, payload.preLaunchOptions.enableNotifyFallbackAuthority, payload.projectLocalCodexHomeForCleanup);
+    traceDetachedLeaderPhase("post-launch-done");
     if (payload.readyPath) writeDetachedLeaderReport(payload.readyPath, {
       version: 1, kind: "terminal", nonce, sessionId: payload.sessionId, sessionName: payload.sessionName,
       paneId: pane, leaderPid: process.pid, finalized: true,
       ...(typeof process.exitCode === "number" ? { exitStatus: process.exitCode } : {}),
     });
+    traceDetachedLeaderPhase("terminal-report-written");
     await cleanupRuntimeCodexHome(payload.runtimeCodexHomeForCleanup, payload.projectLocalCodexHomeForCleanup);
     if (ownedRecord) {
       const bytes = readFileSync(activeRecordPath, "utf-8");
@@ -7060,8 +7069,11 @@ async function runDetachedSessionLeader(payload: DetachedLeaderPayload): Promise
       if (bytes === ownedRecord.bytes && digest === ownedRecord.digest) rmSync(activeRecordPath, { force: true });
     }
     if (!externalInterrupt && outcome.code !== null) {
+      traceDetachedLeaderPhase("hud-teardown-start");
       teardownDetachedOwnedHudPane(detachedHudProof);
+      traceDetachedLeaderPhase("hud-teardown-done");
     }
+    traceDetachedLeaderPhase("leader-return");
   } catch (error) {
     let failure: unknown = error;
     let finalized = false;
