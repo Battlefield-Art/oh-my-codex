@@ -3030,7 +3030,7 @@ export async function writeSessionEnd(
   traceSessionFinalizationOperation('preLock-read-start');
   try {
     preLockPointer = await readSessionPointer(context);
-    traceSessionFinalizationOperation('preLock-read-done');
+    traceSessionFinalizationOperation(`preLock-read-done:${preLockPointer.status}`);
   } catch (error) {
     throw resolvedAbort(context, {
       code: 'session_pointer_io_failure', operation: 'pointer-read', candidateSessionId,
@@ -3073,7 +3073,7 @@ export async function writeSessionEnd(
     traceSessionFinalizationOperation('under-lock-read-start');
     try {
       pointer = await readSessionPointer(context);
-      traceSessionFinalizationOperation('under-lock-read-done');
+      traceSessionFinalizationOperation(`under-lock-read-done:${pointer.status}`);
     } catch (error) {
       throw resolvedAbort(context, {
         code: 'session_pointer_io_failure',
