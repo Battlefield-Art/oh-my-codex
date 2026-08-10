@@ -1,12 +1,16 @@
+import {
+  probeInstalledCodexVersionDetailed,
+  type CodexVersionProbeResult,
+} from './codex-feature-probe.js';
+
 import { resolveInstalledRoleName } from '../subagents/tracker.js';
-import { neutralizeOwnedRoutingRalplan } from '../ralplan/documented-leader-preflight.js';
 
 export const RALPLAN_HELP = `omx ralplan - fail-closed adapted-authority diagnostics
 
 Usage:
   omx ralplan preflight [--json]
                 Required only when native role routing is unavailable and adapted Ralplan authority is requested.
-                Ordinary work remains under its own workflow gates.
+                State-preserving diagnostic only. Ordinary work remains under its own workflow gates.
   omx ralplan role-intent write --role <role> --parent-thread <id> [--session <id>] [--ttl-ms <n>] [--json]
                 Compatibility diagnostic only: installed roles are denied with unsupported_documented_leader_proof.
 `;
@@ -29,8 +33,63 @@ export interface RalplanCommandDependencies {
   stdout?: (line: string) => void;
   stderr?: (line: string) => void;
   resolveInstalledRoleName?: typeof resolveInstalledRoleName;
-  neutralizeOwnedRoutingRalplan?: (cwd: string) => Promise<boolean>;
+  probeCodexVersionDetailed?: () => CodexVersionProbeResult | null | undefined;
+}
 
+const REVIEWED_ROOT_IDENTITY_ABSENT_VERSIONS = new Set([
+  '0.144.5',
+  '0.145.0',
+  '0.146.1',
+  '0.148.0-alpha.5',
+]);
+
+type DocumentedRootIdentityStatus = 'missing' | 'unknown';
+
+interface RalplanPreflightDiagnostics {
+  probe_status: CodexVersionProbeResult['status'];
+  detected_version: string | null;
+  documented_root_identity: { status: DocumentedRootIdentityStatus };
+}
+
+function normalizeDetectedVersion(result: CodexVersionProbeResult): string | null {
+  if (result.status !== 'ok' || result.collected.truncated || result.collected.lineLimitExceeded) return null;
+  for (const line of result.collected.output.split(/\r?\n/).slice(0, 8)) {
+    for (const token of line.trim().split(/\s+/)) {
+      if (token.length > 64) continue;
+      const match = /^(?:v)?(\d{1,3})\.(\d{1,3})\.(\d{1,3})(-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/.exec(token);
+      if (!match) continue;
+      const normalized = `${match[1]}.${match[2]}.${match[3]}${match[4] ?? ''}`;
+      return normalized;
+    }
+  }
+  return null;
+}
+
+function buildPreflightDiagnostics(result: CodexVersionProbeResult): RalplanPreflightDiagnostics {
+  const detectedVersion = normalizeDetectedVersion(result);
+  const completeOutput = result.status === 'ok'
+    && !result.collected.truncated
+    && !result.collected.lineLimitExceeded;
+  return {
+    probe_status: result.status,
+    detected_version: detectedVersion,
+    documented_root_identity: {
+      status: completeOutput && detectedVersion !== null && REVIEWED_ROOT_IDENTITY_ABSENT_VERSIONS.has(detectedVersion)
+        ? 'missing'
+        : 'unknown',
+    },
+  };
+}
+
+function resolvePreflightProbeResult(deps: RalplanCommandDependencies): CodexVersionProbeResult {
+  if (!Object.prototype.hasOwnProperty.call(deps, 'probeCodexVersionDetailed')) {
+    return probeInstalledCodexVersionDetailed();
+  }
+  try {
+    return deps.probeCodexVersionDetailed?.() ?? { status: 'exit-failure' };
+  } catch {
+    return { status: 'exit-failure' };
+  }
 }
 
 export async function ralplanCommand(args: string[], deps: RalplanCommandDependencies = {}): Promise<void> {
@@ -43,11 +102,15 @@ export async function ralplanCommand(args: string[], deps: RalplanCommandDepende
   if (args[0] === 'preflight') {
     const json = args.length === 2 && args[1] === '--json';
     if ((args.length !== 1 && !json)) throw new Error(`Unknown ralplan preflight argument: ${args.slice(1).join(' ')}`);
-    await (deps.neutralizeOwnedRoutingRalplan ?? neutralizeOwnedRoutingRalplan)((deps.cwd ?? process.cwd)());
 
-    const failure = { ok: false, reason: 'unsupported_documented_leader_proof' as const };
-    if (json) stdout(JSON.stringify(failure));
-    else stderr('ralplan preflight failed: unsupported_documented_leader_proof');
+    const diagnostics = buildPreflightDiagnostics(resolvePreflightProbeResult(deps));
+    const failure = { ok: false, reason: 'unsupported_documented_leader_proof' as const, diagnostics };
+    if (json) {
+      stdout(JSON.stringify(failure));
+    } else {
+      stderr('ralplan preflight failed: unsupported_documented_leader_proof');
+      stderr(`detected codex ${diagnostics.detected_version ?? 'null'}; probe_status: ${diagnostics.probe_status}; documented_root_identity: ${diagnostics.documented_root_identity.status}`);
+    }
     process.exitCode = 1;
     return;
   }

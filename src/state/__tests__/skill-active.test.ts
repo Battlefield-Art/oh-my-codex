@@ -1,6 +1,7 @@
+import { spawn } from 'node:child_process';
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, mkdir, readFile, readdir, rename, rm, utimes, writeFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -8,8 +9,11 @@ import {
   listActiveSkills,
   listTransitionActiveSkills,
   readVisibleSkillActiveState,
+  SkillActiveStateWriteError,
   syncCanonicalSkillStateForMode,
   writeSkillActiveStateCopies,
+  writeSkillActiveStateCopiesForStateDir,
+  writeSkillActiveStateWithPrimaryTransactionForStateDir,
 } from '../skill-active.js';
 
 async function withTempRepo(prefix: string, run: (cwd: string) => Promise<void>): Promise<void> {
@@ -19,6 +23,79 @@ async function withTempRepo(prefix: string, run: (cwd: string) => Promise<void>)
   } finally {
     await rm(cwd, { recursive: true, force: true });
   }
+}
+
+async function waitForPath(path: string, timeoutMs = 5_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${path}`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+async function waitForReadyOrError(readyPath: string, errorPath: string): Promise<'ready' | 'error'> {
+  const deadline = Date.now() + 10_000;
+  while (!existsSync(readyPath) && !existsSync(errorPath)) {
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${readyPath} or ${errorPath}`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+  return existsSync(errorPath) ? 'error' : 'ready';
+}
+
+async function waitForRootPhase(path: string, sessionId: string, phase: string): Promise<void> {
+  const deadline = Date.now() + 5_000;
+  while (true) {
+    try {
+      const state = JSON.parse(await readFile(path, 'utf8')) as { active_skills?: Array<{ session_id?: string; phase?: string }> };
+      if (state.active_skills?.some((entry) => entry.session_id === sessionId && entry.phase === phase)) return;
+    } catch {
+      // The atomic replacement may be between visibility checks; retry.
+    }
+    if (Date.now() >= deadline) throw new Error(`timed out waiting for ${sessionId}=${phase}`);
+    await new Promise<void>((resolve) => setTimeout(resolve, 10));
+  }
+}
+
+
+function rootWriterWorkerSource(): string {
+  return `
+    import { existsSync } from 'node:fs';
+    import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+    const stateDir = process.env.STATE_DIR;
+    const sessionId = process.env.SESSION_ID;
+    const skill = process.env.SKILL;
+    const phase = process.env.PHASE;
+    const readyPath = process.env.READY_PATH;
+    const releasePath = process.env.RELEASE_PATH;
+    const errorPath = process.env.ERROR_PATH;
+    const sessionReadyPath = process.env.SESSION_READY_PATH;
+    const sessionReleasePath = process.env.SESSION_RELEASE_PATH;
+    const rootPath = stateDir + '/skill-active-state.json';
+    try {
+      const { writeSkillActiveStateCopiesForStateDir } = await import(${JSON.stringify(new URL('../skill-active.js', import.meta.url).href)});
+      const root = JSON.parse(await readFile(rootPath, 'utf8'));
+      await mkdir(stateDir + '/sessions/' + sessionId, { recursive: true });
+      await writeSkillActiveStateCopiesForStateDir(stateDir, {
+        version: 1, active: true, skill, phase, session_id: sessionId,
+        active_skills: [{ skill, phase, active: true, session_id: sessionId }],
+      }, sessionId, root, { beforeCommit: async (event) => {
+        if (event.site === 'skill-active.root-copy') {
+          await writeFile(readyPath, 'ready');
+          while (!existsSync(releasePath)) await new Promise(resolve => setTimeout(resolve, 10));
+          return;
+        }
+        if (event.site === 'skill-active.session-copy' && sessionReadyPath && sessionReleasePath) {
+          await writeFile(sessionReadyPath, 'ready');
+          while (!existsSync(sessionReleasePath)) await new Promise(resolve => setTimeout(resolve, 10));
+        }
+      }});
+    } catch (error) {
+      const errorTempPath = errorPath + '.tmp-' + process.pid;
+      await writeFile(errorTempPath, JSON.stringify({ code: error?.code, message: String(error?.message ?? error) }));
+      await rename(errorTempPath, errorPath);
+      process.exitCode = 1;
+    }
+  `;
 }
 async function withStateRootEnv<T>(env: Partial<Record<'OMX_ROOT' | 'OMX_STATE_ROOT' | 'OMX_TEAM_STATE_ROOT', string>>, run: () => Promise<T>): Promise<T> {
   const previousOmxRoot = process.env.OMX_ROOT;
@@ -444,6 +521,427 @@ describe('skill-active state helpers', () => {
           session_id,
         })),
         [{ skill: 'custom-skill', phase: 'running', session_id: undefined }],
+      );
+    });
+  });
+  it('serializes concurrent session root RMW and preserves both entries', async () => {
+    await withTempRepo('omx-skill-active-root-rmw-', async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      await mkdir(join(stateDir, 'sessions', 'sess-a'), { recursive: true });
+      await mkdir(join(stateDir, 'sessions', 'sess-b'), { recursive: true });
+      const root = {
+        version: 1,
+        active: true,
+        skill: 'ralph',
+        active_skills: [
+          { skill: 'ralph', phase: 'executing', active: true, session_id: 'sess-a' },
+          { skill: 'team', phase: 'running', active: true, session_id: 'sess-b' },
+        ],
+      };
+      await writeFile(rootPath, `${JSON.stringify(root, null, 2)}\n`);
+
+      let resolveFirstEntered!: () => void;
+      const firstEntered = new Promise<void>((resolve) => { resolveFirstEntered = resolve; });
+      let releaseFirst!: () => void;
+      const firstHold = new Promise<void>((resolve) => { releaseFirst = resolve; });
+      let secondEntered = false;
+      const write = (sessionId: string, skill: string, beforeCommit: (event: { site: string }) => Promise<void>) => (
+        writeSkillActiveStateCopiesForStateDir(
+          stateDir,
+          {
+            version: 1,
+            active: true,
+            skill,
+            session_id: sessionId,
+            active_skills: [{ skill, phase: 'updated', active: true, session_id: sessionId }],
+          },
+          sessionId,
+          root,
+          { beforeCommit },
+        )
+      );
+
+      const first = write('sess-a', 'ralph', async (event) => {
+        if (event.site !== 'skill-active.root-copy') return;
+        resolveFirstEntered();
+        await firstHold;
+      });
+      await firstEntered;
+      const second = write('sess-b', 'team', async (event) => {
+        if (event.site === 'skill-active.root-copy') secondEntered = true;
+      });
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(secondEntered, false);
+      releaseFirst();
+      await Promise.all([first, second]);
+
+      const parsed = JSON.parse(await readFile(rootPath, 'utf-8')) as { active_skills: Array<{ skill: string; session_id?: string; phase?: string }> };
+      assert.deepEqual(
+        parsed.active_skills.map(({ skill, session_id, phase }) => ({ skill, session_id, phase })),
+        [
+          { skill: 'ralph', session_id: 'sess-a', phase: 'updated' },
+          { skill: 'team', session_id: 'sess-b', phase: 'updated' },
+        ],
+      );
+      assert.deepEqual((await readdir(stateDir)).filter((entry) => !entry.startsWith('skill-active-state.json.lock')), ['sessions', 'skill-active-state.json']);
+      await rm(`${rootPath}.lock`, { recursive: true, force: true });
+      const releaseMarkers = (await readdir(stateDir)).filter((entry) => entry.startsWith('skill-active-state.json.lock.released-'));
+      await Promise.all(releaseMarkers.map((entry) => rm(join(stateDir, entry), { force: true })));
+    });
+  });
+
+  it('fails closed on malformed root state and recovers after repair', async () => {
+    await withTempRepo('omx-skill-active-root-recovery-', async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      await mkdir(stateDir, { recursive: true });
+      const malformed = '{"active":';
+      await writeFile(rootPath, malformed);
+      await mkdir(`${rootPath}.lock`);
+      await assert.rejects(
+        () => writeSkillActiveStateCopiesForStateDir(
+          stateDir,
+          { active: true, skill: 'ralph', session_id: 'sess-recovery', active_skills: [{ skill: 'ralph', active: true, session_id: 'sess-recovery' }] },
+          'sess-recovery',
+          { active: true, skill: 'ralph', session_id: 'sess-recovery' },
+        ),
+        (error: unknown) => error instanceof SkillActiveStateWriteError && error.code === 'lock-timeout',
+      );
+      assert.equal(await readFile(rootPath, 'utf-8'), malformed);
+      await rm(`${rootPath}.lock`, { recursive: true, force: true });
+
+      await assert.rejects(
+        () => writeSkillActiveStateCopiesForStateDir(
+          stateDir,
+          { active: true, skill: 'ralph', session_id: 'sess-recovery', active_skills: [{ skill: 'ralph', active: true, session_id: 'sess-recovery' }] },
+          'sess-recovery',
+          { active: true, skill: 'ralph', session_id: 'sess-recovery' },
+        ),
+        (error: unknown) => error instanceof SkillActiveStateWriteError && error.code === 'malformed-root',
+      );
+      assert.equal(await readFile(rootPath, 'utf-8'), malformed);
+
+      await rm(`${rootPath}.lock`, { recursive: true, force: true });
+      await writeFile(rootPath, `${JSON.stringify({ version: 1, active: true, skill: 'ralph', active_skills: [{ skill: 'ralph', active: true, session_id: 'sess-recovery' }] }, null, 2)}\n`);
+      await writeSkillActiveStateCopiesForStateDir(
+        stateDir,
+        { active: true, skill: 'ralph', phase: 'recovered', session_id: 'sess-recovery', active_skills: [{ skill: 'ralph', phase: 'recovered', active: true, session_id: 'sess-recovery' }] },
+        'sess-recovery',
+        { active: true, skill: 'ralph', session_id: 'sess-recovery' },
+      );
+      assert.equal(JSON.parse(await readFile(rootPath, 'utf-8')).active_skills[0].phase, 'recovered');
+    });
+  });
+  it('serializes genuine multi-process root contention', async () => {
+    await withTempRepo('omx-skill-active-process-rmw-', async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(rootPath, `${JSON.stringify({
+        version: 1,
+        active: true,
+        skill: 'ralph',
+        active_skills: [
+          { skill: 'ralph', phase: 'old-a', active: true, session_id: 'proc-a' },
+          { skill: 'team', phase: 'old-b', active: true, session_id: 'proc-b' },
+        ],
+      }, null, 2)}\n`);
+      const worker = rootWriterWorkerSource();
+      const launch = (sessionId: string, skill: string, phase: string) => {
+        const readyPath = join(stateDir, `${sessionId}.ready`);
+        const releasePath = join(stateDir, `${sessionId}.release`);
+        const errorPath = join(stateDir, `${sessionId}.error`);
+        const child = spawn(process.execPath, ['--input-type=module', '-e', worker], {
+          env: { ...process.env, STATE_DIR: stateDir, SESSION_ID: sessionId, SKILL: skill, PHASE: phase, READY_PATH: readyPath, RELEASE_PATH: releasePath, ERROR_PATH: errorPath },
+          stdio: 'ignore',
+        });
+        return { child, done: new Promise<number | null>((resolve) => child.once('close', resolve)), readyPath, releasePath, errorPath };
+      };
+      const first = launch('proc-a', 'ralph', 'new-a');
+      const second = launch('proc-b', 'team', 'new-b');
+      const firstReady = await Promise.race([
+        waitForReadyOrError(first.readyPath, first.errorPath).then(async (outcome) => {
+          if (outcome !== 'ready') throw new Error(await readFile(first.errorPath, 'utf8'));
+          return first;
+        }),
+        waitForReadyOrError(second.readyPath, second.errorPath).then(async (outcome) => {
+          if (outcome !== 'ready') throw new Error(await readFile(second.errorPath, 'utf8'));
+          return second;
+        }),
+      ]);
+      await new Promise<void>((resolve) => setTimeout(resolve, 100));
+      const secondReady = firstReady === first ? second : first;
+      assert.equal(existsSync(secondReady.readyPath), false);
+      await writeFile(firstReady.releasePath, 'release');
+      await waitForPath(secondReady.readyPath);
+      await writeFile(secondReady.releasePath, 'release');
+      await waitForRootPhase(rootPath, 'proc-a', 'new-a');
+      await waitForRootPhase(rootPath, 'proc-b', 'new-b');
+      assert.equal(await firstReady.done, 0);
+      assert.equal(await secondReady.done, 0);
+
+      const final = JSON.parse(await readFile(rootPath, 'utf8')) as { active_skills: Array<{ session_id?: string; phase?: string }> };
+      assert.deepEqual(
+        Object.fromEntries(final.active_skills.map((entry) => [entry.session_id, entry.phase])),
+        { 'proc-a': 'new-a', 'proc-b': 'new-b' },
+      );
+    });
+  });
+
+  it('does not release a successor lock after cross-process takeover', async () => {
+    await withTempRepo('omx-skill-active-successor-release-', async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(rootPath, `${JSON.stringify({
+        version: 1,
+        active: true,
+        skill: 'ralph',
+        active_skills: [{ skill: 'ralph', phase: 'old', active: true, session_id: 'release-owner' }],
+      }, null, 2)}\n`);
+      const readyPath = join(stateDir, 'release-owner.ready');
+      const releasePath = join(stateDir, 'release-owner.release');
+      const sessionReadyPath = join(stateDir, 'release-owner.session-ready');
+      const sessionReleasePath = join(stateDir, 'release-owner.session-release');
+      const errorPath = join(stateDir, 'release-owner.error');
+      const worker = spawn(process.execPath, ['--input-type=module', '-e', rootWriterWorkerSource()], {
+        env: {
+          ...process.env,
+          STATE_DIR: stateDir,
+          SESSION_ID: 'release-owner',
+          SKILL: 'ralph',
+          PHASE: 'updated',
+          READY_PATH: readyPath,
+          RELEASE_PATH: releasePath,
+          SESSION_READY_PATH: sessionReadyPath,
+          SESSION_RELEASE_PATH: sessionReleasePath,
+          ERROR_PATH: errorPath,
+        },
+        stdio: 'ignore',
+      });
+      const done = new Promise<number | null>((resolve) => worker.once('close', resolve));
+      await waitForPath(readyPath);
+      await writeFile(releasePath, 'release-root');
+      await waitForPath(sessionReadyPath);
+
+      const lockPath = `${rootPath}.lock`;
+      const ownerEntry = (await readdir(lockPath)).find((entry) => entry.startsWith('owner-'));
+      assert.ok(ownerEntry);
+      const ownerToken = await readFile(join(lockPath, ownerEntry), 'utf8');
+      const successorPath = `${lockPath}.old-owner`;
+      await rename(lockPath, successorPath);
+      await mkdir(lockPath);
+      await writeFile(sessionReleasePath, 'release-session');
+
+      assert.equal(await done, 0);
+      assert.deepEqual(await readdir(lockPath), []);
+      const successorToken = 'successor-token';
+      await writeFile(join(lockPath, `owner-${successorToken}`), successorToken);
+      assert.equal(await readFile(join(lockPath, `owner-${successorToken}`), 'utf8'), successorToken);
+      assert.equal(await readFile(join(successorPath, ownerEntry), 'utf8'), ownerToken);
+      assert.equal(existsSync(errorPath), false);
+      await rm(lockPath, { recursive: true, force: true });
+      await rm(successorPath, { recursive: true, force: true });
+    });
+  });
+  it('does not restore a successor root after primary transaction lock loss', async () => {
+    await withTempRepo('omx-skill-active-successor-rollback-', async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      const sessionId = 'sess-successor-rollback';
+      const sessionPath = join(stateDir, 'sessions', sessionId, 'skill-active-state.json');
+      const lockPath = `${rootPath}.lock`;
+      const successorPath = `${lockPath}.successor`;
+      const previousRoot = `${JSON.stringify({ version: 1, active: true, skill: 'old', active_skills: [{ skill: 'old', active: true, session_id: sessionId }] }, null, 2)}\n`;
+      const successorRoot = `${JSON.stringify({ version: 1, active: true, skill: 'successor', active_skills: [{ skill: 'successor', active: true, session_id: 'successor-session' }] }, null, 2)}\n`;
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      await writeFile(rootPath, previousRoot);
+      await writeFile(sessionPath, `${JSON.stringify({ active: true, skill: 'old' }, null, 2)}\n`);
+
+      await assert.rejects(
+        () => writeSkillActiveStateWithPrimaryTransactionForStateDir(
+          stateDir,
+          { active: true, skill: 'new', phase: 'executing', session_id: sessionId, active_skills: [{ skill: 'new', phase: 'executing', active: true, session_id: sessionId }] },
+          sessionId,
+          sessionPath,
+          async () => writeFile(sessionPath, 'primary-new'),
+          {
+            beforeCommit: async (event) => {
+              if (event.site !== 'skill-active.session-copy') return;
+              await rename(lockPath, successorPath);
+              await mkdir(lockPath);
+              await writeFile(join(lockPath, 'owner-successor-token'), 'successor-token');
+              await writeFile(rootPath, successorRoot);
+            },
+          },
+        ),
+        (error) => error instanceof SkillActiveStateWriteError && error.code === 'lock-lost',
+      );
+      assert.equal(await readFile(rootPath, 'utf8'), successorRoot);
+      assert.equal(await readFile(join(lockPath, 'owner-successor-token'), 'utf8'), 'successor-token');
+    });
+  });
+  it('rejects live stale takeover, cleans dead stale locks, and preserves recovery', async () => {
+    await withTempRepo('omx-skill-active-stale-lock-', async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      await mkdir(stateDir, { recursive: true });
+      await writeFile(rootPath, `${JSON.stringify({
+        version: 1,
+        active: true,
+        skill: 'ralph',
+        active_skills: [{ skill: 'ralph', phase: 'old', active: true, session_id: 'live-owner' }],
+      }, null, 2)}\n`);
+      const worker = rootWriterWorkerSource();
+      const launch = (sessionId: string, phase: string) => {
+        const readyPath = join(stateDir, `${sessionId}.ready`);
+        const releasePath = join(stateDir, `${sessionId}.release`);
+        const errorPath = join(stateDir, `${sessionId}.error`);
+        const child = spawn(process.execPath, ['--input-type=module', '-e', worker], {
+          env: { ...process.env, STATE_DIR: stateDir, SESSION_ID: sessionId, SKILL: 'ralph', PHASE: phase, READY_PATH: readyPath, RELEASE_PATH: releasePath, ERROR_PATH: errorPath },
+          stdio: 'ignore',
+        });
+        return { child, done: new Promise<number | null>((resolve) => child.once('close', resolve)), readyPath, releasePath, errorPath };
+      };
+      const owner = launch('live-owner', 'live-update');
+      const staleTime = new Date(Date.now() - 60_000);
+      let contender: ReturnType<typeof launch> | null = null;
+      try {
+        await waitForPath(owner.readyPath);
+        await utimes(`${rootPath}.lock`, staleTime, staleTime);
+        contender = launch('contender', 'should-not-win');
+        assert.equal(await waitForReadyOrError(contender.readyPath, contender.errorPath), 'error');
+        assert.equal(JSON.parse(await readFile(contender.errorPath, 'utf8')).code, 'lock-timeout');
+        assert.equal(existsSync(contender.readyPath), false);
+        await writeFile(owner.releasePath, 'release');
+        await waitForRootPhase(rootPath, 'live-owner', 'live-update');
+        assert.equal(await owner.done, 0);
+        await rm(`${rootPath}.lock`, { recursive: true, force: true });
+        assert.equal(await contender.done, 1);
+      } finally {
+        await writeFile(owner.releasePath, 'release').catch(() => {});
+        if (contender) await writeFile(contender.releasePath, 'release').catch(() => {});
+        owner.child.kill('SIGKILL');
+        contender?.child.kill('SIGKILL');
+        await owner.done;
+        if (contender) await contender.done;
+      }
+
+      await mkdir(`${rootPath}.lock`);
+      await writeFile(`${rootPath}.lock/owner-live-token`, '{malformed');
+      await utimes(`${rootPath}.lock`, staleTime, staleTime);
+      await assert.rejects(
+        () => writeSkillActiveStateCopiesForStateDir(
+          stateDir,
+          { active: true, skill: 'ralph', phase: 'ambiguous', session_id: 'live-owner', active_skills: [{ skill: 'ralph', phase: 'ambiguous', active: true, session_id: 'live-owner' }] },
+          'live-owner',
+          { active: true, skill: 'ralph', session_id: 'live-owner' },
+        ),
+        (error: unknown) => error instanceof SkillActiveStateWriteError && error.code === 'lock-timeout',
+      );
+      assert.equal(existsSync(`${rootPath}.lock`), true);
+      await rm(`${rootPath}.lock`, { recursive: true, force: true });
+      await mkdir(`${rootPath}.lock`);
+      await mkdir(`${rootPath}.lock/owner-unreadable`);
+      await utimes(`${rootPath}.lock`, staleTime, staleTime);
+      await assert.rejects(
+        () => writeSkillActiveStateCopiesForStateDir(
+          stateDir,
+          { active: true, skill: 'ralph', phase: 'unreadable', session_id: 'live-owner', active_skills: [{ skill: 'ralph', phase: 'unreadable', active: true, session_id: 'live-owner' }] },
+          'live-owner',
+          { active: true, skill: 'ralph', session_id: 'live-owner' },
+        ),
+        (error: unknown) => error instanceof SkillActiveStateWriteError && error.code === 'lock-timeout',
+      );
+      assert.equal(existsSync(`${rootPath}.lock`), true);
+      await rm(`${rootPath}.lock`, { recursive: true, force: true });
+
+
+      await mkdir(`${rootPath}.lock`);
+      await utimes(`${rootPath}.lock`, staleTime, staleTime);
+      await writeSkillActiveStateCopiesForStateDir(
+        stateDir,
+        { active: true, skill: 'ralph', phase: 'ownerless-recovered', session_id: 'live-owner', active_skills: [{ skill: 'ralph', phase: 'ownerless-recovered', active: true, session_id: 'live-owner' }] },
+        'live-owner',
+        { active: true, skill: 'ralph', session_id: 'live-owner' },
+      );
+      assert.equal(JSON.parse(await readFile(rootPath, 'utf8')).active_skills[0].phase, 'ownerless-recovered');
+      await rm(`${rootPath}.lock`, { recursive: true, force: true });
+
+      await mkdir(`${rootPath}.lock`);
+      await writeFile(`${rootPath}.lock/owner`, '2147483647-dead-owner-token');
+      await utimes(`${rootPath}.lock`, staleTime, staleTime);
+      await writeSkillActiveStateCopiesForStateDir(
+        stateDir,
+        { active: true, skill: 'ralph', phase: 'recovered', session_id: 'live-owner', active_skills: [{ skill: 'ralph', phase: 'recovered', active: true, session_id: 'live-owner' }] },
+        'live-owner',
+        { active: true, skill: 'ralph', session_id: 'live-owner' },
+      );
+      assert.equal(JSON.parse(await readFile(rootPath, 'utf8')).active_skills[0].phase, 'recovered');
+    });
+  });
+
+  it('removes root-scoped stale ralplan entry owned by the session when clearing, even when session_id is empty (#3451-A)', async () => {
+    await withTempRepo('omx-skill-active-3451-owner-clear-', async (cwd) => {
+      const stateDir = join(cwd, '.omx', 'state');
+      await mkdir(stateDir, { recursive: true });
+      const sessionId = 'sess-3451-owner';
+      // Seed root skill-active with a root-scoped ralplan entry (empty session_id)
+      // owned by the current session via owner_codex_session_id. The entryKey
+      // dedup (skill::session_id) prevents two same-skill unscoped entries, so we
+      // also seed a different-skill entry to verify only the matching entry clears.
+      await writeSkillActiveStateCopiesForStateDir(
+        stateDir,
+        {
+          active: true,
+          skill: 'ralplan',
+          phase: 'planning',
+          session_id: undefined,
+          owner_codex_session_id: sessionId,
+          active_skills: [
+            { skill: 'ralplan', phase: 'planning', active: true, session_id: undefined, owner_codex_session_id: sessionId },
+            { skill: 'team', phase: 'running', active: true, session_id: undefined, owner_codex_session_id: 'other-session' },
+          ],
+        },
+        undefined,
+        {
+          active: true,
+          skill: 'ralplan',
+          phase: 'planning',
+          active_skills: [
+            { skill: 'ralplan', phase: 'planning', active: true, session_id: undefined, owner_codex_session_id: sessionId },
+            { skill: 'team', phase: 'running', active: true, session_id: undefined, owner_codex_session_id: 'other-session' },
+          ],
+        },
+      );
+
+      // Clear ralplan for the current session
+      await syncCanonicalSkillStateForMode({
+        cwd,
+        mode: 'ralplan',
+        active: false,
+        sessionId,
+        ownerCodexSessionId: sessionId,
+        nowIso: '2026-08-07T00:00:00.000Z',
+      });
+
+      const rootState = JSON.parse(
+        await readFile(join(stateDir, 'skill-active-state.json'), 'utf-8'),
+      ) as { active_skills?: Array<{ skill: string; owner_codex_session_id?: string }> };
+
+      const remaining = rootState.active_skills ?? [];
+      // The ralplan entry owned by the current session must be removed
+      assert.equal(
+        remaining.some((e) => e.skill === 'ralplan'),
+        false,
+        'stale root-scoped ralplan entry owned by the current session should be removed',
+      );
+      // The team entry owned by the other session must survive
+      assert.equal(
+        remaining.some((e) => e.skill === 'team' && e.owner_codex_session_id === 'other-session'),
+        true,
+        'team entry owned by a different session should survive',
       );
     });
   });

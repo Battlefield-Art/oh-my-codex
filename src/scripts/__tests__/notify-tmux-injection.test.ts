@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-import { readVisibleAllowedModes } from '../notify-hook/tmux-injection.js';
+import { isNotifyModeStateFilename, readVisibleAllowedModes } from '../notify-hook/tmux-injection.js';
 
 describe('notify-hook tmux injection canonical skill gating', () => {
   it('reads canonical skill-active state from authoritative team state root', async () => {
@@ -78,5 +78,30 @@ describe('notify-hook tmux injection canonical skill gating', () => {
     } finally {
       await rm(wd, { recursive: true, force: true });
     }
+  });
+
+  it('ignores derived run-state.json when scanning active mode states', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-notify-tmux-derived-run-state-'));
+    try {
+      const stateDir = join(wd, '.omx', 'state');
+      const sessionId = 'sess-derived-run-state';
+      await mkdir(join(stateDir, 'sessions', sessionId), { recursive: true });
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd }, null, 2));
+      await writeFile(join(stateDir, 'sessions', sessionId, 'run-state.json'), JSON.stringify({ active: true, mode: 'run' }, null, 2));
+      await writeFile(join(stateDir, 'sessions', sessionId, 'ralph-state.json'), JSON.stringify({ active: true, mode: 'ralph' }, null, 2));
+
+      const visible = await readVisibleAllowedModes(wd, stateDir, {}, ['ralph', 'run']);
+
+      assert.equal(visible.preferredMode, null);
+      assert.equal(visible.canonicalPresent, false);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('filters only derived run-state while retaining genuine state filenames', () => {
+    assert.equal(isNotifyModeStateFilename('run-state.json'), false);
+    assert.equal(isNotifyModeStateFilename('ralph-state.json'), true);
+    assert.equal(isNotifyModeStateFilename('tmux-hook-state.json'), false);
   });
 });

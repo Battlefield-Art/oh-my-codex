@@ -35,7 +35,6 @@ import { readRoleRoutingMarker, writeRoleRoutingMarker } from "../subagents/role
 import { evaluateCodex01445PreToolUse } from "../ralplan/documented-leader-preflight.js";
 import {
   resolveCanonicalTeamStateRoot,
-  resolveWorkerNotifyTeamStateRootPath,
   resolveWorkerTeamStateRootPath,
 } from "../team/state-root.js";
 import { inferTerminalLifecycleOutcome } from "../runtime/run-outcome.js";
@@ -68,7 +67,6 @@ import {
 import {
   appendTeamEvent,
   readTeamLeaderAttention,
-  readTeamConfig,
   readTeamManifestV2,
   readTeamPhase,
   writeTeamLeaderAttention,
@@ -2928,10 +2926,27 @@ function parseTeamWorkerEnv(rawValue: string): { teamName: string; workerName: s
 function readTeamWorkerEnvironment(): { teamName: string; workerName: string } | null {
   const internalWorker = parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER));
   const externalWorker = parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_WORKER));
-  if (internalWorker && externalWorker && internalWorker.workerName !== externalWorker.workerName) return null;
+  if (!internalWorker) return null;
+  if (externalWorker && internalWorker.workerName !== externalWorker.workerName) return null;
   // The public Team name is a display alias; only the session-scoped internal
   // identity is authoritative for state-root/config/manifest validation.
-  return internalWorker ?? externalWorker;
+  return internalWorker;
+}
+
+function readCanonicalInternalTeamWorkerEnvironment(): { teamName: string; workerName: string } | null {
+  const rawInternalWorker = safeString(process.env.OMX_TEAM_INTERNAL_WORKER).trim();
+  if (!rawInternalWorker) return null;
+  const internalWorker = parseTeamWorkerEnv(rawInternalWorker);
+  if (!internalWorker) return null;
+  const rawExternalWorker = safeString(process.env.OMX_TEAM_WORKER).trim();
+  if (!rawExternalWorker) return internalWorker;
+  const externalWorker = parseTeamWorkerEnv(rawExternalWorker);
+  if (!externalWorker || externalWorker.workerName !== internalWorker.workerName) return null;
+  return internalWorker;
+}
+
+function hasCanonicalInternalTeamWorkerDeclaration(): boolean {
+  return readCanonicalInternalTeamWorkerEnvironment() !== null;
 }
 
 function hasRawTeamWorkerDeclaration(): boolean {
@@ -2939,12 +2954,16 @@ function hasRawTeamWorkerDeclaration(): boolean {
     || safeString(process.env.OMX_TEAM_WORKER).trim() !== "";
 }
 
-async function hasAuthoritativeTeamWorkerContext(cwd: string): Promise<boolean> {
-  const workerContext = readTeamWorkerEnvironment();
+async function hasAuthoritativeTeamWorkerContext(
+  cwd: string,
+  options: { requireWorkerPane?: boolean } = {},
+): Promise<boolean> {
+  const workerContext = readCanonicalInternalTeamWorkerEnvironment();
   if (!workerContext) return false;
 
+  const requireWorkerPane = options.requireWorkerPane === true;
   const currentPaneId = safeString(process.env.TMUX_PANE).trim();
-  if (!currentPaneId) return false;
+  if (requireWorkerPane && !currentPaneId) return false;
   const stateRoot = await resolveWorkerTeamStateRootPath(cwd, workerContext, process.env).catch(() => null);
   if (!stateRoot) return false;
 
@@ -2976,18 +2995,18 @@ async function hasAuthoritativeTeamWorkerContext(cwd: string): Promise<boolean> 
   const configWorker = matchingWorker(config);
   if (!manifestWorker || !configWorker) return false;
   if (safeString(identity.name).trim() !== workerContext.workerName) return false;
-  if (safeString(identity.pane_id).trim() !== currentPaneId) return false;
+  if (requireWorkerPane && safeString(identity.pane_id).trim() !== currentPaneId) return false;
   if (!pathMatches(identity.team_state_root, canonicalStateRoot)) return false;
   if (!pathMatches(identity.worktree_path ?? identity.working_dir, canonicalCwd)) return false;
   for (const state of [manifest, config]) {
     if (safeString(state.name).trim() !== workerContext.teamName) return false;
-    if (safeString(state.leader_pane_id).trim() === currentPaneId) return false;
+    if (requireWorkerPane && safeString(state.leader_pane_id).trim() === currentPaneId) return false;
     if (!pathMatches(state.team_state_root, canonicalStateRoot)) return false;
     if (!pathMatches(state.leader_cwd, canonicalLeaderCwd)) return false;
   }
   if (safeString(manifest.leader_pane_id).trim() !== safeString(config.leader_pane_id).trim()) return false;
   for (const worker of [manifestWorker, configWorker]) {
-    if (safeString(worker.pane_id).trim() !== currentPaneId) return false;
+    if (requireWorkerPane && safeString(worker.pane_id).trim() !== currentPaneId) return false;
     if (!pathMatches(worker.team_state_root, canonicalStateRoot)) return false;
     const workingDir = safeString(worker.working_dir).trim();
     const worktreePath = safeString(worker.worktree_path).trim();
@@ -3002,35 +3021,13 @@ async function resolveTeamStateDirForWorkerContext(
   cwd: string,
   workerContext: { teamName: string; workerName: string },
 ): Promise<string | null> {
-  const resolved = await resolveWorkerNotifyTeamStateRootPath(cwd, workerContext, process.env).catch(() => null);
+  const resolved = await resolveWorkerTeamStateRootPath(cwd, workerContext, process.env).catch(() => null);
   if (resolved) return resolved;
-  const explicit = safeString(process.env.OMX_TEAM_STATE_ROOT).trim();
-  if (explicit) {
-    const candidate = resolve(cwd, explicit);
-    const workerRoot = join(candidate, "team", workerContext.teamName, "workers", workerContext.workerName);
-    if (existsSync(workerRoot)) return candidate;
-    return candidate;
-  }
   return null;
 }
 
 async function isConfirmedTeamWorkerPromptSubmitPane(cwd: string): Promise<boolean> {
-  const workerContext = readTeamWorkerEnvironment();
-  if (!workerContext) return false;
-
-  const currentPaneId = safeString(process.env.TMUX_PANE).trim();
-  if (!currentPaneId) return false;
-
-  const config = await readTeamConfig(workerContext.teamName, cwd).catch(() => null);
-  if (!config) return false;
-
-  const leaderPaneId = safeString(config.leader_pane_id).trim();
-  if (leaderPaneId && leaderPaneId === currentPaneId) return false;
-
-  const workerPaneId = safeString(
-    config.workers.find((worker) => worker.name === workerContext.workerName)?.pane_id,
-  ).trim();
-  return workerPaneId !== "" && workerPaneId === currentPaneId;
+  return hasAuthoritativeTeamWorkerContext(cwd, { requireWorkerPane: true });
 }
 
 
@@ -3055,10 +3052,8 @@ type TeamWorkerStopDecision =
 async function resolveTeamWorkerStopDecision(
   cwd: string,
 ): Promise<TeamWorkerStopDecision> {
-  const workerContext =
-    parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_INTERNAL_WORKER))
-    || parseTeamWorkerEnv(safeString(process.env.OMX_TEAM_WORKER));
-  if (!workerContext) return { kind: "unresolved", reason: "missing_worker_context" };
+  const workerContext = readCanonicalInternalTeamWorkerEnvironment();
+  if (!workerContext) return { kind: "unresolved", reason: "missing_canonical_internal_worker_context" };
 
   const blockWorkerStop = (
     reasonCode: string,
@@ -5714,11 +5709,12 @@ function classifyPreToolUseMutationTransport(
     if (
       rawCommand === command
       && (isAllowedOmxReadOnlyCommand(command, cwd) || isAllowedGhReadOnlyCommand(command) || isAllowedVersionProbeCommand(command))
-    ) return "read-only";
+    ) return isAllowedOmxSessionLockInspectCommand(command, cwd) ? "bash" : "read-only";
     return rawCommand !== command
       || commandHasDeepInterviewWriteIntent(command, 0, cwd)
       || collectOmxStateCommandOperations(command, "write").length > 0
       || commandHasNestedCliMutationIntent(command)
+      || omxOrGjcReadOnlyShapeMatches(command)
       || classifyConductorExecutableRuntime(command, 0, cwd) !== null
       ? "bash"
       : "read-only";
@@ -10071,6 +10067,7 @@ function isAllowedOmxNestedHelpForm(args: readonly string[]): boolean {
 // untrusted binary, shell-function shadow, invalid state spelling, or unsafe
 // sparkshell mode.
 function omxOrGjcReadOnlyShapeMatches(command: string): boolean {
+  if (/^\s*(?:omx|gjc)\s+session\s+lock\s+(?:inspect|recover)(?:\s|$)/.test(command)) return true;
   if (!isSingleLiteralShellInvocation(command)) return false;
   const words = literalInvocationWords(command);
   const index = skipLiteralLeadingAssignments(words);
@@ -10082,7 +10079,48 @@ function omxOrGjcReadOnlyShapeMatches(command: string): boolean {
   if (args[0] === "help" || args[0] === "status" || args[0] === "version") return true;
   if (args[0] === "state" && ["read", "get-status", "status"].includes(args[1] ?? "")) return true;
   if (args[0] === "sparkshell") return true;
+  if (args[0] === "session" && args[1] === "lock" && (args[2] === "inspect" || args[2] === "recover")) return true;
   return args[0] === "cleanup" && args.includes("--dry-run");
+
+}
+
+function isAllowedOmxSessionLockInspectCommand(command: string, cwd: string): boolean {
+  if (!isSingleLiteralShellInvocation(command)) return false;
+  const words = literalInvocationWords(command);
+  const index = skipLiteralLeadingAssignments(words);
+  const commandName = commandNameFromShellWord(words[index] ?? "");
+  if (commandName !== "omx" && commandName !== "gjc") return false;
+  const args = words.slice(index + 1).filter(Boolean);
+  if (args[0] !== "session" || args[1] !== "lock" || args[2] !== "inspect") return false;
+
+  let sawJson = false;
+  let sawCwd = false;
+  for (let cursor = 3; cursor < args.length; cursor += 1) {
+    const arg = args[cursor] ?? "";
+    if (arg === "--json") {
+      if (sawJson) return false;
+      sawJson = true;
+      continue;
+    }
+    if (arg === "--cwd") {
+      if (sawCwd) return false;
+      const value = args[cursor + 1] ?? "";
+      if (!value || value.startsWith("-")) return false;
+      if (!sameFilePath(value, cwd)) return false;
+      sawCwd = true;
+      cursor += 1;
+      continue;
+    }
+    if (arg.startsWith("--cwd=")) {
+      if (sawCwd) return false;
+      const value = arg.slice("--cwd=".length);
+      if (!value || !sameFilePath(value, cwd)) return false;
+      sawCwd = true;
+      continue;
+    }
+    return false;
+  }
+  return true;
 }
 
 function isAllowedOmxReadOnlyCommand(command: string, cwd: string): boolean {
@@ -10104,6 +10142,7 @@ function isAllowedOmxReadOnlyCommand(command: string, cwd: string): boolean {
   if (args.length === 1 && (args[0] === "--help" || args[0] === "-h" || args[0] === "--version" || args[0] === "-v")) return true;
   if (args.length === 1 && (args[0] === "help" || args[0] === "status" || args[0] === "version")) return true;
   if (isAllowedOmxNestedHelpForm(args)) return true;
+  if (isAllowedOmxSessionLockInspectCommand(command, cwd)) return true;
   if (args[0] === "state" && OMX_STATE_READ_ONLY_OPERATIONS.has(args[1] ?? "")) {
     return stateReadTrailingArgsAreSafe(args.slice(2));
   }
@@ -10656,6 +10695,8 @@ function teamWorkerMutationTargetsProtectedWorkflowState(
 
 
 
+const RALPLAN_CONSENSUS_NATIVE_ROLE_NAMES = new Set(["planner", "architect", "critic"]);
+
 async function buildRalplanPreToolUseBoundaryOutput(
   payload: CodexHookPayload,
   cwd: string,
@@ -10706,6 +10747,19 @@ async function buildRalplanPreToolUseBoundaryOutput(
   let blocked = false;
   let blockedDetail = "implementation/write tools are blocked until an explicit execution handoff workflow is activated";
 
+  // Allow only installed Planner/Architect/Critic native consensus delegation
+  // during Ralplan planning. The upstream unknown-role deny blocks uninstalled
+  // roles. Other installed roles (including executor) are not consensus lanes,
+  // so they and every non-spawn transport remain fail-closed (#3451-B).
+  if (mutationTransport === "orchestration" && isNativeSubagentSpawnToolName(toolName)) {
+    const requestedSpawnRole = readRequestedSpawnRole(payload);
+    if (
+      RALPLAN_CONSENSUS_NATIVE_ROLE_NAMES.has(requestedSpawnRole)
+      && resolveInstalledRoleName(requestedSpawnRole, undefined, cwd) !== null
+    ) {
+      return null;
+    }
+  }
   if (toolName === "Bash") {
     blocked = !isAllowedRalplanBashWrite(cwd, command, activeState, sessionId, readPreToolUseRawCommand(payload));
     if (blocked) {
@@ -11064,7 +11118,7 @@ async function resolvePreToolUseWriteActor(
   if (payloadHasOwnerIdentityClaim(payload)) return "native-child";
   if (!payloadAgentId && isTypedAgentRolePayload(payload, cwd)) return "native-child";
   if (payloadAgentId || payloadThreadId) return "native-child";
-  return (await hasAuthoritativeTeamWorkerContext(cwd)) ? "team-worker" : "native-child";
+  return (await hasAuthoritativeTeamWorkerContext(cwd, { requireWorkerPane: true })) ? "team-worker" : "native-child";
 }
 
 function isActiveConductorModeState(state: Record<string, unknown> | null, mode: string, sessionId: string): boolean {
@@ -16656,9 +16710,13 @@ function hasExactConductorOrchestrationOptionSchema(commandName: string, words: 
   const args = collectConductorInvocationWords(words, commandIndex);
   const command = shellWordLiteral(args[0] ?? "");
   const subcommand = shellWordLiteral(args[1] ?? "");
+  const isUltragoalCreate = command === "ultragoal" && (subcommand === "create" || subcommand === "create-goals");
   let permitted: Set<string>;
   let required: Set<string>;
-  if (command === "ultragoal" && subcommand === "steer") {
+  if (isUltragoalCreate) {
+    permitted = new Set(["--brief", "--goal", "--codex-goal-mode", "--force", "--json"]);
+    required = new Set(["--brief", "--force"]);
+  } else if (command === "ultragoal" && subcommand === "steer") {
     permitted = new Set(["--kind", "--target-goal-id", "--evidence", "--rationale", "--json"]);
     required = new Set(["--kind", "--target-goal-id", "--evidence", "--rationale"]);
   } else if (command === "ultragoal" && subcommand === "checkpoint") {
@@ -16677,13 +16735,15 @@ function hasExactConductorOrchestrationOptionSchema(commandName: string, words: 
     const raw = args[index] ?? "";
     const option = shellWordLiteral(raw);
     if (!option || !option.startsWith("--") || option === "--" || !conductorOrchestrationWordIsStatic(raw)) return false;
-    if (option === "--json") {
+    if (option === "--json" || (isUltragoalCreate && option === "--force")) {
       if (!permitted.has(option) || seen.has(option)) return false;
       seen.set(option, "");
       continue;
     }
     const name = option.split("=", 1)[0] ?? "";
-    if (!permitted.has(name) || seen.has(name)) return false;
+    if (!permitted.has(name)) return false;
+    const repeated = isUltragoalCreate && name === "--goal";
+    if (!repeated && seen.has(name)) return false;
     const rawValue = option.startsWith(`${name}=`) ? option.slice(name.length + 1) : args[index + 1] ?? "";
     const value = shellWordLiteral(rawValue);
     if (!value || !conductorOrchestrationWordIsStatic(rawValue) || shellWordMayProduceWgetOptions(value)) return false;
@@ -16691,6 +16751,10 @@ function hasExactConductorOrchestrationOptionSchema(commandName: string, words: 
     seen.set(name, value);
   }
   if (![...required].every((option) => seen.has(option))) return false;
+  if (isUltragoalCreate) {
+    const mode = seen.get("--codex-goal-mode");
+    return mode === undefined || new Set(["aggregate", "per-story"]).has(mode);
+  }
   const status = seen.get("--status");
   return status === undefined || new Set(["complete", "blocked", "failed", "in_progress"]).has(status);
 }
@@ -20390,6 +20454,15 @@ function isExactConductorMetadataRoot(cwd: string, target: string): boolean {
 }
 
   const shellMutations = extractConductorBashMutations(normalizedCommand, cwd, policyCwd);
+  if (
+    splitShellCommandSegments(normalizedCommand).length > 1
+    && shellMutations.some((mutation) => mutation.mainRootStructuredOrchestrationMutation)
+  ) {
+    return {
+      allowed: false,
+      blockedDetail: "Bash compound command cannot combine a Main-root Conductor orchestration mutation with another shell segment",
+    };
+  }
   if (shellMutations.length > 0) {
     for (const mutation of shellMutations) {
       if (mutation.mainRootStructuredStateWrite || mutation.mainRootStructuredOrchestrationMutation) continue;
@@ -20626,7 +20699,12 @@ export async function buildConductorPreToolUseWriteGuardOutput(
     } else if (mutationTransport !== "read-only") {
       const shellMutations = extractConductorBashMutations(command, cwd, policyCwd);
       const bashEvaluation = evaluateConductorBashWrite(cwd, command, 0, sessionId, policyCwd, rawCommand);
-      blocked = !bashEvaluation.allowed;
+      const recognizedOmxReadOnlyShape = omxOrGjcReadOnlyShapeMatches(command);
+      const trustedOmxReadOnly = isAllowedOmxReadOnlyCommand(command, policyCwd);
+      const trustedSessionLockInspect = trustedOmxReadOnly && isAllowedOmxSessionLockInspectCommand(command, policyCwd);
+      blocked = !trustedSessionLockInspect && (
+        !bashEvaluation.allowed || (recognizedOmxReadOnlyShape && !trustedOmxReadOnly)
+      );
       const canonicalStateCommand = canonicalizeOmxStateTransportCommand(command);
       const bashStateOperations = collectOmxStateCommandOperations(canonicalStateCommand, "write");
       if (bashStateOperations.length > 0) {
@@ -22276,7 +22354,9 @@ export async function dispatchCodexNativeHook(
       outputJson: null,
     };
   }
-  if (hookEventName === "Stop" && hasRawTeamWorkerDeclaration()) {
+  const canonicalInternalTeamWorkerDeclared = hasCanonicalInternalTeamWorkerDeclaration();
+
+  if (hookEventName === "Stop" && canonicalInternalTeamWorkerDeclared) {
     return {
       hookEventName,
       omxEventName: mapCodexHookEventToOmxEvent(hookEventName),
@@ -22362,13 +22442,18 @@ export async function dispatchCodexNativeHook(
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
   let isSubagentSessionStart = false;
-  const authoritativeTeamWorker = declaredTeamWorker && await hasAuthoritativeTeamWorkerContext(cwd);
+  const authoritativeTeamWorker = declaredTeamWorker
+    && (hookEventName !== "Stop" || canonicalInternalTeamWorkerDeclared)
+    && await hasAuthoritativeTeamWorkerContext(cwd);
   const authoritativeWorkerPayloadSessionId = authoritativeTeamWorker
     && candidateWorkerPayloadSessionId
     && (!pointer.state || !payloadMatchesSessionPointer(candidateWorkerPayloadSessionId, pointer.state))
       ? candidateWorkerPayloadSessionId
       : "";
-  const declaredTeamWorkerStopOnly = hookEventName === "Stop" && declaredTeamWorker;
+  const declaredTeamWorkerStopOnly = hookEventName === "Stop" && canonicalInternalTeamWorkerDeclared;
+  if (declaredTeamWorker && !authoritativeTeamWorker) {
+    allowImplicitSessionSideEffects = false;
+  }
 
   if (hookEventName === "SessionStart" && declaredTeamWorker && !authoritativeWorkerPayloadSessionId) {
     canonicalSessionId = "";
@@ -23131,7 +23216,9 @@ export async function dispatchCodexNativeHook(
       if (detectMcpTransportFailure(payload)) {
         await markTeamTransportFailure(cwd, payload);
       }
-      await handleTeamWorkerPostToolUseSuccess(payload, cwd);
+      if (hasCanonicalInternalTeamWorkerDeclaration()) {
+        await handleTeamWorkerPostToolUseSuccess(payload, cwd);
+      }
     }
     outputJson = buildNativePostToolUseOutput(payload);
   } else if (hookEventName === "Stop") {
@@ -23150,26 +23237,12 @@ export async function dispatchCodexNativeHook(
           : null
       );
     } else {
-      const failure = stopAuthorizationFailure ?? {
-        stopReason: "session_pointer_unusable",
-        reason: "OMX cannot authorize Stop without a writable session authority.",
-      };
-      const stopHookActive = payload.stop_hook_active === true || payload.stopHookActive === true;
-      const pointerCannotAuthorizeThisCwd = pointer.status === "foreign-cwd";
-      const unmatchedStopSession = failure.stopReason === "session_scope_unmatched";
-      // An unmatched payload or foreign-cwd pointer cannot authorize continuation.
-      // Return no output so Codex cannot reinterpret an authorization diagnostic as
-      // a new action request. Other unusable pointers retain their bounded replay behavior.
-      if (pointerCannotAuthorizeThisCwd || unmatchedStopSession || stopHookActive) {
-        outputJson = null;
-      } else {
-        outputJson = {
-          decision: "block",
-          stopReason: failure.stopReason,
-          reason: failure.reason,
-          systemMessage: failure.reason,
-        };
-      }
+      // Authorization failure never grants continuation authority. It also must not
+      // inject a repair request: the same provenance failure can deny every tool the
+      // model would need to repair it, turning a Stop denial into an unbounded loop.
+      // Returning no hook output permits termination while preserving the denial of
+      // all session-scoped and global side effects above.
+      outputJson = null;
     }
   }
 

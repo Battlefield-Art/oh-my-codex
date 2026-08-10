@@ -4,7 +4,7 @@ import { mkdtemp, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, type TestContext } from 'node:test';
-import { buildPtyScriptCommand, isRealTmuxAvailable, tmuxSessionExists, withTempTmuxSession } from './tmux-test-fixture.js';
+import { buildPtyScriptCommand, isRealTmuxAvailable, runPtyResult, tmuxSessionExists, withTempTmuxSession } from './tmux-test-fixture.js';
 
 function skipUnlessTmux(t: TestContext): void {
   if (!isRealTmuxAvailable()) {
@@ -260,5 +260,82 @@ describe('buildPtyScriptCommand', () => {
       ? { executable: 'script', args: ['-q', '/dev/null', '/bin/sh', '-c', 'echo hi'] }
       : { executable: 'script', args: ['-q', '-e', '-c', 'echo hi', '/dev/null'] };
     assert.deepEqual(result, expected);
+  });
+});
+
+describe('runPtyResult failure contracts', () => {
+  function runWithDisplayState(
+    displayState: string,
+    resultOverrides: Record<string, { status: number | null; stdout: string; stderr: string; error: string }> = {},
+  ): { result: ReturnType<typeof runPtyResult>; calls: string[][] } {
+    const calls: string[][] = [];
+    const result = runPtyResult('echo hi', {
+      platform: 'darwin',
+      syntheticServer: true,
+      sessionName: 'omx-test-fixture',
+      pollLimit: 1,
+      statusMarker: '__omx_pty_test_status__',
+      sleep: () => undefined,
+      run: (args) => {
+        calls.push(args);
+        if (args[0] === 'new-window') return '%99';
+        if (args[0] === 'display-message') return displayState;
+        return '';
+      },
+      runResult: (args) => {
+        calls.push(args);
+        return resultOverrides[args[0]] ?? { status: 0, stdout: '', stderr: '', error: '' };
+      },
+    });
+    return { result, calls };
+  }
+
+  it('reports malformed pane status and still attempts capture and cleanup', () => {
+    const { result, calls } = runWithDisplayState('1 malformed');
+    assert.equal(result.status, null);
+    assert.match(result.error, /PTY command did not exit: 1 malformed/);
+    assert.deepEqual(calls.slice(-2).map(([command]) => command), ['capture-pane', 'kill-pane']);
+    assert.deepEqual(
+      calls.find(([command]) => command === 'display-message'),
+      ['display-message', '-p', '-t', '%99', '#{pane_dead} #{pane_dead_status}'],
+    );
+    const newWindowCall = calls.find(([command]) => command === 'new-window');
+    assert.equal(newWindowCall?.length, 8, 'tmux new-window must receive one composed shell-command argument');
+    assert.match(newWindowCall?.at(-1) ?? '', /^'\/bin\/sh' '-c' '/);
+    assert.match(newWindowCall?.at(-1) ?? '', /__omx_pty_test_status__/);
+  });
+
+  it('prefers the inner shell status marker over the tmux pane wrapper status', () => {
+    const { result } = runWithDisplayState('1 1', {
+      'capture-pane': { status: 0, stdout: '__omx_pty_test_status__:0\n', stderr: '', error: '' },
+    });
+    assert.equal(result.status, 0);
+  });
+
+  it('reports missing pane status after the bounded poll and still cleans up', () => {
+    const { result, calls } = runWithDisplayState('');
+    assert.equal(result.status, null);
+    assert.match(result.error, /PTY command did not exit/);
+    assert.equal(calls.at(-1)?.[0], 'kill-pane');
+  });
+
+  it('rejects capture failure from status alone without losing the child status', () => {
+    const { result } = runWithDisplayState('1 7', {
+      'capture-pane': { status: 1, stdout: '', stderr: 'capture status only', error: '' },
+    });
+    assert.equal(result.status, 7);
+    assert.match(result.error, /capture-pane failed with status 1/);
+    assert.match(result.error, /capture status only/);
+    assert.equal(result.stderr, 'capture status only');
+  });
+
+  it('rejects cleanup failure from status alone after a successful child exit', () => {
+    const { result } = runWithDisplayState('1 0', {
+      'kill-pane': { status: 1, stdout: '', stderr: 'cleanup status only', error: '' },
+    });
+    assert.equal(result.status, 0);
+    assert.match(result.error, /kill-pane failed with status 1/);
+    assert.match(result.error, /cleanup status only/);
+    assert.equal(result.stderr, 'cleanup status only');
   });
 });

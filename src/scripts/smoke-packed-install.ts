@@ -15,7 +15,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { delimiter, dirname, join, resolve } from 'node:path';
+import { delimiter, dirname, isAbsolute, join, resolve } from 'node:path';
 import { spawn, spawnSync, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { TextDecoder } from 'node:util';
@@ -30,6 +30,7 @@ import {
   ensureReusableNodeModules,
 } from '../utils/repo-deps.js';
 import { escapeTomlString } from '../utils/toml.js';
+import { sameFilePath } from '../utils/paths.js';
 
 
 export {
@@ -164,13 +165,13 @@ export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
   { name: 'doc-preserves-earlier', prompt: 'Use autopilot mode; "note"; use $ralplan is the workflow command.', expectedSkill: 'autopilot', expectedStopBlock: true },
   { name: 'doc-colon-followup', prompt: 'use $ralplan is the workflow command: use $autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
   { name: 'table-followup', prompt: 'Mode | Meaning\n--- | ---\nmanual | documentation\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
-  { name: 'neg-advance-reopen', prompt: 'Do not run $ralplan but advance to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false },
-  { name: 'neg-jump-reopen', prompt: 'Do not run $ralplan but jump straight to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false },
+  { name: 'neg-advance-reopen', prompt: 'Do not run $ralplan but advance to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false, insideTmux: true },
+  { name: 'neg-jump-reopen', prompt: 'Do not run $ralplan but jump straight to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false, insideTmux: true },
   { name: 'reference-plain-title', prompt: '[docs]: /target "title\nplain text"\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
   { name: 'reference-plain-destination', prompt: '[docs]: ./target\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
   { name: 'directive-use-the', prompt: 'Do not run $ralplan; use the $autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true },
   { name: 'directive-continue-after-quote', prompt: '"quoted"\ncontinue with $ralplan', expectedSkill: 'ralplan', expectedStopBlock: true },
-  { name: 'doc-advance-followup', prompt: 'use $ralplan is the workflow command; advance to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false },
+  { name: 'doc-advance-followup', prompt: 'use $ralplan is the workflow command; advance to $ultragoal', expectedSkill: 'ultragoal', expectedStopBlock: false, insideTmux: true },
   { name: 'directive-run-code-review', prompt: 'run $code-review', expectedSkill: 'code-review', expectedStopBlock: false },
   { name: 'directive-documentation', prompt: 'use $ralplan is the consensus-planning command', expectedSkill: null, expectedStopBlock: false },
   { name: 'nested-bounded-child-unbounded-parent', prompt: '"`x`\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
@@ -202,11 +203,33 @@ export const PACKED_INSTALL_NATIVE_HOOK_REGRESSION_PROMPTS = [
   { name: 'percent-suffix', prompt: '$ralplan%docs', expectedSkill: null, expectedStopBlock: false },
   { name: 'fullwidth-percent-suffix', prompt: '$ralplan％docs', expectedSkill: null, expectedStopBlock: false },
   { name: 'g1a-ordered-multi-skill', prompt: '$ralplan, $autopilot; $team', expectedSkill: 'ralplan', expectedStopBlock: true, expectedDeferredSkills: ['autopilot', 'team'], expectedActiveSkills: ['ralplan'], insideTmux: true },
-  { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: ['autopilot'] },
+  { name: 'g1c-duplicate-alias', prompt: '$autopilot $oh-my-codex:autopilot build it', expectedSkill: 'autopilot', expectedStopBlock: true, expectedDeferredSkills: [], expectedActiveSkills: [] },
   { name: 'b3-longer-valid-fence', prompt: '```text\n$autopilot build it\n````\n$ralplan plan it', expectedSkill: 'ralplan', expectedStopBlock: true },
   { name: 'b4-shorter-invalid-fence', prompt: '````text\n$autopilot build it\n```\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
   { name: 'b5-different-marker-invalid-fence', prompt: '```text\n$autopilot build it\n~~~\n$ralplan plan it', expectedSkill: null, expectedStopBlock: false },
 ] as const;
+
+export function assertPackedRegressionWorkflowState(
+  testCase: { readonly name: string; readonly expectedSkill: string },
+  skillState: { readonly active?: boolean; readonly skill?: string; readonly phase?: string; readonly error?: string; readonly active_skills?: readonly unknown[] },
+): void {
+  const matchesExpectedState = testCase.expectedSkill === 'autopilot'
+    ? skillState.active === false
+      && skillState.skill === 'autopilot'
+      && skillState.phase === 'failed'
+      && skillState.error === 'documented_host_consensus_receipt_unavailable'
+      && skillState.active_skills?.length === 0
+    : skillState.active === true && skillState.skill === testCase.expectedSkill;
+  if (!matchesExpectedState) {
+    throw new Error(`packed regression ${testCase.name} persisted unexpected workflow state`);
+  }
+}
+
+export function shouldPackedRegressionStopBlock(
+  testCase: { readonly expectedSkill: string | null; readonly expectedStopBlock: boolean },
+): boolean {
+  return testCase.expectedSkill === 'autopilot' ? false : testCase.expectedStopBlock;
+}
 
 export function buildPackedRegressionEnvironment(
   testCase: { readonly name: string; readonly insideTmux?: boolean },
@@ -1229,16 +1252,85 @@ export const PACKED_INSTALL_PLUGIN_MCP_TARGETS = [
 const PACKED_INSTALL_OPERATIONAL_PROBE_TIMEOUT_MS = 5_000;
 const PACKED_INSTALL_COMMAND_TIMEOUT_MS = 120_000;
 
+export interface PackedProbeEnvOptions {
+  runtimeBinary?: string | null;
+  repoRoot?: string;
+}
 
-function buildPackedProbeEnv(overrides: NodeJS.ProcessEnv = {}): NodeJS.ProcessEnv {
+function runtimeBinaryName(platform: NodeJS.Platform): string {
+  return platform === 'win32' ? 'omx-runtime.exe' : 'omx-runtime';
+}
+
+function validatePackedSmokeRuntimeBinary(candidate: string, platform: NodeJS.Platform): string {
+  if (!isAbsolute(candidate)) {
+    throw new Error(`packed smoke runtime override must be absolute: ${candidate}`);
+  }
+  let stats;
+  try {
+    stats = statSync(candidate);
+  } catch {
+    throw new Error(`packed smoke requires omx-runtime at "${candidate}"; run "npm run build:runtime"`);
+  }
+  if (!stats.isFile() || (platform !== 'win32' && (stats.mode & 0o111) === 0)) {
+    throw new Error(`packed smoke runtime must be an executable regular file: ${candidate}`);
+  }
+  return candidate;
+}
+
+export function resolvePackedSmokeRuntimeBinary(
+  repoRoot: string = process.cwd(),
+  options: { platform?: NodeJS.Platform; candidate?: string } = {},
+): string {
+  const platform = options.platform ?? process.platform;
+  const candidate = options.candidate ?? resolve(join(repoRoot, 'target', 'debug', runtimeBinaryName(platform)));
+  return validatePackedSmokeRuntimeBinary(candidate, platform);
+}
+
+export function buildPackedProbeEnv(
+  overrides: NodeJS.ProcessEnv = {},
+  options: PackedProbeEnvOptions = {},
+): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(env)) {
     const upper = key.toUpperCase();
-    if (upper === 'NODE_OPTIONS' || upper.startsWith('OMX_') || upper.startsWith('CODEX_')) {
+    if (
+      upper === 'NODE_OPTIONS'
+      || upper === 'BASH_ENV'
+      || upper === 'ENV'
+      || upper === 'ZDOTDIR'
+      || upper.startsWith('OMX_')
+      || upper.startsWith('CODEX_')
+      || upper.startsWith('GJC_')
+      || upper === 'TMUX'
+      || upper === 'TMUX_PANE'
+    ) {
       delete env[key];
     }
   }
-  return { ...env, ...overrides };
+  for (const [key, value] of Object.entries(overrides)) {
+    if (value === undefined) delete env[key];
+    else env[key] = value;
+  }
+  if (options.runtimeBinary === null) {
+    delete env.OMX_RUNTIME_BINARY;
+  } else {
+    env.OMX_RUNTIME_BINARY = options.runtimeBinary === undefined
+      ? resolvePackedSmokeRuntimeBinary(options.repoRoot)
+      : validatePackedSmokeRuntimeBinary(options.runtimeBinary, process.platform);
+  }
+  return env;
+}
+
+export function replacePathKeyCaseInsensitive(env: NodeJS.ProcessEnv, value: string): NodeJS.ProcessEnv {
+  const result = { ...env };
+  let pathKey: string | undefined;
+  for (const key of Object.keys(result)) {
+    if (key.toUpperCase() !== 'PATH') continue;
+    pathKey ??= key;
+    delete result[key];
+  }
+  result[pathKey ?? 'PATH'] = value;
+  return result;
 }
 
 export interface PackedInstallNpmFile {
@@ -1693,7 +1785,7 @@ async function assertInstalledReasoningArtifacts(packageRoot: string): Promise<v
 function smokeInstalledRootReasoningRejections(omxPath: string, cwd: string): void {
   const codexHome = mkdtempSync(join(tmpdir(), 'omx-packed-root-reasoning-'));
   try {
-    const env = buildPackedProbeEnv({ CODEX_HOME: codexHome });
+    const env = buildPackedProbeEnv({ CODEX_HOME: codexHome }, { runtimeBinary: null });
     const configPath = join(codexHome, 'config.toml');
     const usageResult = spawnSync(omxPath, ['reasoning'], { cwd, encoding: 'utf-8', env });
     if (usageResult.status !== 0) {
@@ -1748,8 +1840,18 @@ function readFakeCodexLaunches(capturePath: string): FakeCodexLaunch[] {
   if (!existsSync(capturePath)) return [];
   return parseFakeCodexLaunches(readFileSync(capturePath, 'utf-8'));
 }
+export function assertPackedLaunchCwdPreserved(
+  expectedCwd: string,
+  receivedCwd: string,
+  message: string,
+): void {
+  if (!sameFilePath(expectedCwd, receivedCwd)) {
+    throw new Error(`${message}: expected ${expectedCwd}, received ${receivedCwd}`);
+  }
+}
 
-function smokeInstalledLaunchArgumentBoundary(omxPath: string): void {
+
+function smokeInstalledLaunchArgumentBoundary(omxPath: string, runtimeBinary: string): void {
   const smokeRoot = mkdtempSync(join(tmpdir(), 'omx-packed-launch-boundary-'));
   const modelInstructionsPath = join(smokeRoot, 'model-instructions.md');
   try {
@@ -1806,7 +1908,7 @@ function smokeInstalledLaunchArgumentBoundary(omxPath: string): void {
       OMX_MODEL_INSTRUCTIONS_FILE: modelInstructionsPath,
       OMX_LAUNCH_POLICY: 'direct',
       OMX_PACKED_FAKE_CODEX_CAPTURE_PATH: capturePath,
-    });
+    }, { runtimeBinary });
     delete env.OMX_NOTIFY_TEMP_CONTRACT;
     delete env.OMX_TEAM_WORKER_LAUNCH_ARGS;
     writeFileSync(modelInstructionsPath, '# Packed launch boundary instructions\n');
@@ -1859,9 +1961,11 @@ function smokeInstalledLaunchArgumentBoundary(omxPath: string): void {
         expectedCodexArgs,
         'omx must inject model instructions before -- and preserve exact post-marker argument boundaries',
       );
-      if (launch.cwd !== launchCwd) {
-        throw new Error(`omx must not change cwd for post-marker arguments: expected ${launchCwd}, received ${launch.cwd}`);
-      }
+      assertPackedLaunchCwdPreserved(
+        launchCwd,
+        launch.cwd,
+        'omx must not change cwd for post-marker arguments',
+      );
       if (launch.OMX_NOTIFY_TEMP_CONTRACT !== null) {
         throw new Error(`omx must not activate temporary notification routing for post-marker arguments: ${JSON.stringify(launch)}`);
       }
@@ -1998,9 +2102,11 @@ function smokeInstalledLaunchArgumentBoundary(omxPath: string): void {
       `model_instructions_file="${escapeTomlString(modelInstructionsPath)}"`,
       ...twoMarkerArgs.slice(1),
     ], 'the first literal -- must terminate OMX parsing and preserve every later argv element');
-    if (twoMarkerLaunch.cwd !== launchCwd) {
-      throw new Error(`the first literal -- must preserve launch cwd: expected ${launchCwd}, received ${twoMarkerLaunch.cwd}`);
-    }
+    assertPackedLaunchCwdPreserved(
+      launchCwd,
+      twoMarkerLaunch.cwd,
+      'the first literal -- must preserve launch cwd',
+    );
     if (twoMarkerLaunch.OMX_NOTIFY_TEMP_CONTRACT !== null) {
       throw new Error(`the first literal -- must not activate notification routing: ${JSON.stringify(twoMarkerLaunch)}`);
     }
@@ -2015,6 +2121,7 @@ function usage(): string {
   return [
     'Usage: node scripts/smoke-packed-install.mjs',
     '',
+    '  --fail-closed-probe  install the package, assert the runtime-absent fail-closed denial, and exit',
     'Creates an npm tarball, installs it into an isolated prefix, and smoke tests the installed omx CLI.',
     'Release smoke validates installed CLI boot, native-hook dispatch, packaged artifacts, installed reasoning boundaries, and the isolated setup/rerun/uninstall lifecycle; Codex trust checks run when the pinned CLI is present.',
   ].join('\n');
@@ -2073,14 +2180,20 @@ export function ensureRepoDependencies(repoRoot: string, options: EnsureRepoDeps
   };
 }
 
-function parseArgs(argv: string[]): void {
+export function parseArgs(argv: string[]): { failClosedProbe: boolean } {
+  let failClosedProbe = false;
   for (const token of argv) {
     if (token === '--help' || token === '-h') {
       console.log(usage());
       process.exit(0);
     }
+    if (token === '--fail-closed-probe') {
+      failClosedProbe = true;
+      continue;
+    }
     throw new Error(`Unknown argument: ${token}\n${usage()}`);
   }
+  return { failClosedProbe };
 }
 
 function run(cmd: string, args: readonly string[], options: Record<string, unknown> = {}): ReturnType<typeof spawnSync> {
@@ -2282,7 +2395,7 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
   const g2cPayload = { ...PACKED_CODEX_01445_NO_POINTER_NO_TRACKER_FIXTURE, cwd: g2cCwd };
   const g2cResult = invoke(g2cCwd, buildPackedRegressionEnvironment({ name: 'g2c-01445' }), g2cPayload);
   const g2cStdout = String(g2cResult.stdout || '');
-  const g2cExpected = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan."}}\n';
+  const g2cExpected = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"unsupported_documented_leader_proof: Codex hooks do not expose a documented, non-user-mintable root identity required for adapted Ralplan."}}\n';
   if (g2cStdout !== g2cExpected) throw new Error('packed Codex 0.144.5 fixture returned unexpected PreToolUse bytes');
   if (existsSync(join(g2cCwd, '.omx', 'state'))) throw new Error('packed Codex 0.144.5 fixture created pointer or tracker state');
 }
@@ -2302,10 +2415,48 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
           OMX_SESSION_ID: `packed-install-smoke-${eventName}`,
           OMX_SOURCE_CWD: smokeCwd,
           OMX_STARTUP_CWD: smokeCwd,
-        }),
+        }, { runtimeBinary: null }),
         input: JSON.stringify(payload),
       });
       validateHookStdout(eventName, result.stdout as string);
+    }
+    const collaborationCwd = join(smokeCwd, 'flattened-collaboration-nested-lifecycle');
+    mkdirSync(collaborationCwd, { recursive: true });
+    const collaborationResult = run(process.execPath, [realpathSync(hookScript)], {
+      cwd: collaborationCwd,
+      env: buildPackedProbeEnv({
+        OMX_SOURCE_CWD: collaborationCwd,
+        OMX_STARTUP_CWD: collaborationCwd,
+      }, { runtimeBinary: null }),
+      input: JSON.stringify({
+        hook_event_name: 'PostToolUse',
+        cwd: collaborationCwd,
+        session_id: 'packed-flattened-collaboration-nested-lifecycle',
+        thread_id: 'packed-flattened-collaboration-nested-lifecycle-thread',
+        tool_name: 'collaborationlist_agents',
+        tool_response: {
+          agents: [
+            { agent_name: '/root', agent_status: 'running' },
+            {
+              agent_name: '/root/reviewer',
+              agent_status: {
+                completed: 'Child report discusses an unavailable and unsupported optional adapter.',
+              },
+            },
+          ],
+        },
+      }),
+    });
+    if (collaborationResult.status !== 0 || String(collaborationResult.stderr) !== '') {
+      throw new Error('packed flattened collaboration nested lifecycle hook invocation failed');
+    }
+    validateHookStdout('PostToolUse', String(collaborationResult.stdout));
+    const collaborationStateDir = join(collaborationCwd, '.omx', 'state');
+    if (existsSync(join(collaborationStateDir, 'native-subagent-support.json'))) {
+      throw new Error('packed flattened collaboration nested lifecycle persisted a native support blocker');
+    }
+    if (existsSync(join(collaborationStateDir, 'native-subagent-capacity-blocker.json'))) {
+      throw new Error('packed flattened collaboration nested lifecycle persisted a capacity blocker');
     }
     const pluginHookScript = join(packageRoot, 'plugins', 'oh-my-codex', 'hooks', 'codex-native-hook.mjs');
     const pluginChildScript = join(smokeCwd, 'packed-plugin-oversized-child.mjs');
@@ -2458,13 +2609,15 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
       [realpathSync(hookScript)],
       { cwd: smokeCwd, env, input: JSON.stringify(payload) },
     );
-    const hookEnv = {
-      ...process.env,
+    const hookEnv = buildPackedProbeEnv({
+      BASH_ENV: undefined,
+      ENV: undefined,
+      ZDOTDIR: undefined,
       OMX_NATIVE_HOOK_DOCTOR_SMOKE: '1',
       OMX_ROOT: hookRoot,
       OMX_SOURCE_CWD: smokeCwd,
       OMX_STARTUP_CWD: smokeCwd,
-    };
+    }, { runtimeBinary: null });
     const officialTeamRootPayload = {
       hook_event_name: 'PreToolUse',
       cwd: smokeCwd,
@@ -2788,9 +2941,9 @@ function runPackedTransportRegressions(hookScript: string, smokeCwd: string): vo
     })).length !== 0) {
       throw new Error('packed main-root bounded quoted heredoc metadata control should be allowed');
     }
-    if (Object.keys(runActorProbeResult('main-root', 'zsh fast startup control', 'Bash', {
+    if (Object.keys(runActorProbe('main-root', 'zsh fast startup control', 'Bash', {
       command: `zsh -f -c ':'`,
-    }, { BASH_ENV: undefined, ENV: undefined, ZDOTDIR: undefined }).output).length !== 0) {
+    })).length !== 0) {
       throw new Error('packed main-root zsh fast startup control should be allowed');
     }
     const boxedPlanningRoot = join(smokeCwd, 'boxed-planning-root');
@@ -4443,7 +4596,7 @@ PY`],
         tool_input: { command: 'omx ralplan role-intent write --role architect --parent-thread "$CODEX_THREAD_ID" --json' },
       }),
     });
-    const preToolUseExpected = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"unsupported_documented_leader_proof: Codex 0.144.5 hooks do not expose documented root identity required for adapted Ralplan."}}\n';
+    const preToolUseExpected = '{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"unsupported_documented_leader_proof: Codex hooks do not expose a documented, non-user-mintable root identity required for adapted Ralplan."}}\n';
     if (String(preToolUseResult.stdout || '') !== preToolUseExpected) {
       throw new Error('installed #3212 PreToolUse did not emit the exact unsupported denial');
     }
@@ -4487,10 +4640,8 @@ PY`],
         if (existsSync(skillStatePath)) throw new Error(`packed regression ${testCase.name} created workflow state`);
       } else {
         if (!existsSync(skillStatePath)) throw new Error(`packed regression ${testCase.name} did not create workflow state`);
-        const skillState = JSON.parse(readFileSync(skillStatePath, 'utf-8')) as { active?: boolean; skill?: string; deferred_skills?: string[]; active_skills?: Array<{ skill?: string }> };
-        if (!skillState.active || skillState.skill !== testCase.expectedSkill) {
-          throw new Error(`packed regression ${testCase.name} persisted unexpected workflow state`);
-        }
+        const skillState = JSON.parse(readFileSync(skillStatePath, 'utf-8')) as { active?: boolean; skill?: string; phase?: string; error?: string; deferred_skills?: string[]; active_skills?: Array<{ skill?: string }> };
+        assertPackedRegressionWorkflowState(testCase, skillState);
         if ('expectedDeferredSkills' in testCase && JSON.stringify(skillState.deferred_skills ?? []) !== JSON.stringify(testCase.expectedDeferredSkills)) {
           throw new Error(`packed regression ${testCase.name} persisted unexpected deferred workflows`);
         }
@@ -4505,10 +4656,11 @@ PY`],
         input: JSON.stringify({ ...promptPayload, hook_event_name: 'Stop', turn_id: `stop-${caseIndex}` }),
       });
       const stopOutput = JSON.parse(String(stopResult.stdout || '{}')) as { decision?: string };
-      if (testCase.expectedStopBlock && stopOutput.decision !== 'block') {
+      const expectedStopBlock = shouldPackedRegressionStopBlock(testCase);
+      if (expectedStopBlock && stopOutput.decision !== 'block') {
         throw new Error(`packed regression ${testCase.name} did not block Stop`);
       }
-      if (!testCase.expectedStopBlock && stopOutput.decision === 'block') {
+      if (!expectedStopBlock && stopOutput.decision === 'block') {
         throw new Error(`packed regression ${testCase.name} blocked Stop: ${JSON.stringify(stopOutput)}`);
       }
     }
@@ -5128,7 +5280,7 @@ function smokeInstalledPluginHookLauncher(packageRoot: string, omxPath: string):
       OMX_ENTRY_PATH: omxPath,
       OMX_CODEX_LAUNCH_ID: 'packed-plugin-hook-launch',
       OMX_PACKED_PLUGIN_HOOK_CAPTURE_PATH: capturePath,
-    });
+    }, { runtimeBinary: null });
     const runProbe = (
       name: string,
       payload: Record<string, unknown>,
@@ -5278,7 +5430,7 @@ function smokeInstalledMcpTargets(omxPath: string): void {
       OMX_TEAM_WORKER: '',
       OMX_TEAM_WORKER_LAUNCH_ARGS: '',
       OMX_NOTIFY_TEMP_CONTRACT: '',
-    });
+    }, { runtimeBinary: null });
     for (const [serverName, target, expectedServerName] of PACKED_INSTALL_PLUGIN_MCP_TARGETS) {
       const result = spawnSync(omxPath, ['mcp-serve', target], {
         cwd: smokeRoot,
@@ -5312,6 +5464,103 @@ function smokeInstalledMcpTargets(omxPath: string): void {
     rmSync(smokeRoot, { recursive: true, force: true });
   }
 }
+function smokeInstalledFailClosedDenial(omxPath: string, packageRoot: string): void {
+  if (process.platform === 'linux') {
+    console.log('fail-closed probe: skipped on linux');
+    return;
+  }
+
+  const smokeRoot = mkdtempSync(join(tmpdir(), 'omx-packed-fail-closed-'));
+  try {
+    const fakeBinDir = join(smokeRoot, 'bin');
+    const launchCwd = join(smokeRoot, 'cwd');
+    const codexHome = join(smokeRoot, 'codex-home');
+    const isolatedHome = join(smokeRoot, 'home');
+    const capturePath = join(smokeRoot, 'fake-codex-argv.jsonl');
+    const modelInstructionsPath = join(smokeRoot, 'model-instructions.md');
+    mkdirSync(fakeBinDir, { recursive: true });
+    mkdirSync(launchCwd, { recursive: true });
+    mkdirSync(codexHome, { recursive: true });
+    mkdirSync(isolatedHome, { recursive: true });
+    writeFileSync(modelInstructionsPath, '# Packed fail-closed probe instructions\n');
+
+    const fakeCodexSource = [
+      'const { appendFileSync, existsSync } = require("node:fs");',
+      'const path = require("node:path");',
+      'const capturePath = process.env.OMX_PACKED_FAKE_CODEX_CAPTURE_PATH;',
+      'if (!capturePath) process.exit(2);',
+      'appendFileSync(capturePath, `${JSON.stringify({',
+      '  argv: process.argv.slice(2),',
+      '  cwd: process.cwd(),',
+      '  hasResumeSqlite: existsSync(path.join(process.env.CODEX_HOME ?? "", "state_5.sqlite")),',
+      '  OMX_NOTIFY_TEMP_CONTRACT: process.env.OMX_NOTIFY_TEMP_CONTRACT ?? null,',
+      '  OMX_TEAM_WORKER_LAUNCH_ARGS: process.env.OMX_TEAM_WORKER_LAUNCH_ARGS ?? null,',
+      '})}\\n`);',
+    ].join('\n');
+    if (process.platform === 'win32') {
+      const fakeCodexScript = join(fakeBinDir, 'codex.cjs');
+      writeFileSync(fakeCodexScript, fakeCodexSource);
+      writeFileSync(join(fakeBinDir, 'codex.cmd'), [
+        '@echo off',
+        `"${process.execPath}" "${fakeCodexScript}" %*`,
+      ].join('\r\n'));
+    } else {
+      const fakeCodexPath = join(fakeBinDir, 'codex');
+      writeFileSync(fakeCodexPath, `#!/usr/bin/env node\n${fakeCodexSource}\n`);
+      chmodSync(fakeCodexPath, 0o755);
+    }
+
+    const systemPathEntries = process.platform === 'win32'
+      ? [join(process.env.SystemRoot ?? 'C:\\Windows', 'System32')]
+      : ['/usr/bin', '/bin'];
+    const isolatedPathEntries = [fakeBinDir, dirname(process.execPath), ...systemPathEntries];
+    const runtimeName = runtimeBinaryName(process.platform);
+    for (const entry of isolatedPathEntries) {
+      if (existsSync(join(entry, runtimeName))) {
+        throw new Error(`fail-closed probe PATH unexpectedly contains ${runtimeName}: ${entry}`);
+      }
+    }
+    for (const profile of ['debug', 'release']) {
+      const workspaceCandidate = join(packageRoot, 'target', profile, runtimeName);
+      if (existsSync(workspaceCandidate)) {
+        throw new Error(`fail-closed probe installed package unexpectedly contains runtime candidate: ${workspaceCandidate}`);
+      }
+    }
+
+    let env = buildPackedProbeEnv({
+      CODEX_HOME: codexHome,
+      HOME: isolatedHome,
+      USERPROFILE: isolatedHome,
+      OMX_BYPASS_DEFAULT_SYSTEM_PROMPT: '1',
+      OMX_MODEL_INSTRUCTIONS_FILE: modelInstructionsPath,
+      OMX_LAUNCH_POLICY: 'direct',
+      OMX_PACKED_FAKE_CODEX_CAPTURE_PATH: capturePath,
+    }, { runtimeBinary: null });
+    env = replacePathKeyCaseInsensitive(env, isolatedPathEntries.join(delimiter));
+    console.log(`fail-closed probe PATH: ${isolatedPathEntries.join(delimiter)}`);
+
+    const result = spawnSync(omxPath, ['--', 'packed-fail-closed-probe'], {
+      cwd: launchCwd,
+      encoding: 'utf-8',
+      env,
+      timeout: PACKED_INSTALL_OPERATIONAL_PROBE_TIMEOUT_MS,
+      killSignal: 'SIGKILL',
+    });
+    const launches = readFakeCodexLaunches(capturePath);
+    if (launches.length !== 1) {
+      throw new Error(`fail-closed probe must launch fake Codex exactly once: ${JSON.stringify(launches)}`);
+    }
+    const stderr = String(result.stderr ?? '');
+    if (result.status === 0 || !stderr.includes('session_pointer_unusable')) {
+      throw new Error(`fail-closed probe expected session_pointer_unusable denial, received status ${String(result.status)}\n${stderr}`);
+    }
+    console.log(`fail-closed probe denial: ${stderr.trim()}`);
+    console.log('fail-closed probe: denial observed');
+  } finally {
+    rmSync(smokeRoot, { recursive: true, force: true });
+  }
+}
+
 
 export function parseNpmPackJsonOutput(stdout: string): PackedInstallNpmPackResult[] {
   const start = stdout.lastIndexOf('\n[');
@@ -5323,7 +5572,7 @@ export function parseNpmPackJsonOutput(stdout: string): PackedInstallNpmPackResu
 }
 
 async function main(): Promise<void> {
-  parseArgs(process.argv.slice(2));
+  const { failClosedProbe } = parseArgs(process.argv.slice(2));
 
   const repoRoot = process.cwd();
   const tempRoot = mkdtempSync(join(tmpdir(), 'omx-packed-install-'));
@@ -5341,7 +5590,7 @@ async function main(): Promise<void> {
     CODEX_HOME: installCodexHome,
     npm_config_cache: installNpmCache,
     NPM_CONFIG_CACHE: installNpmCache,
-  });
+  }, { runtimeBinary: null });
 
   let tarballPath: string | undefined;
   try {
@@ -5366,8 +5615,14 @@ async function main(): Promise<void> {
     await assertInstalledReasoningArtifacts(packageRoot);
 
     const omxPath = join(prefixDir, process.platform === 'win32' ? '' : 'bin', npmBinName('omx'));
+    if (failClosedProbe) {
+      smokeInstalledFailClosedDenial(omxPath, packageRoot);
+      return;
+    }
+    const runtimeBinary = resolvePackedSmokeRuntimeBinary(repoRoot);
+    console.log(`packed smoke runtime: ${runtimeBinary}`);
     smokeInstalledRootReasoningRejections(omxPath, repoRoot);
-    smokeInstalledLaunchArgumentBoundary(omxPath);
+    smokeInstalledLaunchArgumentBoundary(omxPath, runtimeBinary);
     smokeInstalledPluginHookLauncher(packageRoot, omxPath);
     smokeInstalledMcpTargets(omxPath);
     for (const argv of PACKED_INSTALL_SMOKE_CORE_COMMANDS) {

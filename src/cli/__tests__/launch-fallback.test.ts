@@ -1,13 +1,13 @@
 import { describe, it, type TestContext } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import { chmod, mkdir, mkdtemp, readFile, readdir, rename, rm, writeFile } from 'node:fs/promises';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { HUD_RESIZE_RECONCILE_DELAY_SECONDS, HUD_TMUX_HEIGHT_LINES } from '../../hud/constants.js';
-import { DETACHED_TMUX_HISTORY_LIMIT } from '../index.js';
+import { DETACHED_LAUNCH_CONTROL_PLANE_KEYS, DETACHED_TMUX_HISTORY_LIMIT, buildMadmaxDetachedLaunchContextKey } from '../index.js';
 import {
   closeLaunchSessionBindingOnce,
   establishLaunchSessionBinding,
@@ -18,6 +18,7 @@ import {
 import { buildPtyScriptCommand, isRealScriptAvailable, isRealTmuxAvailable, withTempTmuxSession } from '../../team/__tests__/tmux-test-fixture.js';
 
 const CLI_SPAWN_TIMEOUT_MS = 60_000;
+const DARWIN_PTY_FINALIZATION_POLL_LIMIT = 600;
 function buildRunOmxEnv(envOverrides: Record<string, string>): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = { ...process.env };
   for (const key of Object.keys(env)) {
@@ -98,7 +99,8 @@ async function wrapFakeTmuxWithDetachedLeader(fakeTmuxPath: string): Promise<voi
   await writeExecutable(fakeTmuxPath, `#!/bin/sh
 if [ "$1" = "display-message" ] && [ "$2" = "-p" ] && [ "$3" = "-t" ] && case "$5" in *'#{session_created}'*'#{window_id}'*'#{pane_pid}'*) true;; *) false;; esac; then
   session=$(cat /tmp/omx-test-detached-session-name 2>/dev/null || printf omx-test)
-  printf '%s\t$1\t1\t0\t@1\t%s\t123\n' "$session" "$4"
+  leader_pid=$(cat "$0.detached-leader-pid" 2>/dev/null || printf 123)
+  printf '%s\t$1\t1\t0\t@1\t%s\t%s\n' "$session" "$4" "$leader_pid"
   exit 0
 fi
 if [ "$1" = "set-option" ] && [ "$2" = "-t" ] && [ "$4" = "@omx_instance_id" ]; then
@@ -108,7 +110,9 @@ if [ "$1" = "list-panes" ] && case "$*" in *'#{session_created}'*'#{@omx_instanc
   ${JSON.stringify(implementationPath)} "$@" >/dev/null 2>&1 || true
   session=$(cat /tmp/omx-test-detached-session-name 2>/dev/null || printf omx-test)
   owner=$(cat /tmp/omx-test-detached-owner-id 2>/dev/null || printf '')
-  printf '%%12\t0\t123\t%s\t$1\t1\t%s\n' "$session" "$owner"
+  leader_pid=$(cat "$0.detached-leader-pid" 2>/dev/null || printf 123)
+  pane=$(cat "$0.detached-leader-pane" 2>/dev/null || printf '%%12')
+  printf '%s\t0\t%s\t%s\t$1\t1\t%s\n' "$pane" "$leader_pid" "$session" "$owner"
   exit 0
 fi
 if [ "$1" = "if-shell" ] && [ "$2" = "-F" ] && [ "$3" = "-t" ]; then
@@ -135,6 +139,13 @@ if [ "$1" = "if-shell" ] && [ "$2" = "-F" ] && [ "$3" = "-t" ]; then
   esac
   exit 0
 fi
+if [ "$1" = "list-panes" ] && case "$*" in *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*) true;; *) false;; esac; then
+  leader_pid=$(cat "$0.detached-leader-pid" 2>/dev/null || printf '')
+  [ -n "$leader_pid" ] || exit 1
+  pane=$(cat "$0.detached-leader-pane" 2>/dev/null || printf '%%12')
+  printf '%s\t0\t%s\n' "$pane" "$leader_pid"
+  exit 0
+fi
 output=$(${JSON.stringify(implementationPath)} "$@")
 status=$?
 printf '%s' "$output"
@@ -146,8 +157,10 @@ if [ "$status" -eq 0 ] && [ "$1" = "new-session" ]; then
   done
   for last_arg do :; done
   pane=$(printf '%s' "$output" | sed -n '1p')
-  TMUX=/tmp/omx-test-tmux,1,0 TMUX_PANE="$pane" nohup /bin/sh -c "$last_arg" </dev/null >/tmp/omx-test-detached-leader.log 2>&1 &
+  TMUX=/tmp/omx-test-tmux,1,0 TMUX_PANE="$pane" nohup /bin/sh -c 'eval "exec $1"' sh "$last_arg" </dev/null >/tmp/omx-test-detached-leader.log 2>&1 &
   leader_pid=$!
+  printf '%s' "$leader_pid" > "$0.detached-leader-pid"
+  printf '%s' "$pane" > "$0.detached-leader-pane"
   (while kill -0 "$leader_pid" 2>/dev/null; do sleep 0.02; done; printf done > ${JSON.stringify(`${fakeTmuxPath}.leader-done`)}) </dev/null >/dev/null 2>&1 &
 fi
 exit "$status"
@@ -175,7 +188,8 @@ async function createLaunchFixture(
   await writeExecutable(join(fakeBin, 'tmux'), `#!/bin/sh
 if [ "$1" = "display-message" ] && [ "$2" = "-p" ] && [ "$3" = "-t" ] && case "$5" in *'#{session_created}'*'#{window_id}'*'#{pane_pid}'*) true;; *) false;; esac; then
   session=$(cat /tmp/omx-test-detached-session-name 2>/dev/null || printf omx-test)
-  printf '%s\t$1\t1\t0\t@1\t%s\t123\n' "$session" "$4"
+  leader_pid=$(cat "$0.detached-leader-pid" 2>/dev/null || printf 123)
+  printf '%s\t$1\t1\t0\t@1\t%s\t%s\n' "$session" "$4" "$leader_pid"
   exit 0
 fi
 if [ "$1" = "set-option" ] && [ "$2" = "-t" ] && [ "$4" = "@omx_instance_id" ]; then
@@ -185,7 +199,16 @@ if [ "$1" = "list-panes" ] && case "$*" in *'#{session_created}'*'#{@omx_instanc
   ${JSON.stringify(tmuxImpl)} "$@" >/dev/null 2>&1 || true
   session=$(cat /tmp/omx-test-detached-session-name 2>/dev/null || printf omx-test)
   owner=$(cat /tmp/omx-test-detached-owner-id 2>/dev/null || printf '')
-  printf '%%12\t0\t123\t%s\t$1\t1\t%s\n' "$session" "$owner"
+  leader_pid=$(cat "$0.detached-leader-pid" 2>/dev/null || printf 123)
+  pane=$(cat "$0.detached-leader-pane" 2>/dev/null || printf '%%12')
+  printf '%s\t0\t%s\t%s\t$1\t1\t%s\n' "$pane" "$leader_pid" "$session" "$owner"
+  exit 0
+fi
+if [ "$1" = "list-panes" ] && case "$*" in *'#{pane_id}'*'#{pane_dead}'*'#{pane_pid}'*) true;; *) false;; esac; then
+  leader_pid=$(cat "$0.detached-leader-pid" 2>/dev/null || printf '')
+  [ -n "$leader_pid" ] || exit 1
+  pane=$(cat "$0.detached-leader-pane" 2>/dev/null || printf '%%12')
+  printf '%s\t0\t%s\n' "$pane" "$leader_pid"
   exit 0
 fi
 if [ "$1" = "if-shell" ] && [ "$2" = "-F" ] && [ "$3" = "-t" ]; then
@@ -222,9 +245,16 @@ if [ "$status" -eq 0 ] && [ "$1" = "new-session" ]; then
     previous="$arg"
   done
   for last_arg do :; done
+  previous=''
+  for arg in "$@"; do
+    if [ "$previous" = '-e' ]; then export "$arg"; fi
+    previous="$arg"
+  done
   pane=$(printf '%s' "$output" | sed -n '1p')
-  TMUX=/tmp/omx-test-tmux,1,0 TMUX_PANE="$pane" nohup /bin/sh -c "$last_arg" </dev/null >/tmp/omx-test-detached-leader.log 2>&1 &
+  TMUX=/tmp/omx-test-tmux,1,0 TMUX_PANE="$pane" nohup /bin/sh -c 'eval "exec $1"' sh "$last_arg" </dev/null >/tmp/omx-test-detached-leader.log 2>&1 &
   leader_pid=$!
+  printf '%s' "$leader_pid" > "$0.detached-leader-pid"
+  printf '%s' "$pane" > "$0.detached-leader-pane"
   (while kill -0 "$leader_pid" 2>/dev/null; do sleep 0.02; done; printf done > ${JSON.stringify(join(wd, 'leader-done'))}) </dev/null >/dev/null 2>&1 &
 fi
 exit "$status"
@@ -261,8 +291,9 @@ function startHeldOmx(
   });
 }
 
-async function waitForPath(path: string, expectedLines: number = 1): Promise<void> {
-  for (let attempt = 0; attempt < 300; attempt += 1) {
+async function waitForPath(path: string, expectedLines: number = 1, timeoutMs: number = 6_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
     if (existsSync(path)) {
       const contents = await readFile(path, 'utf-8').catch(() => '');
       if (contents.trim().split('\n').filter(Boolean).length >= expectedLines) return;
@@ -1244,10 +1275,174 @@ describe('omx launcher when tmux is available', () => {
     }
   });
 
+  it('cleans a poisoned private tmux server before replaying a held child and Stop', async (t) => {
+    if (!skipUnlessPrivateRealTmux(t)) return;
+    const wd = await mkdtemp(join(tmpdir(), 'omx-launch-private-poisoned-server-'));
+    try {
+      await withTempTmuxSession(async (fixture) => {
+        const home = join(wd, 'home');
+        const bin = join(wd, 'bin');
+        const releasePath = join(wd, 'child-release');
+        const capturePath = join(wd, 'child-b-env.log');
+        const poisonRuns = join(wd, 'poison-runs');
+        const shimLogPath = join(wd, 'private-tmux-shim.log');
+        const poisonEnv = Object.fromEntries(
+          DETACHED_LAUNCH_CONTROL_PLANE_KEYS.map((key) => [
+            key,
+            key === 'OMX_RUNS_DIR' ? poisonRuns : `poison-${key.toLowerCase()}`,
+          ]),
+        ) as Record<string, string>;
+        await mkdir(home, { recursive: true });
+        await mkdir(bin, { recursive: true });
+        await writeFile(releasePath, 'hold\n');
+        const captureLines = DETACHED_LAUNCH_CONTROL_PLANE_KEYS
+          .map((key) => `printf '%s=%s\\n' '${key}' "$${key}"`)
+          .join('\n');
+        await writeExecutable(
+          join(bin, 'codex'),
+          `#!/bin/sh
+{
+${captureLines}
+} > ${JSON.stringify(capturePath)}
+while [ -f ${JSON.stringify(releasePath)} ]; do sleep 1; done
+`,
+        );
+        await fixture.createPathShim(bin, shimLogPath);
+        for (const key of DETACHED_LAUNCH_CONTROL_PLANE_KEYS) {
+          fixture.run(['set-environment', '-g', key, poisonEnv[key]!]);
+        }
+
+        const result = runOmx(wd, ['--madmax', '--tmux'], {
+          ...poisonEnv,
+          HOME: home,
+          PATH: `${bin}:${process.env.PATH ?? ''}`,
+          OMX_AUTO_UPDATE: '0',
+          OMX_NOTIFY_FALLBACK: '0',
+          OMX_HOOK_DERIVED_SIGNALS: '0',
+          OMX_HERMES_MCP_BRIDGE: '1',
+          OMX_LAUNCH_POLICY: 'direct',
+          TMUX: '',
+          TMUX_PANE: '',
+        });
+        assert.equal(result.status, 0, result.error || result.stderr || result.stdout);
+        assert.doesNotMatch(`${result.stderr}\n${result.stdout}`, /scope|pointer|state root.*error/i);
+        await waitForPath(capturePath, 1, 15_000);
+
+        const captured = Object.fromEntries(
+          (await readFile(capturePath, 'utf-8')).trim().split('\n').map((line) => {
+            const separator = line.indexOf('=');
+            return [line.slice(0, separator), line.slice(separator + 1)];
+          }),
+        ) as Record<string, string>;
+        assert.deepEqual(Object.keys(captured), [...DETACHED_LAUNCH_CONTROL_PLANE_KEYS]);
+        assert.match(captured.OMX_SESSION_ID ?? '', /^omx-/);
+        assert.equal(captured.CODEX_SESSION_ID, '');
+        assert.equal(captured.SESSION_ID, '');
+        assert.equal(captured.OMX_TMUX_HUD_OWNER, '1');
+        assert.equal(captured.OMX_TMUX_HUD_LEADER_PANE, '');
+        assert.match(captured.OMX_ROOT ?? '', new RegExp(`^${escapeRegExp(poisonRuns)}/run-`));
+        assert.equal(captured.OMX_STATE_ROOT, '');
+        assert.equal(captured.OMX_TEAM_STATE_ROOT, '');
+        assert.equal(captured.OMXBOX_ACTIVE, '1');
+        assert.equal(captured.OMX_SOURCE_CWD, wd);
+        assert.match(captured.OMX_MADMAX_DETACHED_CONTEXT ?? '', /^[0-9a-f]{32}$/);
+        assert.equal(captured.OMX_RUNS_DIR, poisonRuns);
+        assert.equal(captured.OMX_TEAM_LEADER_CWD, '');
+        assert.equal(captured.OMX_TEAM_WORKER, '');
+        assert.equal(captured.OMX_TEAM_INTERNAL_WORKER, '');
+
+        const launchedSession = fixture.run(['list-sessions', '-F', '#{session_name}'])
+          .split('\n')
+          .find((name) => name.startsWith('omx-') && name !== fixture.sessionName);
+        assert.ok(launchedSession, 'compiled launcher must create a detached session on the private server');
+        assert.equal(
+          fixture.run(['show-options', '-v', '-t', launchedSession, 'history-limit']),
+          String(DETACHED_TMUX_HISTORY_LIMIT),
+        );
+
+        const sessionJsonPath = join(captured.OMX_ROOT, '.omx', 'state', 'session.json');
+        await waitForPath(sessionJsonPath);
+        const sessionJsonBeforeStop = await readFile(sessionJsonPath, 'utf-8');
+        const sessionStateBeforeStop = JSON.parse(sessionJsonBeforeStop) as {
+          session_id?: string;
+          tmux_session_name?: string;
+          tmux_pane_id?: string;
+        };
+        assert.equal(sessionStateBeforeStop.session_id, captured.OMX_SESSION_ID);
+        assert.equal(sessionStateBeforeStop.tmux_session_name, launchedSession);
+        assert.match(sessionStateBeforeStop.tmux_pane_id ?? '', /^%[0-9]+$/);
+        const stop = spawnSync(
+          process.execPath,
+          [join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'scripts', 'codex-native-hook.js')],
+          {
+            cwd: wd,
+            input: JSON.stringify({
+              hook_event_name: 'Stop',
+              source: 'codex-app',
+              cwd: wd,
+              session_id: captured.OMX_SESSION_ID,
+              thread_id: 'poisoned-server-child-b',
+              turn_id: 'stop-poisoned-server-child-b',
+            }),
+            encoding: 'utf-8',
+            env: buildRunOmxEnv({
+              ...captured,
+              HOME: home,
+              PATH: `${bin}:${process.env.PATH ?? ''}`,
+              OMX_AUTO_UPDATE: '0',
+              OMX_NOTIFY_FALLBACK: '0',
+              OMX_HOOK_DERIVED_SIGNALS: '0',
+              TMUX: '',
+              TMUX_PANE: '',
+            }),
+          },
+        );
+        assert.equal(stop.status, 0, stop.stderr || stop.stdout);
+        assert.doesNotMatch(`${stop.stderr}\n${stop.stdout}`, /scope|pointer|state root.*error/i);
+        const stopOutput = JSON.parse(stop.stdout.trim()) as { decision?: string; stopReason?: string };
+        assert.deepEqual(stopOutput, {}, 'a clean held-child Stop must be a JSON no-op');
+        assert.notEqual(stopOutput.decision, 'block');
+        const sessionJsonAfterStop = await readFile(sessionJsonPath, 'utf-8');
+        const sessionStateAfterStop = JSON.parse(sessionJsonAfterStop) as { session_id?: string; tmux_session_name?: string };
+        assert.equal(sessionStateAfterStop.session_id, captured.OMX_SESSION_ID);
+        assert.equal(sessionStateAfterStop.tmux_session_name, launchedSession);
+        assert.equal(sessionJsonAfterStop, sessionJsonBeforeStop, 'a no-op Stop must preserve the live B session pointer');
+
+        const activeRecordPath = join(
+          captured.OMX_RUNS_DIR,
+          'active-detached',
+          `${captured.OMX_MADMAX_DETACHED_CONTEXT}.json`,
+        );
+        assert.equal(existsSync(activeRecordPath), true, 'leader must retain its active record while child B is live');
+        await rm(releasePath, { force: true });
+        for (let attempt = 0; attempt < 300 && fixture.sessionExists(launchedSession); attempt += 1) {
+          await new Promise((resolve) => setTimeout(resolve, 20));
+        }
+        assert.equal(fixture.sessionExists(launchedSession), false, 'released child must clean up its detached tmux session');
+        await waitForPath(join(captured.OMX_ROOT, '.omx', 'logs', 'session-history.jsonl'));
+        assert.equal(existsSync(activeRecordPath), false, 'released child must remove its active record');
+        assert.match(
+          await readFile(join(captured.OMX_ROOT, '.omx', 'logs', 'session-history.jsonl'), 'utf-8'),
+          new RegExp(escapeRegExp(captured.OMX_SESSION_ID)),
+        );
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true, maxRetries: 20, retryDelay: 50 });
+    }
+  });
+
   it('does not let the outer launcher fabricate leader-owned active records', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-launch-madmax-reuse-'));
     try {
       const runs = join(wd, 'runs');
+      const madmaxRoot = join(wd, 'madmax-root');
+      const madmaxContext = buildMadmaxDetachedLaunchContextKey(wd, ['--madmax', '--tmux'], madmaxRoot);
+      await mkdir(madmaxRoot, { recursive: true });
+      await writeFile(join(madmaxRoot, '.omxbox-run.json'), JSON.stringify({
+        cwd: madmaxRoot,
+        source_cwd: wd,
+        detached_launch_context: madmaxContext,
+      }));
       const activeMarker = join(wd, 'active-session');
       const instanceMarker = join(wd, 'active-instance');
       const { env, tmuxLogPath } = await createLaunchFixture(
@@ -1319,8 +1514,10 @@ exit 0
       const baseEnv = {
         ...env,
         OMX_RUNS_DIR: runs,
+        OMX_ROOT: madmaxRoot,
         OMXBOX_ACTIVE: '1',
-        OMX_MADMAX_DETACHED_CONTEXT: 'boxed-context-under-test',
+        OMX_SOURCE_CWD: wd,
+        OMX_MADMAX_DETACHED_CONTEXT: madmaxContext,
         OMX_LAUNCH_POLICY: 'direct',
         TMUX: '',
         TMUX_PANE: '',
@@ -1335,11 +1532,13 @@ exit 0
       assert.match(second.stderr, /madmax detached launch already active for this context/);
 
       const tmuxLog = await readFile(tmuxLogPath, 'utf-8');
+      assert.match(tmuxLog, new RegExp(`-e OMX_MADMAX_DETACHED_CONTEXT=${escapeRegExp(madmaxContext)}`));
+      assert.match(tmuxLog, new RegExp(`-e OMX_RUNS_DIR=${escapeRegExp(runs)}`));
       assert.equal((tmuxLog.match(/tmux:new-session/g) || []).length, 1);
       assert.equal((tmuxLog.match(/tmux:has-session/g) || []).length, 0);
       assert.ok((tmuxLog.match(/tmux:list-panes/g) || []).length >= 2);
       assert.equal((tmuxLog.match(/tmux:attach-session/g) || []).length, 2);
-      const activeRecord = await readFile(join(runs, 'active-detached', 'boxed-context-under-test.json'), 'utf-8');
+      const activeRecord = await readFile(join(runs, 'active-detached', `${madmaxContext}.json`), 'utf-8');
       assert.match(activeRecord, /"tmux_session_name"/);
       assert.match(activeRecord, /"session_id"/);
       assert.match(activeRecord, /"tmux_pane_id": "%12"/);
@@ -2597,6 +2796,7 @@ exit 0
   it('keeps finalization authority in the real detached leader process through child exit', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-detached-leader-process-'));
     const home = join(wd, 'home');
+    const fakeBin = join(wd, 'bin');
     const fakeChild = join(wd, 'fake-codex.sh');
     const childReady = join(wd, 'child-ready');
     const childRelease = join(wd, 'child-release');
@@ -2607,6 +2807,13 @@ exit 0
     const sessionId = 'omx-detached-leader-process';
     try {
       await mkdir(home, { recursive: true });
+      await mkdir(fakeBin, { recursive: true });
+      await writeExecutable(join(fakeBin, 'tmux'), `#!/bin/sh
+if [ "$1" = "list-panes" ]; then
+  printf '%s\t0\t%s\n' "$TMUX_PANE" "$PPID"
+fi
+exit 0
+`);
       await writeExecutable(fakeChild, `#!/bin/sh\nprintf '%s' "$OMX_NOTIFY_TEMP_CONTRACT" > ${JSON.stringify(childEnv)}\n(sh -c 'trap "" TERM; while :; do sleep 1; done') &\nprintf '%s' "$!" > ${JSON.stringify(descendantPidPath)}\nprintf ready > ${JSON.stringify(childReady)}\nwhile [ ! -f ${JSON.stringify(childRelease)} ]; do sleep 0.02; done\nexit 0\n`);
       const payload = Buffer.from(JSON.stringify({
         cwd: wd,
@@ -2624,6 +2831,7 @@ exit 0
           },
           enableNotifyFallbackAuthority: false,
           worktreeDirty: false,
+          shouldAttach: true,
         },
       })).toString('base64url');
       const leader = spawn(process.execPath, [omxBin, '__detached-session-leader', payload], {
@@ -2632,6 +2840,7 @@ exit 0
           HOME: home,
           TMUX: '/tmp/fake-tmux,1,0',
           TMUX_PANE: '%3202',
+          PATH: `${fakeBin}:/usr/bin:/bin`,
           OMX_AUTO_UPDATE: '0',
           OMX_NOTIFY_FALLBACK: '0',
           OMX_HOOK_DERIVED_SIGNALS: '0',
@@ -2650,7 +2859,12 @@ exit 0
       const descendantPid = Number.parseInt((await readFile(descendantPidPath, 'utf-8')).trim(), 10);
       assert.equal(Number.isSafeInteger(descendantPid) && descendantPid > 0, true);
       assert.equal(existsSync(readyPath), true);
-      assert.equal(existsSync(join(wd, '.omx', 'state', 'session.json')), true);
+      const sessionState = JSON.parse(await readFile(join(wd, '.omx', 'state', 'session.json'), 'utf-8')) as {
+        tmux_session_name?: string;
+        tmux_pane_id?: string;
+      };
+      assert.equal(sessionState.tmux_session_name, 'omx-detached-leader-process');
+      assert.equal(sessionState.tmux_pane_id, '%3202');
       assert.equal(existsSync(join(wd, '.omx', 'state', 'detached-active-record.json')), true);
       await writeFile(childRelease, 'release\n');
       const exitCode = await new Promise<number | null>((resolveExit, rejectExit) => {
@@ -2707,21 +2921,44 @@ exit 0
         await writeFile(join(home, '.omx', 'state', 'star-prompt.json'), '{"prompted_at":"2026-01-01T00:00:00.000Z"}\n');
         await fixture.createPathShim(bin);
         const omxBin = join(dirname(fileURLToPath(import.meta.url)), '..', '..', '..', 'dist', 'cli', 'omx.js');
-        const runPtyLaunch = (childExitStatus: number, remainOnExit: string): { status: number | null; output: string } => {
+        const runPtyLaunch = (childExitStatus: number, remainOnExit: string): { status: number | null; output: string; error: string } => {
           writeFileSync(join(bin, 'codex'), `#!/bin/sh\nsleep 1\nexit ${childExitStatus}\n`, { mode: 0o755 });
           // Simulate a user tmux config that would retain the dead leader pane.
           fixture.run(['set-option', '-g', 'remain-on-exit', remainOnExit]);
           const envPrefix = [
-            `HOME=${JSON.stringify(home)}`,
-            `PATH=${JSON.stringify(bin)}:$PATH`,
-            'OMX_AUTO_UPDATE=0',
-            'OMX_NOTIFY_FALLBACK=0',
-            'OMX_HOOK_DERIVED_SIGNALS=0',
-            'TERM=xterm-256color',
-          ].map((kv) => `export ${kv}`).join('; ');
-          const ptyCommand = buildPtyScriptCommand(
-            `${envPrefix}; cd ${JSON.stringify(wd)} && exec ${JSON.stringify(process.execPath)} ${JSON.stringify(omxBin)} --tmux ${JSON.stringify('e2e prompt')}`,
-          );
+            'unset TMUX TMUX_PANE',
+            'export OMX_TEST_DETACHED_TRACE=1',
+            `export OMX_TEST_DETACHED_TRACE_PATH=${JSON.stringify(join(wd, 'detached-trace.log'))}`,
+            `export HOME=${JSON.stringify(home)}`,
+            `export PATH=${JSON.stringify(bin)}:$PATH`,
+            'export OMX_AUTO_UPDATE=0',
+            'export OMX_NOTIFY_FALLBACK=0',
+            'export OMX_HOOK_DERIVED_SIGNALS=0',
+            'export TERM=xterm-256color',
+          ].join('; ');
+          const command = `${envPrefix}; cd ${JSON.stringify(wd)} || exit 125; ${JSON.stringify(process.execPath)} ${JSON.stringify(omxBin)} --tmux ${JSON.stringify('e2e prompt')}; child_status=$?; printf '\n%s:%s\n' 'omx-follow-up' "$child_status"; exit "$child_status"`;
+          if (process.platform === 'darwin') {
+            const result = fixture.runPtyResult(command, { pollLimit: DARWIN_PTY_FINALIZATION_POLL_LIMIT });
+            let diagnostics = '';
+            if (result.error) {
+              const sessions = fixture.runResult(['list-sessions', '-F', '#{session_name}']);
+              for (const session of sessions.stdout.split('\n').filter((name) => name.startsWith('omx-'))) {
+                const panes = fixture.runResult([
+                  'list-panes', '-t', session, '-F', '#{pane_id}\t#{pane_dead}\t#{pane_dead_status}\t#{pane_pid}\t#{pane_current_command}\t#{@omx_instance_id}\t#{@omx_hud_owner}',
+                ]);
+                diagnostics += `\n[${session}]\n${panes.stdout}`;
+                for (const paneLine of panes.stdout.split('\n').filter(Boolean)) {
+                  const [paneId] = paneLine.split('\t', 1);
+                  if (!paneId) continue;
+                  diagnostics += `\n[${paneLine}]\n${fixture.runResult(['capture-pane', '-p', '-t', paneId, '-S', '-']).stdout}`;
+                }
+              }
+              const tracePath = join(wd, 'detached-trace.log');
+              if (existsSync(tracePath)) diagnostics += `\n[detached-trace]\n${readFileSync(tracePath, 'utf-8')}`;
+            }
+            return { status: result.status, output: `${result.stdout}\n${result.stderr}${diagnostics}`, error: result.error };
+          }
+          const ptyCommand = buildPtyScriptCommand(command);
           const result = spawnSync(
             ptyCommand.executable,
             ptyCommand.args,
@@ -2732,18 +2969,22 @@ exit 0
               env: buildRunOmxEnv({ TMUX: '', TMUX_PANE: '' }),
             },
           );
-          return { status: result.status, output: `${result.stdout || ''}\n${result.stderr || ''}` };
+          return { status: result.status, output: `${result.stdout || ''}\n${result.stderr || ''}`, error: result.error?.message ?? '' };
         };
         const listOmxSessions = (): string[] => fixture.run(['list-sessions', '-F', '#{session_name}'])
           .split('\n')
           .filter((name) => name.startsWith('omx-') && name !== fixture.sessionName);
 
         const zero = runPtyLaunch(0, 'on');
+        assert.equal(zero.error, '', `zero-status PTY capture and cleanup must succeed: ${zero.error}\n${zero.output}`);
         assert.equal(zero.status, 0, `zero-status attached launch must return to the shell successfully:\n${zero.output}`);
+        assert.match(zero.output, /omx-follow-up:0/, `zero-status launch must leave a usable shell for a follow-up command:\n${zero.output}`);
         assert.deepEqual(listOmxSessions(), [], 'zero-status exit must destroy the owned detached session despite remain-on-exit=on');
 
         const seven = runPtyLaunch(7, 'failed');
+        assert.equal(seven.error, '', `nonzero-status PTY capture and cleanup must succeed: ${seven.error}\n${seven.output}`);
         assert.equal(seven.status, 7, `nonzero child status must propagate to the invoking shell:\n${seven.output}`);
+        assert.match(seven.output, /omx-follow-up:7/, `nonzero launch must leave a usable shell for a follow-up command:\n${seven.output}`);
         assert.deepEqual(listOmxSessions(), [], 'nonzero exit must destroy the owned detached session despite remain-on-exit=failed');
       });
     } finally {

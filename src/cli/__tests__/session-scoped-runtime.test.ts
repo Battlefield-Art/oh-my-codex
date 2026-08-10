@@ -1,6 +1,6 @@
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmod, mkdir, mkdtemp, rm, symlink, writeFile, readFile } from 'fs/promises';
+import { chmod, mkdir, mkdtemp, readFile, readdir, rm, symlink, writeFile } from 'fs/promises';
 
 import { existsSync, realpathSync } from 'fs';
 import { dirname, join } from 'path';
@@ -13,6 +13,14 @@ import { recordSkillActivation } from '../../hooks/keyword-detector.js';
 import { cancelModesForTest } from '../index.js';
 
 const tmpdir = (): string => realpathSync(osTmpdir());
+
+async function createFakeCodexBin(root: string, output: string): Promise<string> {
+  const binDir = join(root, 'bin');
+  await mkdir(binDir, { recursive: true });
+  await writeFile(join(binDir, 'codex'), `#!/bin/sh\nprintf '%s\\n' '${output}'\n`);
+  await chmod(join(binDir, 'codex'), 0o755);
+  return binDir;
+}
 
 const testDir = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(testDir, '..', '..', '..');
@@ -447,6 +455,7 @@ describe('CLI session-scoped state parity', () => {
         session_id: sessionId,
         native_session_id: nativeSessionId,
         cwd: wd,
+        state_root: stateDir,
         platform: process.platform,
       }, null, 2);
       const skillPath = join(sessionDir, 'skill-active-state.json');
@@ -565,6 +574,7 @@ describe('CLI session-scoped state parity', () => {
         session_id: sessionId,
         native_session_id: nativeSessionId,
         cwd: wd,
+        state_root: stateDir,
       }, null, 2));
       await mkdir(join(stateDir, 'sessions', nativeSessionId), { recursive: true });
       await writeFile(join(stateDir, 'sessions', nativeSessionId, 'session-owner.json'), JSON.stringify({
@@ -710,7 +720,7 @@ describe('CLI session-scoped state parity', () => {
         active_skills: [{ skill: 'ralplan', active: true, session_id: sessionId, owner_codex_session_id: nativeSessionId }],
       }, null, 2);
       await mkdir(sessionDir, { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, native_session_id: nativeSessionId, cwd: wd }));
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, native_session_id: nativeSessionId, cwd: wd, state_root: stateDir }));
       await mkdir(join(stateDir, 'sessions', nativeSessionId), { recursive: true });
       await writeFile(join(stateDir, 'sessions', nativeSessionId, 'session-owner.json'), JSON.stringify({
         session_id: nativeSessionId,
@@ -755,6 +765,7 @@ describe('CLI session-scoped state parity', () => {
 
   it('fails Ralplan preflight without mutating unproven session state', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-ralplan-preflight-scope-'));
+    const codexBin = await createFakeCodexBin(wd, 'codex-cli 0.147.0');
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess-unproven-owner';
@@ -770,11 +781,16 @@ describe('CLI session-scoped state parity', () => {
 
       await writeFile(ralplanPath, ralplanState);
 
-      const preflightResult = runOmx(wd, 'ralplan', 'preflight', '--json');
+      const preflightResult = runOmxWithEnv(wd, { PATH: `${codexBin}:${process.env.PATH}` }, 'ralplan', 'preflight', '--json');
       assert.equal(preflightResult.status, 1, preflightResult.stderr || preflightResult.stdout);
       assert.deepEqual(JSON.parse(preflightResult.stdout), {
         ok: false,
         reason: 'unsupported_documented_leader_proof',
+        diagnostics: {
+          probe_status: 'ok',
+          detected_version: '0.147.0',
+          documented_root_identity: { status: 'unknown' },
+        },
       });
       assert.equal(await readFile(ralplanPath, 'utf-8'), ralplanState);
     } finally {
@@ -782,8 +798,9 @@ describe('CLI session-scoped state parity', () => {
     }
   });
 
-  it('neutralizes exact-owner routing-only Ralplan before preflight denial', async () => {
+  it('keeps exact-owner routing-only Ralplan active after preflight denial', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-cli-ralplan-preflight-owner-'));
+    const codexBin = await createFakeCodexBin(wd, 'codex-cli 0.147.0');
     try {
       const stateDir = join(wd, '.omx', 'state');
       const sessionId = 'sess-proven-owner';
@@ -814,13 +831,18 @@ describe('CLI session-scoped state parity', () => {
       await writeFile(rootTeamPath, rootTeam);
       await writeFile(rootSkillPath, rootSkill);
       await writeFile(rootStopPath, rootStop);
+      const sessionEntries = await readdir(sessionDir);
 
-
-      const preflightResult = runOmxWithEnv(wd, { OMX_SESSION_ID: sessionId }, 'ralplan', 'preflight', '--json');
+      const preflightResult = runOmxWithEnv(wd, { OMX_SESSION_ID: sessionId, PATH: `${codexBin}:${process.env.PATH}` }, 'ralplan', 'preflight', '--json');
       assert.equal(preflightResult.status, 1, preflightResult.stderr || preflightResult.stdout);
       assert.deepEqual(JSON.parse(preflightResult.stdout), {
         ok: false,
         reason: 'unsupported_documented_leader_proof',
+        diagnostics: {
+          probe_status: 'ok',
+          detected_version: '0.147.0',
+          documented_root_identity: { status: 'unknown' },
+        },
       });
       assert.equal(await readFile(ralplanPath, 'utf-8'), ralplanState);
       assert.equal(await readFile(sessionSkillPath, 'utf-8'), sessionSkillState);
@@ -828,10 +850,11 @@ describe('CLI session-scoped state parity', () => {
         readModeState('ralplan', wd),
         readSkillActiveState(sessionSkillPath),
       ]);
-      assert.equal(state?.active, false);
-      assert.equal(state?.current_phase, 'cancelled');
-      assert.equal(skillState?.active, false);
-      assert.equal(skillState?.current_phase, 'cancelled');
+      assert.equal(state?.active, true);
+      assert.equal(skillState?.active, true);
+      const postPreflightEntries = await readdir(sessionDir);
+      assert.deepEqual(postPreflightEntries, sessionEntries);
+      assert.equal(postPreflightEntries.some((name) => name.startsWith('.ralplan-neutralization-')), false);
       assert.equal(await readFile(rootTeamPath, 'utf-8'), rootTeam);
       assert.equal(await readFile(rootSkillPath, 'utf-8'), rootSkill);
       assert.equal(await readFile(rootStopPath, 'utf-8'), rootStop);
@@ -956,7 +979,7 @@ describe('CLI session-scoped state parity', () => {
       const fakeBin = await createFakeTmuxBin(wd);
       await mkdir(dirname(statePath), { recursive: true });
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
-      await writeFile(join(outsideStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeFile(join(outsideStateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: outsideStateDir }));
       await writeFile(statePath, state);
       await symlink(outsideRoot, linkRunDir, 'dir');
       await writeActiveRunRecord({
@@ -1001,7 +1024,7 @@ describe('CLI session-scoped state parity', () => {
         const fakeBin = await createFakeTmuxBin(wd);
         await mkdir(join(stateDir, 'sessions'), { recursive: true });
         await mkdir(join(wd, '.omx', 'state'), { recursive: true });
-        await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+        await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: stateDir }));
         await writeFile(outsideStatePath, state);
         if (kind === 'session-dir') {
           await symlink(outsideRoot, sessionDir, 'dir');
@@ -1043,7 +1066,7 @@ describe('CLI session-scoped state parity', () => {
       const fakeBin = await createFakeTmuxBin(wd);
       await mkdir(dirname(statePath), { recursive: true });
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: stateDir }));
       await writeFile(statePath, state);
       await writeActiveRunRecord({ runsRoot, contextKey: 'toctou-run', sourceCwd: wd, runDir, sessionId, tmuxSessionName });
 
@@ -1081,7 +1104,7 @@ describe('CLI session-scoped state parity', () => {
       const fakeBin = await createFakeTmuxBin(wd);
       await mkdir(sessionDir, { recursive: true });
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: stateDir }));
       await writeFile(validPath, validState);
       await writeFile(malformedPath, malformedState);
       await writeActiveRunRecord({ runsRoot, contextKey: 'malformed-run', sourceCwd: wd, runDir, sessionId, tmuxSessionName });
@@ -1117,7 +1140,7 @@ describe('CLI session-scoped state parity', () => {
       const fakeBin = await createFakeTmuxBin(wd);
       await mkdir(sessionDir, { recursive: true });
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: stateDir }));
       await writeFile(modePath, JSON.stringify({ active: true, mode: 'autopilot', current_phase: 'executing' }));
       await writeFile(stopPath, JSON.stringify({ sessions: { [sessionId]: { pending: true }, foreign: { pending: true } } }, null, 2));
       await writeActiveRunRecord({ runsRoot, contextKey: 'force-run', sourceCwd: wd, runDir, sessionId, tmuxSessionName });
@@ -1154,7 +1177,7 @@ describe('CLI session-scoped state parity', () => {
         const statePath = join(runStateDir, 'sessions', sessionId, `${mode}-state.json`);
         const content = JSON.stringify({ active: true, mode, current_phase: 'executing' }, null, 2);
         await mkdir(dirname(statePath), { recursive: true });
-        await writeFile(join(runStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }));
+        await writeFile(join(runStateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: runStateDir }));
         await writeFile(statePath, content);
         await writeActiveRunRecord({
           runsRoot,
@@ -1204,7 +1227,7 @@ describe('CLI session-scoped state parity', () => {
 
       await mkdir(runSessionDir, { recursive: true });
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
-      await writeFile(join(runStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(join(runStateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: runStateDir }, null, 2));
       await writeFile(rootAutopilotPath, rootAutopilotState);
 
       await writeFile(join(runSessionDir, 'autopilot-state.json'), JSON.stringify({
@@ -1277,7 +1300,7 @@ describe('CLI session-scoped state parity', () => {
       const runSessionDir = join(runStateDir, 'sessions', sessionId);
       await mkdir(runSessionDir, { recursive: true });
       await mkdir(join(wd, '.omx', 'state'), { recursive: true });
-      await writeFile(join(runStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(join(runStateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: runStateDir }, null, 2));
       await writeFile(join(runSessionDir, 'autopilot-state.json'), JSON.stringify({
         active: true,
         mode: 'autopilot',
@@ -1322,7 +1345,7 @@ describe('CLI session-scoped state parity', () => {
       await mkdir(runSessionDir, { recursive: true });
       await mkdir(join(worktree, '.omx', 'state'), { recursive: true });
 
-      await writeFile(join(runStateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(join(runStateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: runStateDir }, null, 2));
       await writeFile(join(runSessionDir, 'autopilot-state.json'), JSON.stringify({
         active: true,
         mode: 'autopilot',
@@ -1366,7 +1389,7 @@ describe('CLI session-scoped state parity', () => {
     try {
       const stateDir = join(wd, '.omx', 'state');
       await mkdir(stateDir, { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: 'sess-stale-autopilot' }, null, 2));
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: 'sess-stale-autopilot', cwd: wd, state_root: stateDir }, null, 2));
       const currentAutopilotPath = join(stateDir, 'current-autopilot.json');
       const currentAutopilot = {
         active: true,
@@ -1398,7 +1421,7 @@ describe('CLI session-scoped state parity', () => {
       const sessionId = 'sess-stale-autopilot-inactive';
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: stateDir }, null, 2));
       const currentAutopilotPath = join(stateDir, 'current-autopilot.json');
       const currentAutopilot = {
         active: true,
@@ -1431,7 +1454,7 @@ describe('CLI session-scoped state parity', () => {
       const sessionId = 'sess-active-autopilot';
       const sessionDir = join(stateDir, 'sessions', sessionId);
       await mkdir(sessionDir, { recursive: true });
-      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(join(stateDir, 'session.json'), JSON.stringify({ session_id: sessionId, cwd: wd, state_root: stateDir }, null, 2));
       await writeFile(join(stateDir, 'current-autopilot.json'), JSON.stringify({
         active: true,
         current_phase: 'complete',

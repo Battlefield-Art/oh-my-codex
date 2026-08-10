@@ -961,6 +961,27 @@ describe('state operations directory initialization', () => {
     }
   });
 
+  it('excludes derived run-state.json from active mode enumeration while preserving genuine mode state files', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-derived-run-state-'));
+    try {
+      const sessionId = 'sess-derived-run-state';
+      const sessionDir = join(wd, '.omx', 'state', 'sessions', sessionId);
+      await mkdir(sessionDir, { recursive: true });
+      await writeFile(join(wd, '.omx', 'state', 'session.json'), JSON.stringify({ session_id: sessionId }, null, 2));
+      await writeFile(join(sessionDir, 'run-state.json'), JSON.stringify({ active: true, mode: 'derived' }, null, 2));
+      await writeFile(join(sessionDir, 'autopilot-state.json'), JSON.stringify({ active: true, current_phase: 'executing' }, null, 2));
+
+      const response = await executeStateOperation('state_list_active', {
+        workingDirectory: wd,
+        session_id: sessionId,
+      });
+
+      assert.deepEqual(response.payload, { active_modes: ['autopilot'] });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
   it('does not list a mode active when terminal canonical visibility contradicts an active detail state', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-terminal-canonical-wins-'));
     try {
@@ -1809,7 +1830,7 @@ describe('state operations directory initialization', () => {
 
         const beforeList = await executeStateOperation('state_list_active', { workingDirectory: wd });
         const beforeTeam = await executeStateOperation('state_read', { workingDirectory: wd, mode: 'team' });
-        assert.deepEqual(beforeList.payload, { active_modes: ['run'] });
+        assert.deepEqual(beforeList.payload, { active_modes: [] });
         assert.deepEqual(beforeTeam.payload, teamState);
 
         const response = await executeStateOperation('state_write', {
@@ -1832,7 +1853,7 @@ describe('state operations directory initialization', () => {
           foreignSkillState,
         );
         const afterList = await executeStateOperation('state_list_active', { workingDirectory: wd });
-        assert.deepEqual(afterList.payload, { active_modes: ['deep-interview', 'run'] });
+        assert.deepEqual(afterList.payload, { active_modes: ['deep-interview'] });
       } finally {
         await rm(wd, { recursive: true, force: true });
       }
@@ -4639,6 +4660,66 @@ function assertPrefix(events: WritableEvent[], expected: WritableEvent[]): void 
   assert.deepEqual(events.slice(0, expected.length), expected);
 }
 
+  it('fails closed before primary session persistence on malformed root skill-active state', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-malformed-root-'));
+    try {
+      const { stateDir, sessionId } = await seedWritableScope(wd);
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      const sessionPath = join(stateDir, 'sessions', sessionId, 'skill-active-state.json');
+      const rootBytes = '{"active":true,\n';
+      const sessionBytes = '{"active":true,"skill":"old"}\n';
+      await writeFile(rootPath, rootBytes);
+      await writeFile(sessionPath, sessionBytes);
+
+      const response = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        session_id: sessionId,
+        mode: 'skill-active',
+        active: true,
+        skill: 'new',
+        phase: 'executing',
+        active_skills: [{ skill: 'new', phase: 'executing', active: true, session_id: sessionId }],
+      });
+
+      assert.equal(response.isError, true);
+      assert.match(String((response.payload as { error?: string }).error || ''), /malformed root skill-active state/i);
+      assert.equal(await readFile(rootPath, 'utf8'), rootBytes);
+      assert.equal(await readFile(sessionPath, 'utf8'), sessionBytes);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed before primary session persistence on root lock timeout', async () => {
+    const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-lock-timeout-'));
+    try {
+      const { stateDir, sessionId } = await seedWritableScope(wd);
+      const rootPath = join(stateDir, 'skill-active-state.json');
+      const sessionPath = join(stateDir, 'sessions', sessionId, 'skill-active-state.json');
+      const rootBytes = `${JSON.stringify({ version: 1, active: true, skill: 'old', session_id: sessionId, active_skills: [] }, null, 2)}\n`;
+      const sessionBytes = '{"active":true,"skill":"old"}\n';
+      await writeFile(rootPath, rootBytes);
+      await writeFile(sessionPath, sessionBytes);
+      await mkdir(`${rootPath}.lock`);
+
+      const response = await executeStateOperation('state_write', {
+        workingDirectory: wd,
+        session_id: sessionId,
+        mode: 'skill-active',
+        active: true,
+        skill: 'new',
+        phase: 'executing',
+        active_skills: [{ skill: 'new', phase: 'executing', active: true, session_id: sessionId }],
+      });
+
+      assert.equal(response.isError, true);
+      assert.match(String((response.payload as { error?: string }).error || ''), /lock|timeout/i);
+      assert.equal(await readFile(rootPath, 'utf8'), rootBytes);
+      assert.equal(await readFile(sessionPath, 'utf8'), sessionBytes);
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
   it('T4 records the full pinned state_write commit prefix', async () => {
     const wd = await mkdtemp(join(tmpdir(), 'omx-state-ops-t4-'));
     try {

@@ -22,7 +22,7 @@ import {
   unlink as nodeUnlink,
   writeFile as nodeWriteFile,
 } from 'fs/promises';
-import { constants as fsConstants, readFileSync } from 'fs';
+import { appendFileSync, closeSync, constants as fsConstants, fstatSync, openSync, readFileSync } from 'fs';
 import type { FileHandle } from 'fs/promises';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'crypto';
@@ -266,6 +266,13 @@ const LOCK_RETRY_DELAYS_MS = [25, 50, 100] as const;
 const DEFAULT_POINTER_TIMEOUT_MS = 5_000;
 const NATIVE_POINTER_TIMEOUT_MS = 2_000;
 
+
+function traceSessionFinalizationOperation(operation: string): void {
+  if (process.env.OMX_TEST_DETACHED_TRACE !== '1') return;
+  const tracePath = process.env.OMX_TEST_DETACHED_TRACE_PATH;
+  if (!tracePath) return;
+  appendFileSync(tracePath, `[omx-test-session-finalization] ${operation}\n`);
+}
 /**
  * Convert arbitrary input into a valid session ID without exposing validator
  * exceptions to lifecycle or hook inputs.
@@ -277,9 +284,12 @@ export function normalizeSessionId(value: unknown): string | undefined {
 }
 
 /** Resolve the one exact pointer path used by an operation. */
-export function resolveSessionPointerContext(cwd: string): SessionPointerContext {
-  const normalizedCwd = resolveWorkingDirectoryForState(cwd);
-  const { baseStateDir, rootSource } = getBaseStateDirWithSource(normalizedCwd);
+export function resolveSessionPointerContext(
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): SessionPointerContext {
+  const normalizedCwd = resolveWorkingDirectoryForState(cwd, env);
+  const { baseStateDir, rootSource } = getBaseStateDirWithSource(normalizedCwd, env);
   const pointerPath = join(baseStateDir, SESSION_FILE);
   return {
     cwd: normalizedCwd,
@@ -671,7 +681,7 @@ function isValidBirth(value: unknown): value is string {
   return typeof value === 'string' && PROCESS_BIRTH_PATTERN.test(value);
 }
 
-function isValidProcessIdentity(value: unknown): value is ProcessIdentity {
+export function isValidProcessIdentity(value: unknown): value is ProcessIdentity {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false;
   const identity = value as Partial<ProcessIdentity>;
   if (Object.keys(identity).some((key) => key !== 'platform' && key !== 'birth' && key !== 'cmdline_hash')) return false;
@@ -1031,9 +1041,12 @@ export async function readUsableSessionStateFromContext(context: SessionPointerC
 }
 
 /** Read current session state from the exact selected root. */
-export async function readSessionState(cwd: string): Promise<SessionState | null> {
+export async function readSessionState(
+  cwd: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<SessionState | null> {
   try {
-    return await readSessionStateFromContext(resolveSessionPointerContext(cwd));
+    return await readSessionStateFromContext(resolveSessionPointerContext(cwd, env));
   } catch {
     return null;
   }
@@ -2531,12 +2544,31 @@ function isAuthorizedBoundPointer(
   candidateSessionId: string,
   state: SessionState | undefined,
 ): boolean {
+  traceSessionFinalizationOperation('auth-function-enter');
+  traceSessionFinalizationOperation('lease-lookup-start');
   const lease = bindingLeases.get(binding);
-  if (!lease || (binding.directoryIdentity.kind === 'supported' && lease.closed) || !state) return false;
-  if (!isValidToken(binding.launchLineageToken) || !isValidToken(state.launch_lineage_token)) return false;
-  if (candidateSessionId !== binding.canonicalSessionId) return false;
-  if (state.launch_lineage_token !== binding.launchLineageToken) return false;
-  if (state.started_at !== binding.startedAt) return false;
+  traceSessionFinalizationOperation('lease-lookup-done');
+  traceSessionFinalizationOperation(`state-present:${state ? 'true' : 'false'}`);
+  if (!lease || (binding.directoryIdentity.kind === 'supported' && lease.closed) || !state) {
+    traceSessionFinalizationOperation('bound-auth-fail:lease-or-state');
+    return false;
+  }
+  if (!isValidToken(binding.launchLineageToken) || !isValidToken(state.launch_lineage_token)) {
+    traceSessionFinalizationOperation('bound-auth-fail:token-shape');
+    return false;
+  }
+  if (candidateSessionId !== binding.canonicalSessionId) {
+    traceSessionFinalizationOperation('bound-auth-fail:candidate-session');
+    return false;
+  }
+  if (state.launch_lineage_token !== binding.launchLineageToken) {
+    traceSessionFinalizationOperation('bound-auth-fail:lineage-token');
+    return false;
+  }
+  if (state.started_at !== binding.startedAt) {
+    traceSessionFinalizationOperation('bound-auth-fail:started-at');
+    return false;
+  }
   const directCanonicalIdentity = state.session_id === binding.canonicalSessionId
     && ((state.owner_omx_session_id ?? undefined) === binding.ownerOmxSessionId
       || (binding.ownerOmxSessionId === undefined && state.owner_omx_session_id === binding.canonicalSessionId))
@@ -2544,16 +2576,20 @@ function isAuthorizedBoundPointer(
   const replacedNativeIdentity = state.owner_omx_session_id === binding.canonicalSessionId
     && normalizeSessionId(state.session_id) !== undefined
     && state.native_session_id === state.session_id;
-  if (!directCanonicalIdentity && !replacedNativeIdentity) return false;
-  try {
-    return context.rootSource === binding.context.rootSource
-      && context.baseStateDir === binding.context.baseStateDir
-      && context.sessionPath === binding.context.sessionPath
-      && sameFilePath(context.cwd, binding.context.cwd)
-      && sameFilePath(state.cwd, binding.context.cwd);
-  } catch {
+  if (!directCanonicalIdentity && !replacedNativeIdentity) {
+    traceSessionFinalizationOperation('bound-auth-fail:session-identity');
     return false;
   }
+  if (context.rootSource !== binding.context.rootSource) traceSessionFinalizationOperation('bound-auth-fail:root-source');
+  else if (context.baseStateDir !== binding.context.baseStateDir) traceSessionFinalizationOperation('bound-auth-fail:base-state-dir');
+  else if (context.sessionPath !== binding.context.sessionPath) traceSessionFinalizationOperation('bound-auth-fail:session-path');
+  else if (context.cwd !== binding.context.cwd) traceSessionFinalizationOperation('bound-auth-fail:context-cwd');
+  else if (state.cwd !== binding.context.cwd) traceSessionFinalizationOperation('bound-auth-fail:state-cwd');
+  else {
+    traceSessionFinalizationOperation('bound-auth-success');
+    return true;
+  }
+  return false;
 }
 
 function isAuthorizedBoundStaleDeadPointer(
@@ -2577,6 +2613,32 @@ class BoundDirectoryComparisonDenied extends Error {
   constructor(readonly comparison: NonNullable<LifecycleCleanupEvidence['comparison']>, readonly capability: CapabilityCloseEvidence[]) {
     super(comparison.reason);
   }
+}
+
+function isAuthorizedBoundPointerForFinalization(
+  binding: LaunchSessionBinding,
+  context: SessionPointerContext,
+  candidateSessionId: string,
+  pointer: SessionPointerReadResult,
+  phase: 'preLock' | 'under-lock',
+): boolean {
+  traceSessionFinalizationOperation(`${phase}-status:${pointer.status}`);
+  if (pointer.status === 'usable') {
+    traceSessionFinalizationOperation(`${phase}-usable-branch-enter`);
+    return isAuthorizedBoundPointer(binding, context, candidateSessionId, pointer.state);
+  }
+  if (pointer.status === 'stale-dead') {
+    traceSessionFinalizationOperation(`${phase}-stale-dead-branch-enter`);
+    return isAuthorizedBoundStaleDeadPointer(binding, context, candidateSessionId, pointer.state);
+  }
+  if (pointer.status === 'identity-indeterminate') {
+    traceSessionFinalizationOperation(`${phase}-identity-indeterminate-branch-enter`);
+    const sameProcess = pointer.state?.pid === process.pid;
+    traceSessionFinalizationOperation(`${phase}-identity-indeterminate-current-pid:${sameProcess ? 'true' : 'false'}`);
+    return sameProcess && isAuthorizedBoundPointer(binding, context, candidateSessionId, pointer.state);
+  }
+  traceSessionFinalizationOperation(`${phase}-unsupported-status`);
+  return false;
 }
 
 async function authorizeBoundDirectoryBeforeTransaction(
@@ -2603,22 +2665,22 @@ async function authorizeBoundDirectoryBeforeTransaction(
         pointerRaw: pointer.raw,
       };
     }
-    const retained = await lease.handle?.stat({ bigint: true });
+    const retained = fstatSync(lease.handle!.fd, { bigint: true });
     if (!retained || !retained.isDirectory() || retained.dev !== binding.directoryIdentity.dev || retained.ino !== binding.directoryIdentity.ino) {
       throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'retained-directory-identity-mismatch' }, capability);
     }
     const canonical = await realpath(binding.context.baseStateDir);
-    const handle = await open(canonical, 'r');
+    const fd = openSync(canonical, 'r');
     let matched = false;
     try {
-      const stats = await handle.stat({ bigint: true });
+      const stats = fstatSync(fd, { bigint: true });
       matched = canonical === binding.canonicalRealpath
         && stats.isDirectory()
         && stats.dev === binding.directoryIdentity.dev
         && stats.ino === binding.directoryIdentity.ino;
     } finally {
       try {
-        await handle.close();
+        closeSync(fd);
         capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'closed' });
       } catch (error) {
         capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'failed', error: safeError(error) });
@@ -2641,7 +2703,7 @@ async function consumeBoundDirectoryAuthorizationUnderLock(
   if (authorization.comparison?.status !== 'matched' || binding.directoryIdentity.kind !== 'supported') return authorization;
   const lease = bindingLeases.get(binding);
   try {
-    const retained = await lease?.handle?.stat({ bigint: true });
+    const retained = lease?.handle ? fstatSync(lease.handle.fd, { bigint: true }) : undefined;
     if (!retained || !retained.isDirectory() || retained.dev !== binding.directoryIdentity.dev || retained.ino !== binding.directoryIdentity.ino) {
       throw new BoundDirectoryComparisonDenied({ status: 'denied', reason: 'retained-directory-identity-mismatch' }, authorization.capability);
     }
@@ -2652,17 +2714,17 @@ async function consumeBoundDirectoryAuthorizationUnderLock(
       );
     }
     const canonical = await realpath(binding.context.baseStateDir);
-    const handle = await open(canonical, 'r');
+    const fd = openSync(canonical, 'r');
     let matched = false;
     try {
-      const stats = await handle.stat({ bigint: true });
+      const stats = fstatSync(fd, { bigint: true });
       matched = canonical === binding.canonicalRealpath
         && stats.isDirectory()
         && stats.dev === binding.directoryIdentity.dev
         && stats.ino === binding.directoryIdentity.ino;
     } finally {
       try {
-        await handle.close();
+        closeSync(fd);
         authorization.capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'closed' });
       } catch (error) {
         authorization.capability.push({ role: 'fresh-comparison', phase: 'before-authorization', status: 'failed', error: safeError(error) });
@@ -2995,29 +3057,31 @@ export async function writeSessionEnd(
   }
 
   let preLockPointer: SessionPointerReadResult;
+  traceSessionFinalizationOperation('preLock-read-start');
   try {
     preLockPointer = await readSessionPointer(context);
+    traceSessionFinalizationOperation(`preLock-read-done:${preLockPointer.status}`);
   } catch (error) {
     throw resolvedAbort(context, {
       code: 'session_pointer_io_failure', operation: 'pointer-read', candidateSessionId,
       lockPath: context.lockPath, reason: `Unable to read selected session pointer: ${errorMessage(error)}`, cause: error,
     });
   }
-  const preLockAuthorizedBoundUsable = preLockPointer.status === 'usable'
-    && isAuthorizedBoundPointer(options.binding, context, candidateSessionId, preLockPointer.state);
-  const preLockAuthorizedBoundStaleDead = preLockPointer.status === 'stale-dead'
-    && isAuthorizedBoundStaleDeadPointer(options.binding, context, candidateSessionId, preLockPointer.state);
-  if (!preLockAuthorizedBoundUsable && !preLockAuthorizedBoundStaleDead) {
-    throw unusablePointerAbort(context, candidateSessionId, preLockPointer);
-  }
+  const preLockAuthorized = isAuthorizedBoundPointerForFinalization(
+    options.binding, context, candidateSessionId, preLockPointer, 'preLock',
+  );
+  if (!preLockAuthorized) throw unusablePointerAbort(context, candidateSessionId, preLockPointer);
+  traceSessionFinalizationOperation('pre-transaction-auth-start');
   await authorizeBoundDirectoryBeforeTransaction(
     options.binding,
     preLockPointer,
     options.postLaunchCwd ?? options.binding.context.cwd,
   );
+  traceSessionFinalizationOperation('pre-transaction-auth-done');
 
   const platform = options.platform ?? process.platform;
   const tracker: RegularFileDurabilityTracker = { degraded: false };
+  traceSessionFinalizationOperation('acquirePointerLock-start');
   const lock = await acquirePointerLock(
     context,
     candidateSessionId,
@@ -3026,14 +3090,17 @@ export async function writeSessionEnd(
     tracker,
     options.regularFileSync,
   );
+  traceSessionFinalizationOperation('acquirePointerLock-done');
   let primary: unknown;
   let revalidation: { comparison: LifecycleCleanupEvidence['comparison']; capability: CapabilityCloseEvidence[] } = {
     comparison: { status: 'not-run' }, capability: [],
   };
   try {
     let pointer: SessionPointerReadResult;
+    traceSessionFinalizationOperation('under-lock-read-start');
     try {
       pointer = await readSessionPointer(context);
+      traceSessionFinalizationOperation(`under-lock-read-done:${pointer.status}`);
     } catch (error) {
       throw resolvedAbort(context, {
         code: 'session_pointer_io_failure',
@@ -3044,19 +3111,20 @@ export async function writeSessionEnd(
         cause: error,
       });
     }
-    const authorizedBoundUsable = pointer.status === 'usable'
-      && isAuthorizedBoundPointer(options.binding, context, candidateSessionId, pointer.state);
-    const authorizedBoundStaleDead = pointer.status === 'stale-dead'
-      && isAuthorizedBoundStaleDeadPointer(options.binding, context, candidateSessionId, pointer.state);
-    if (!authorizedBoundUsable && !authorizedBoundStaleDead) {
-      throw unusablePointerAbort(context, candidateSessionId, pointer);
-    }
+    const authorized = isAuthorizedBoundPointerForFinalization(
+      options.binding, context, candidateSessionId, pointer, 'under-lock',
+    );
+    if (!authorized) throw unusablePointerAbort(context, candidateSessionId, pointer);
+    traceSessionFinalizationOperation('under-lock-auth-start');
     const authorization = await authorizeBoundDirectoryBeforeTransaction(
       options.binding,
       pointer,
       options.postLaunchCwd ?? options.binding.context.cwd,
     );
+    traceSessionFinalizationOperation('under-lock-auth-done');
+    traceSessionFinalizationOperation('under-lock-consume-start');
     revalidation = await consumeBoundDirectoryAuthorizationUnderLock(options.binding, authorization, pointer);
+    traceSessionFinalizationOperation('under-lock-consume-done');
 
     const state = pointer.state!;
     const ownsCurrentSessionFile = true;
@@ -3076,12 +3144,19 @@ export async function writeSessionEnd(
       ...(!ownsCurrentSessionFile && state?.session_id ? { preserved_active_session_id: state.session_id } : {}),
     };
 
+    traceSessionFinalizationOperation('history-mkdir-start');
     await nodeMkdir(historyDirectory(context), { recursive: true });
+    traceSessionFinalizationOperation('history-mkdir-done');
+    traceSessionFinalizationOperation('history-append-start');
     await appendFile(historyPath(context), `${JSON.stringify(historyEntry)}\n`);
+    traceSessionFinalizationOperation('history-append-done');
+    traceSessionFinalizationOperation('hud-cleanup-start');
     await removeDeadSessionHudState(context, [
       ...(ownsCurrentSessionFile ? [state?.session_id, state?.native_session_id] : []),
       candidateSessionId,
     ]);
+    traceSessionFinalizationOperation('hud-cleanup-done');
+    traceSessionFinalizationOperation('session-unlink-start');
     if (ownsCurrentSessionFile) {
       try {
         await transactionDependencies.fs.unlink(context.sessionPath);
@@ -3089,6 +3164,8 @@ export async function writeSessionEnd(
         if (!isNotFound(error)) throw error;
       }
     }
+    traceSessionFinalizationOperation('session-unlink-done');
+    traceSessionFinalizationOperation('session-end-log-start');
     await appendToLogAtContext(context, {
       event: 'session_end',
       session_id: historyEntry.session_id,
@@ -3097,11 +3174,14 @@ export async function writeSessionEnd(
       ...(historyEntry.preserved_active_session_id ? { preserved_active_session_id: historyEntry.preserved_active_session_id } : {}),
       timestamp: endTime,
     }).catch(() => {});
+    traceSessionFinalizationOperation('session-end-log-done');
   } catch (error) {
     primary = error;
   }
 
+  traceSessionFinalizationOperation('lock-release-start');
   const releaseFailures = await releasePointerLock(lock);
+  traceSessionFinalizationOperation('lock-release-done');
   if (primary) {
     if (isSessionPointerLaunchAbort(primary) && releaseFailures.length > 0) {
       throw recoveryAbort(context, primary as ResolvedSessionPointerAbort, releaseFailures, 'lock-release');
