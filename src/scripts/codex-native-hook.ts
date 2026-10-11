@@ -25,6 +25,7 @@ import {
   readSubagentSessionSummary,
   readSubagentTrackingState,
   recordNativeSubagentAuthorityObservation,
+  recordSubagentTurnForSession,
   repairPersistedRootIdentity,
   quarantinePersistedRootAuthority,
   revokeNativeSubagentAuthorities,
@@ -21957,6 +21958,7 @@ export async function dispatchCodexNativeHook(
   let resolvedNativeSessionId = nativeSessionId;
   let skipCanonicalSessionStartContext = false;
   let isSubagentSessionStart = false;
+  let recordedNativeSubagentSessionStart = false;
   const authoritativeTeamWorker = authoritativeTeamWorkerEvidence !== null;
   const authoritativeWorkerPayloadSessionId = authoritativeTeamWorker
     && candidateWorkerPayloadSessionId
@@ -21999,6 +22001,7 @@ export async function dispatchCodexNativeHook(
         );
         if (belongsToCanonicalSession) {
           resolvedNativeSessionId = nativeSessionId;
+          recordedNativeSubagentSessionStart = true;
           await recordNativeSubagentSessionStart(
             cwd,
             canonicalSessionId,
@@ -22591,6 +22594,19 @@ export async function dispatchCodexNativeHook(
           goalWorkflowAdditionalContext,
           triageAdditionalContext,
         ].filter((entry): entry is string => Boolean(entry)).join("\n\n") || null;
+    // Record bounded delivery evidence for native subagent SessionStart events
+    // Skip if recordNativeSubagentSessionStart already recorded the turn (to avoid duplicate increment)
+    if (hookEventName === "SessionStart" && isSubagentSessionStart && allowImplicitSessionSideEffects && !recordedNativeSubagentSessionStart) {
+      const threadId = readPayloadThreadId(payload);
+      if (canonicalSessionId?.trim() && threadId?.trim()) {
+        await recordSubagentTurnForSession(cwd, {
+          sessionId: canonicalSessionId.trim(),
+          threadId: threadId.trim(),
+          completed: false,
+          timestamp: new Date().toISOString(),
+        }).catch(() => {});
+      }
+    }
     if (additionalContext) {
       outputJson = {
         hookSpecificOutput: {
@@ -22665,6 +22681,19 @@ export async function dispatchCodexNativeHook(
         skipAutoNudge: isSubagentStop,
         sessionScopedOnly: !allowGlobalSideEffects,
       });
+      // Record bounded completion evidence for native subagent Stop events
+      if (isSubagentStop) {
+        const threadId = readPayloadThreadId(payload);
+        if (canonicalSessionId?.trim() && threadId?.trim()) {
+          await recordSubagentTurnForSession(cwd, {
+            sessionId: canonicalSessionId.trim(),
+            threadId: threadId.trim(),
+            completed: true,
+            completionSource: 'native_stop_event',
+            timestamp: new Date().toISOString(),
+          }).catch(() => {});
+        }
+      }
       outputJson = stopOutput ?? (
         allowGlobalSideEffects
           ? await buildCompletedGoalCleanupStopOutput(payload, cwd)

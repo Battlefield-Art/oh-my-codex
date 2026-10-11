@@ -66,6 +66,7 @@ import {
 	readUltragoalPlan,
 } from "../../ultragoal/artifacts.js";
 import { getBaseStateDir } from "../../state/paths.js";
+import { recordNativeSubagentAuthorityObservation } from "../../subagents/tracker.js";
 import { maybeNudgeLeaderForAllowedWorkerStop } from "../notify-hook/team-worker-stop.js";
 import { MAX_NATIVE_STDIN_JSON_BYTES } from "../hook-payload-guard.js";
 import {
@@ -1273,6 +1274,187 @@ describe("codex native hook dispatch", { concurrency: false }, () => {
 			assert.equal(result.stderr, "");
 			assert.deepEqual(parseSingleJsonStdout(result.stdout), {});
 			assert.equal(existsSync(join(cwd, ".omx", "state")), false);
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("records bounded completion evidence for native subagent Stop events (#3729)", async () => {
+		const cwd = await mkdtemp(
+			join(tmpdir(), "omx-native-hook-stop-completion-evidence-"),
+		);
+		try {
+			const stateDir = join(cwd, ".omx", "state");
+			const sessionId = "sess-stop-subagent";
+			const threadId = "thread-stop-subagent";
+			const leaderThreadId = "leader-thread";
+			await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+			await writeSessionStart(cwd, sessionId, { nativeSessionId: leaderThreadId, pid: process.pid });
+		
+			// Create transcript with thread_spawn metadata to make dispatcher detect as subagent
+			const stopTranscriptPath = join(cwd, "stop-transcript.jsonl");
+			await writeFile(stopTranscriptPath, JSON.stringify({
+				type: "session_meta",
+				payload: { id: threadId, source: { subagent: { thread_spawn: { parent_thread_id: leaderThreadId } } } }
+			}) + "\n");
+		
+			// Initialize subagent tracking by recording the native subagent observation
+			await recordNativeSubagentAuthorityObservation(cwd, {
+				sessionIds: [sessionId],
+				childThreadId: threadId,
+				parentThreadId: leaderThreadId,
+				rootNativeSessionId: leaderThreadId,
+				authorityEvidence: "valid",
+			});
+		
+			// Send Stop event from subagent thread
+			const result = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "Stop",
+					cwd,
+					session_id: sessionId,
+					thread_id: threadId,
+					stop_hook_active: true,
+				},
+				{ cwd, sessionOwnerPid: process.pid },
+			);
+			
+			// Verify completion evidence was recorded
+			const tracking = JSON.parse(
+				await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"),
+			) as {
+				sessions?: Record<
+					string,
+					{ threads?: Record<string, { completed_at?: string; completion_source?: string; turn_count?: number }> }
+				>;
+			};
+			
+			const thread = tracking.sessions?.[sessionId]?.threads?.[threadId];
+			assert.ok(thread?.completed_at, "completion evidence must record completed_at timestamp");
+			assert.equal(thread?.completion_source, "native_stop_event", "completion evidence must mark completionSource as native_stop_event");
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("records bounded delivery evidence for native subagent SessionStart events (#3729)", async () => {
+		const cwd = await mkdtemp(
+			join(tmpdir(), "omx-native-hook-sessionstart-delivery-evidence-"),
+		);
+		try {
+			const stateDir = join(cwd, ".omx", "state");
+			const sessionId = "sess-sessionstart-subagent";
+			const threadId = "thread-sessionstart-subagent";
+			const leaderThreadId = "leader-thread";
+			await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+			await writeSessionStart(cwd, sessionId, { nativeSessionId: leaderThreadId, pid: process.pid });
+		
+			// Create transcript with thread_spawn metadata to make dispatcher detect as subagent
+			const transcriptPath = join(cwd, "sessionstart-transcript.jsonl");
+			await writeFile(transcriptPath, JSON.stringify({
+				type: "session_meta",
+				payload: { id: threadId, source: { subagent: { thread_spawn: { parent_thread_id: leaderThreadId } } } }
+			}) + "\n");
+			
+
+			
+			// Send SessionStart event from subagent thread
+			// Note: session_id should be the child's thread ID, thread_id is required for evidence recording
+			const result = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "SessionStart",
+					cwd,
+					session_id: threadId,
+					thread_id: threadId,
+					transcript_path: transcriptPath,
+				},
+				{ cwd, sessionOwnerPid: process.pid },
+			);
+			
+			// Verify delivery evidence was recorded (without completion_source)
+			// Note: Sessions are keyed by canonical session ID in tracking state
+			const canonicalFromPointer = JSON.parse(
+				await readFile(join(stateDir, "session.json"), "utf-8"),
+			) as { session_id?: string };
+			const canonicalSessionIdResult = canonicalFromPointer.session_id || sessionId;
+			const tracking = JSON.parse(
+				await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"),
+			) as {
+				sessions?: Record<
+					string,
+					{ threads?: Record<string, { completed_at?: string; completion_source?: string; turn_count?: number }> }
+				>;
+			};
+			
+			const thread = tracking.sessions?.[canonicalSessionIdResult]?.threads?.[threadId];
+			assert.ok(thread, "thread should exist in tracking");
+			// SessionStart should record the turn (turn_count should be incremented to 1)
+			assert.equal(thread?.turn_count, 1, "SessionStart must record the turn (turn_count should be 1)");
+			// SessionStart should NOT set completed_at
+			assert.ok(!thread?.completed_at, "SessionStart must not set completed_at timestamp");
+			// SessionStart should NOT set completion_source
+			assert.ok(!thread?.completion_source, "SessionStart must not set completion_source");
+		} finally {
+			await rm(cwd, { recursive: true, force: true });
+		}
+	});
+
+	it("does NOT record completion evidence for leader Stop events (#3729)", async () => {
+		const cwd = await mkdtemp(
+			join(tmpdir(), "omx-native-hook-stop-leader-no-record-"),
+		);
+		try {
+			const stateDir = join(cwd, ".omx", "state");
+			const sessionId = "sess-stop-leader";
+			const leaderThreadId = "leader-thread-stop";
+			await mkdir(join(stateDir, "sessions", sessionId), { recursive: true });
+		
+			// Initialize subagent tracking with only leader thread BEFORE writeSessionStart
+			await writeJson(join(stateDir, "subagent-tracking.json"), {
+				schemaVersion: 1,
+				sessions: {
+					[sessionId]: {
+						session_id: sessionId,
+						leader_thread_id: leaderThreadId,
+						updated_at: new Date().toISOString(),
+						threads: {
+							[leaderThreadId]: {
+								thread_id: leaderThreadId,
+								kind: "leader",
+								status: "available",
+								first_seen_at: new Date().toISOString(),
+								last_seen_at: new Date().toISOString(),
+							},
+						},
+					},
+				},
+			});
+			
+			// Send Stop event from leader thread
+			const result = await dispatchCodexNativeHook(
+				{
+					hook_event_name: "Stop",
+					cwd,
+					session_id: sessionId,
+					thread_id: leaderThreadId,
+					stop_hook_active: true,
+				},
+				{ cwd },
+			);
+			
+			// Verify NO completion evidence was recorded for leader
+			const tracking = JSON.parse(
+				await readFile(join(stateDir, "subagent-tracking.json"), "utf-8"),
+			) as {
+				sessions?: Record<
+					string,
+					{ threads?: Record<string, { completed_at?: string; completion_source?: string; turn_count?: number }> }
+				>;
+			};
+			
+			const thread = tracking.sessions?.[sessionId]?.threads?.[leaderThreadId];
+			assert.ok(!thread?.completed_at, "leader Stop must not record completed_at timestamp");
+			assert.ok(!thread?.completion_source, "leader Stop must not record completion_source");
 		} finally {
 			await rm(cwd, { recursive: true, force: true });
 		}
