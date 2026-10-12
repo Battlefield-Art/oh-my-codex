@@ -4,6 +4,35 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.21.10] - 2026-10-12
+
+Patch release for `v0.21.9..72fee0236cf8a4b45e6dd9b3d826871f402b84ae` (16 commits, 15 files, +1067/−82, PRs #3765/#3768/#3771/#3772/#3774/#3775/#3777, linked issues #3655/#3766/#3776).
+
+### Highlights
+
+- TOML configuration merge robustness: multi-line arrays in the `[tui]` configuration section are now correctly preserved during config merge operations, preventing loss of array elements and enabling complex TUI customization without manual repair (#3777, fixes #3776).
+- Astra-defaults evaluation infrastructure: the astra-defaults RunRecord collector gains base URL support for flexible test fixture hosting and implements repository cloning with fixture context, enabling live cost and quality evaluation across model configurations. Collector is now hermetic with bounded Codex v0.162+ JSON-line parsing and includes CI integration (#3655, #3765, #3768, #3772).
+- npm registry-visibility diagnostics: registry-visibility checks now include extended timeout windows and improved diagnostics to surface transient publication issues earlier and support troubleshooting of npm registry visibility failures in CI pipelines (#3771).
+
+### Added
+
+- Astra-defaults collector base URL support and repository cloning with fixture context (#3765, #3772).
+- npm registry-visibility check extended timeout and improved diagnostics (#3771).
+
+### Fixed
+
+- Preserve multi-line arrays in TOML `[tui]` configuration sections during merge operations (#3777, fixes #3776).
+- Harden astra-defaults collector for hermetic operation with correct handling of Codex v0.162+ JSON-line output format (#3772, #3774).
+- astra-defaults eval test failures and add to CI (#3768, fixes #3766).
+
+### Maintenance
+
+- astra-defaults evaluation results recorded for live-suite baseline (#3775).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.10.md) and [release readiness](docs/qa/release-readiness-0.21.10.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.9...v0.21.10
+
 ## [0.21.9] - 2026-10-12
 
 Patch release for `v0.21.8..e4653cd8e115f923014be72cf0f7fb6645384246` (10 commits, 24 files, +1693/−96, PRs #3751/#3753/#3754/#3755/#3757/#3760/#3761/#3762/#3763/#3764, linked issues #3655/#3729).
