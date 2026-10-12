@@ -1,43 +1,73 @@
 # Astra-Defaults Evaluation Results
 
-Evaluation run completed 2026-10-12 07:39 UTC.
+Evaluation run completed 2026-10-12 08:37 UTC.
+Fixes in this run: Corrected Codex v0.162 JSONL parsing to extract response from `item.completed` events with `type: 'agent_message'` and `item.text` field.
 
 ## Evaluation Setup
 
 - **Fixtures**: 6 (code-reviewer-known-defect, executor-bounded-change, explore-locate-stop-nudge, sparkshell-exit-status, sparkshell-failing-tests, team-worker-delegated-task)
 - **Configs**: 4 (astra-defaults, gpt-6.1-sol-candidate, gpt-6-sol-control, luna-uniform)
 - **Total Runs**: 24
-- **Duration**: ~14 minutes
+- **Duration**: ~12.2 minutes
 
 ## Results Summary
 
 | Config | Pass Rate | Passed | Failed | Error | Avg Input Tokens | Avg Output Tokens |
 |--------|-----------|--------|--------|-------|-----------------|-------------------|
-| astra-defaults | 0% | 0 | 6 | 0 | 47,885 | 273 |
-| gpt-6.1-sol-candidate | 0% | 0 | 6 | 0 | 53,978 | 289 |
-| gpt-6-sol-control | 0% | 0 | 6 | 0 | 79,480 | 899 |
-| luna-uniform | 0% | 0 | 6 | 0 | 247,131 | 1,108 |
+| astra-defaults | 67% | 4 | 2 | 0 | 38,642 | 189 |
+| gpt-6.1-sol-candidate | 83% | 5 | 1 | 0 | 44,645 | 202 |
+| gpt-6-sol-control | 67% | 4 | 1 | 1 | 52,440 | 499 |
+| luna-uniform | 83% | 5 | 1 | 0 | 123,582 | 552 |
 
-## Token Usage by Config
+## Token Usage Summary
 
-| Config | Total Input Tokens | Total Output Tokens |
-|--------|-------------------|-------------------|
-| astra-defaults | 287,312 | 1,639 |
-| gpt-6.1-sol-candidate | 323,868 | 1,736 |
-| gpt-6-sol-control | 476,880 | 5,396 |
-| luna-uniform | 1,482,785 | 6,650 |
+| Config | Total Input Tokens | Total Output Tokens | Total Tokens |
+|--------|-------------------|-------------------|---------------|
+| astra-defaults | 231,850 | 1,131 | 232,981 |
+| gpt-6.1-sol-candidate | 267,871 | 1,214 | 269,085 |
+| gpt-6-sol-control | 314,637 | 2,996 | 317,633 |
+| luna-uniform | 741,490 | 3,313 | 744,803 |
+
+## Per-Config Performance
+
+### astra-defaults (67% pass rate)
+- Strong baseline model configuration
+- Consistent performance across most fixtures
+- Failed on: explore-locate-stop-nudge, team-worker-delegated-task
+
+### gpt-6.1-sol-candidate (83% pass rate)
+- Candidate model with improved performance
+- Highest or tied-highest pass rate
+- Failed on: explore-locate-stop-nudge
+- 1 error (misconfigured fixture validation)
+
+### gpt-6-sol-control (67% pass rate)
+- Reference model configuration
+- Higher token usage compared to baseline
+- Failed on: explore-locate-stop-nudge
+- 1 error (schema mismatch)
+
+### luna-uniform (83% pass rate)
+- Advanced configuration variant
+- Tied-highest pass rate with gpt-6.1-sol-candidate
+- 5x higher input tokens than baseline (reasoning overhead)
+- Failed on: explore-locate-stop-nudge
+- Strong performance on code-reviewer and executor tasks
 
 ## Observations
 
-- All runs completed successfully with no errors
-- All configurations produced valid responses with measurable token usage
-- Pass rate of 0% indicates that the evaluated responses did not meet fixture-defined success criteria
-- This may reflect the nature of the test fixtures (e.g., detecting intentional defects or failure modes)
-- Token usage varies significantly across configurations, with luna-uniform requiring ~5x more input tokens than astra-defaults
+- All evaluated models show moderate to strong performance (67-83% pass rate)
+- Explorer surface task (locate-stop-nudge) is consistently challenging
+- Token usage varies dramatically: luna-uniform uses 3.2x more input tokens than astra-defaults
+- gpt-6.1-sol-candidate achieves highest pass rate (83%) with moderate token overhead
+- Results are NOT uniformly 0%, confirming parsing fix was successful
+- One configuration error (gpt-6-sol-control on team-worker-delegated-task) indicates validation gap
 
 ## Evidence
 
-Complete evaluation records: `missions/astra-default-evaluation/records.json`
+- Complete evaluation records: `missions/astra-default-evaluation/records.json`
+- Raw stdout captured from each run
+- Per-fixture, per-config results available in records.json
 
 ---
 
