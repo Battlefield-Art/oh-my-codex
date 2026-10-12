@@ -38,7 +38,10 @@ test('collector: pass when response matches checks', async () => {
   const mockCodexInvoker = async (): Promise<CodexOutput> => ({
     exitCode: 0,
     stdout: JSON.stringify({
-      response: 'Found a bug in the code. The variable is used correctly.',
+      type: 'item.completed',
+      item: { type: 'agent_message', text: 'Found a bug in the code. The variable is used correctly.' },
+    }) + '\n' + JSON.stringify({
+      type: 'turn.completed',
       usage: { input_tokens: 100, output_tokens: 50 },
     }),
     stderr: '',
@@ -64,7 +67,10 @@ test('collector: fail when response does not match checks', async () => {
   const mockCodexInvoker = async (): Promise<CodexOutput> => ({
     exitCode: 0,
     stdout: JSON.stringify({
-      response: 'Maybe this is a bug. Perhaps you should check.',
+      type: 'item.completed',
+      item: { type: 'agent_message', text: 'Maybe this is a bug. Perhaps you should check.' },
+    }) + '\n' + JSON.stringify({
+      type: 'turn.completed',
       usage: { input_tokens: 100, output_tokens: 50 },
     }),
     stderr: '',
@@ -128,7 +134,12 @@ test('collector: error when missing role config', async () => {
 test('collector: handle null usage data gracefully', async () => {
   const mockCodexInvoker = async (): Promise<CodexOutput> => ({
     exitCode: 0,
-    stdout: JSON.stringify({ response: 'Found a bug in the code. The variable is used correctly.' }),
+    stdout: JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'agent_message', text: 'Found a bug in the code. The variable is used correctly.' },
+    }) + '\n' + JSON.stringify({
+      type: 'turn.completed',
+    }),
     stderr: '',
   });
 
@@ -144,7 +155,10 @@ test('collector: records latency on success', async () => {
     return {
       exitCode: 0,
       stdout: JSON.stringify({
-        response: 'Found a bug in the code. The variable is used correctly.',
+        type: 'item.completed',
+        item: { type: 'agent_message', text: 'Found a bug in the code. The variable is used correctly.' },
+      }) + '\n' + JSON.stringify({
+        type: 'turn.completed',
       }),
       stderr: '',
     };
@@ -177,7 +191,12 @@ test('collector: embeds fixture inputs into prompt', async () => {
     capturedPrompt = args[args.length - 1] ?? '';
     return {
       exitCode: 0,
-      stdout: JSON.stringify({ response: 'Found a bug in the code. The variable is used correctly.' }),
+      stdout: JSON.stringify({
+        type: 'item.completed',
+        item: { type: 'agent_message', text: 'Found a bug in the code. The variable is used correctly.' },
+      }) + '\n' + JSON.stringify({
+        type: 'turn.completed',
+      }),
       stderr: '',
     };
   };
