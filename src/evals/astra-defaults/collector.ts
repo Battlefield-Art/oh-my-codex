@@ -4,11 +4,14 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { EvalConfig, EvalFixture, RunRecord } from './types.js';
 import { scoreResponse } from './suite.js';
+import { invokeViaHTTP } from './http-invoker.js';
 
 export interface CollectorOptions {
   timeoutMs?: number;
   /** Called to invoke Codex CLI. Default: npx -y @openai/codex */
   invokeCodex?: (args: string[], cwd: string) => Promise<CodexOutput>;
+  /** Custom OpenAI-compatible API base URL (e.g., https://api.layofflabs.com/v1) */
+  baseUrl?: string;
 }
 
 export interface CodexOutput {
@@ -33,7 +36,9 @@ export async function collectRecord(
   options: CollectorOptions = {},
 ): Promise<CollectionResult> {
   const timeoutMs = options.timeoutMs ?? 15 * 60 * 1000; // 15 minutes default
-  const invokeCodex = options.invokeCodex ?? defaultCodexInvoker;
+  const invokeCodex = options.invokeCodex ?? (options.baseUrl
+    ? (args: string[], cwd: string) => invokeViaHTTP(args, cwd, options.baseUrl!)
+    : defaultCodexInvoker);
 
   const startTime = Date.now();
   const tempDir = mkdtempSync(join(tmpdir(), 'codex-eval-'));
