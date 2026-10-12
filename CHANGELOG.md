@@ -4,6 +4,34 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.21.9] - 2026-10-12
+
+Patch release for `v0.21.8..e4653cd8e115f923014be72cf0f7fb6645384246` (10 commits, 24 files, +1693/−96, PRs #3751/#3753/#3754/#3755/#3757/#3760/#3761/#3762/#3763/#3764, linked issues #3655/#3729).
+
+### Highlights
+
+- Session token usage: `omx session usage` summarizes cumulative per-session token counters from local Codex rollout logs, with filtering, sorting, and JSON output (#3760, authored by @hiSandog).
+- Native subagent lifecycle evidence: a native subagent's Stop event now records bounded completion evidence (`completed_at`, `completion_source: native_stop_event`) in subagent tracking for doctor diagnostics (#3761, fixes #3729).
+- Astra-defaults evaluation: a RunRecord collector and `collect-astra-defaults` script gather live evaluation-suite records, with GPT-6 Sol control, GPT-6.1 Sol candidate, and Luna-uniform comparison configs (#3764, part of #3655; no evaluation results are published in this release).
+
+### Added
+
+- `omx session usage` command and `docs/session-usage.md` (#3760, authored by @hiSandog).
+- Live evaluation RunRecord collector for the astra-defaults suite (#3764).
+
+### Fixed
+
+- Record typed completion evidence for native subagent Stop events in subagent tracking (#3761, fixes #3729).
+
+### Maintenance
+
+- Dependencies: `libc` 0.2.190 (#3751), `@biomejs/biome` 2.5.15 (#3753), `@types/node` 26.6.4 (#3754), `@modelcontextprotocol/sdk` 1.32.0 (#3755), `tar-stream` 3.2.2 / `@types/tar-stream` 3.1.5 (#3757).
+- #3762 (synthetic evaluation records presented as #3655 results) was reverted by #3763; net zero change.
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.9.md) and [release readiness](docs/qa/release-readiness-0.21.9.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.8...v0.21.9
+
 ## [0.21.8] - 2026-10-06
 
 ### Highlights
