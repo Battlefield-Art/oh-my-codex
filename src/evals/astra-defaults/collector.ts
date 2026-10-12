@@ -26,6 +26,7 @@ export interface CodexOutput {
 export interface CollectionResult {
   record: RunRecord;
   error?: string;
+  responseDebug?: string;
 }
 
 /**
@@ -157,13 +158,29 @@ export async function collectRecord(
     }
 
     // Parse JSONL output (--json outputs one JSON object per line)
-    // The final event should contain the agent's final response
-    let finalEvent: Record<string, unknown> | null = null;
+    // Codex v0.162+ emits a stream of events:
+    // - item.completed events with type 'agent_message' contain the response in item.text
+    // - turn.completed events contain usage data
+    let responseText = '';
+    let usageData: Record<string, number> | undefined;
+
     try {
       const lines = output.stdout.trim().split('\n');
       for (const line of lines) {
-        if (line.trim()) {
-          finalEvent = JSON.parse(line);
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+
+        // Extract response from agent_message items
+        if (event.type === 'item.completed' && event.item && typeof event.item === 'object') {
+          const item = event.item as Record<string, unknown>;
+          if (item.type === 'agent_message' && item.text) {
+            responseText = String(item.text);
+          }
+        }
+
+        // Extract usage from turn.completed
+        if (event.type === 'turn.completed' && event.usage) {
+          usageData = event.usage as Record<string, number>;
         }
       }
     } catch (e) {
@@ -184,7 +201,7 @@ export async function collectRecord(
       };
     }
 
-    if (!finalEvent) {
+    if (!responseText) {
       return {
         record: {
           fixtureId: fixture.id,
@@ -197,15 +214,10 @@ export async function collectRecord(
           usage: null,
           operatorMinutes: null,
           difficult: false,
-          notes: 'No output from Codex exec',
+          notes: 'No agent response from Codex exec',
         },
       };
     }
-
-    // Extract response text and usage from final event
-    // The structure depends on what Codex outputs
-    const responseText = String(finalEvent.response ?? finalEvent.message ?? '');
-    const usageData = finalEvent.usage as Record<string, number> | undefined;
 
     // Grade response
     const checks = scoreResponse(fixture, responseText);
@@ -223,6 +235,9 @@ export async function collectRecord(
         }
       : null;
 
+    // Capture first 500 chars of response for debugging
+    const responseDebug = responseText.slice(0, 500);
+
     return {
       record: {
         fixtureId: fixture.id,
@@ -236,6 +251,7 @@ export async function collectRecord(
         operatorMinutes: null,
         difficult: false,
       },
+      responseDebug,
     };
   } catch (error) {
     const latencyMs = Date.now() - startTime;
