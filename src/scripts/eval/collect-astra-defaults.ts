@@ -60,6 +60,17 @@ async function main() {
 
   const configIds = args.length > 0 ? args : ['astra-defaults', 'gpt-6.1-sol-candidate', 'gpt-6-sol-control', 'luna-uniform'];
 
+  // Preflight check: if a provider is specified, ensure the API key is available
+  if (provider) {
+    const apiKeyEnv = 'OPENAI_API_KEY'; // Default env var name used by collector
+    if (!process.env[apiKeyEnv]) {
+      throw new Error(
+        `${apiKeyEnv} environment variable is required for provider "${provider}".\n` +
+        `Export the key before running this script: export ${apiKeyEnv}=<your-key>`,
+      );
+    }
+  }
+
   process.stderr.write(`Loading suite from ${suiteDir}...\n`);
   const suite = loadSuite(suiteDir);
 
@@ -147,10 +158,14 @@ async function main() {
     `\n${renderReport(suite, records, null, 'observed')}\n`,
   );
 
-  process.exit(stats.error > 0 || stats.failed > 0 ? 1 : 0);
+  if (stats.error > 0 || stats.failed > 0) {
+    process.exit(1);
+  }
+
+  process.exit(0);
 }
 
 main().catch((error) => {
-  process.stderr.write(`${error.message}\n`);
+  process.stderr.write(`Collection failed: ${error.message}\n`);
   process.exit(1);
 });

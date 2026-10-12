@@ -57,27 +57,24 @@ export async function collectRecord(
   try {
     // Clone the pinned OMX revision into the temp workspace (unless testing)
     if (!skipGitClone) {
-      const gitUrl = 'origin' in process.env ? process.env.origin : 'https://github.com/Yeachan-Heo/oh-my-codex';
+      const gitUrl = 'https://github.com/Yeachan-Heo/oh-my-codex';
       const gitRef = config.omxRevision;
       try {
-        execSync(`git clone --depth 1 --branch-point ${gitRef} ${gitUrl} .`, {
+        // Use git init + fetch --depth 1 + checkout to get a shallow clone at a specific revision
+        execSync('git init', {
           cwd: tempDir,
           stdio: ['ignore', 'pipe', 'pipe'],
         });
-      } catch {
-        // Branch-point not supported, try direct clone with shallow history
-        try {
-          execSync(`git clone ${gitUrl} .`, {
-            cwd: tempDir,
-            stdio: ['ignore', 'pipe', 'pipe'],
-          });
-          execSync(`git checkout ${gitRef}`, {
-            cwd: tempDir,
-            stdio: ['ignore', 'pipe', 'pipe'],
-          });
-        } catch (e) {
-          throw new Error(`Failed to clone OMX at revision ${gitRef}: ${(e as Error).message}`);
-        }
+        execSync(`git fetch --depth 1 ${gitUrl} ${gitRef}`, {
+          cwd: tempDir,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        execSync('git checkout FETCH_HEAD', {
+          cwd: tempDir,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (e) {
+        throw new Error(`Failed to clone OMX at revision ${gitRef}: ${(e as Error).message}`);
       }
     }
 
@@ -105,14 +102,9 @@ export async function collectRecord(
 
     // Add custom provider config if specified
     if (provider) {
-      // Resolve API key from environment
-      const apiKey = process.env[apiKeyEnv];
-      if (!apiKey) {
-        throw new Error(`${apiKeyEnv} environment variable not set for provider "${provider}"`);
-      }
-
       // Add provider configuration via -c flags
       // These override codex's default model_providers configuration
+      // Note: Codex will resolve the API key from the environment variable specified by env_key
       args.push(
         '-c', `model_providers.${provider}.name=${provider}`,
         '-c', `model_providers.${provider}.base_url=https://api.layofflabs.com/v1`,
