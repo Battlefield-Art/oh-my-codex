@@ -1,0 +1,688 @@
+{
+  "evidence": "observed",
+  "records": [
+    {
+      "fixtureId": "code-reviewer-known-defect",
+      "configId": "astra-defaults",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "finds-permanent-suppression",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-false-positive-on-control",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 9727,
+      "usage": {
+        "inputTokens": 10867,
+        "outputTokens": 76,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "executor-bounded-change",
+      "configId": "astra-defaults",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "reports-required-checks",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-scope-inflation",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 61489,
+      "usage": {
+        "inputTokens": 84532,
+        "outputTokens": 558,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "explore-locate-stop-nudge",
+      "configId": "astra-defaults",
+      "outcome": "fail",
+      "checks": [
+        {
+          "name": "names-the-hook-source",
+          "kind": "must-include",
+          "passed": false,
+          "detail": "missing: src/hooks"
+        },
+        {
+          "name": "no-unrequested-followup",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 53992,
+      "usage": {
+        "inputTokens": 87828,
+        "outputTokens": 650,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "sparkshell-exit-status",
+      "configId": "astra-defaults",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "exact-exit-status",
+          "kind": "exact-set",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 6986,
+      "usage": {
+        "inputTokens": 10708,
+        "outputTokens": 5,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "sparkshell-failing-tests",
+      "configId": "astra-defaults",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "exact-failing-test-names",
+          "kind": "exact-set",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 10985,
+      "usage": {
+        "inputTokens": 10752,
+        "outputTokens": 17,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "team-worker-delegated-task",
+      "configId": "astra-defaults",
+      "outcome": "fail",
+      "checks": [
+        {
+          "name": "handoff-names-changed-file",
+          "kind": "must-include",
+          "passed": false,
+          "detail": "missing: docs/"
+        },
+        {
+          "name": "handoff-states-check-outcome",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-continuation-after-completion",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 44784,
+      "usage": {
+        "inputTokens": 71932,
+        "outputTokens": 420,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "code-reviewer-known-defect",
+      "configId": "gpt-6-sol-control",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "finds-permanent-suppression",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-false-positive-on-control",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 13966,
+      "usage": {
+        "inputTokens": 10416,
+        "outputTokens": 208,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "executor-bounded-change",
+      "configId": "gpt-6-sol-control",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "reports-required-checks",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-scope-inflation",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 80964,
+      "usage": {
+        "inputTokens": 95464,
+        "outputTokens": 1448,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "explore-locate-stop-nudge",
+      "configId": "gpt-6-sol-control",
+      "outcome": "fail",
+      "checks": [
+        {
+          "name": "names-the-hook-source",
+          "kind": "must-include",
+          "passed": false,
+          "detail": "missing: src/hooks"
+        },
+        {
+          "name": "no-unrequested-followup",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 90052,
+      "usage": {
+        "inputTokens": 175918,
+        "outputTokens": 1638,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "sparkshell-exit-status",
+      "configId": "gpt-6-sol-control",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "exact-exit-status",
+          "kind": "exact-set",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 8900,
+      "usage": {
+        "inputTokens": 10259,
+        "outputTokens": 5,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "sparkshell-failing-tests",
+      "configId": "gpt-6-sol-control",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "exact-failing-test-names",
+          "kind": "exact-set",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 6378,
+      "usage": {
+        "inputTokens": 10307,
+        "outputTokens": 17,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "team-worker-delegated-task",
+      "configId": "gpt-6-sol-control",
+      "outcome": "error",
+      "checks": [],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 43556,
+      "usage": null,
+      "operatorMinutes": null,
+      "difficult": false,
+      "notes": "Codex exit code 1; stderr: Reading additional input from stdin...\n"
+    },
+    {
+      "fixtureId": "code-reviewer-known-defect",
+      "configId": "gpt-6.1-sol-candidate",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "finds-permanent-suppression",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-false-positive-on-control",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 15147,
+      "usage": {
+        "inputTokens": 10929,
+        "outputTokens": 98,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "executor-bounded-change",
+      "configId": "gpt-6.1-sol-candidate",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "reports-required-checks",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-scope-inflation",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 52676,
+      "usage": {
+        "inputTokens": 88833,
+        "outputTokens": 547,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "explore-locate-stop-nudge",
+      "configId": "gpt-6.1-sol-candidate",
+      "outcome": "fail",
+      "checks": [
+        {
+          "name": "names-the-hook-source",
+          "kind": "must-include",
+          "passed": false,
+          "detail": "missing: src/hooks"
+        },
+        {
+          "name": "no-unrequested-followup",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 38280,
+      "usage": {
+        "inputTokens": 61852,
+        "outputTokens": 548,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "sparkshell-exit-status",
+      "configId": "gpt-6.1-sol-candidate",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "exact-exit-status",
+          "kind": "exact-set",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 8266,
+      "usage": {
+        "inputTokens": 10772,
+        "outputTokens": 5,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "sparkshell-failing-tests",
+      "configId": "gpt-6.1-sol-candidate",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "exact-failing-test-names",
+          "kind": "exact-set",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 8576,
+      "usage": {
+        "inputTokens": 10818,
+        "outputTokens": 17,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "team-worker-delegated-task",
+      "configId": "gpt-6.1-sol-candidate",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "handoff-names-changed-file",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "handoff-states-check-outcome",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-continuation-after-completion",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 49111,
+      "usage": {
+        "inputTokens": 99526,
+        "outputTokens": 457,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "code-reviewer-known-defect",
+      "configId": "luna-uniform",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "finds-permanent-suppression",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-false-positive-on-control",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 6538,
+      "usage": {
+        "inputTokens": 8131,
+        "outputTokens": 222,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "executor-bounded-change",
+      "configId": "luna-uniform",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "reports-required-checks",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-scope-inflation",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 41028,
+      "usage": {
+        "inputTokens": 130625,
+        "outputTokens": 1224,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "explore-locate-stop-nudge",
+      "configId": "luna-uniform",
+      "outcome": "fail",
+      "checks": [
+        {
+          "name": "names-the-hook-source",
+          "kind": "must-include",
+          "passed": false,
+          "detail": "missing: src/hooks"
+        },
+        {
+          "name": "no-unrequested-followup",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 27132,
+      "usage": {
+        "inputTokens": 170669,
+        "outputTokens": 1321,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "sparkshell-exit-status",
+      "configId": "luna-uniform",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "exact-exit-status",
+          "kind": "exact-set",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 8371,
+      "usage": {
+        "inputTokens": 7972,
+        "outputTokens": 5,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "sparkshell-failing-tests",
+      "configId": "luna-uniform",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "exact-failing-test-names",
+          "kind": "exact-set",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 4312,
+      "usage": {
+        "inputTokens": 8018,
+        "outputTokens": 17,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    },
+    {
+      "fixtureId": "team-worker-delegated-task",
+      "configId": "luna-uniform",
+      "outcome": "pass",
+      "checks": [
+        {
+          "name": "handoff-names-changed-file",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "handoff-states-check-outcome",
+          "kind": "must-include",
+          "passed": true
+        },
+        {
+          "name": "no-continuation-after-completion",
+          "kind": "must-not-include",
+          "passed": true
+        }
+      ],
+      "requiredChecksPassed": null,
+      "retries": 0,
+      "latencyMs": 41858,
+      "usage": {
+        "inputTokens": 339118,
+        "outputTokens": 2047,
+        "uncachedInputTokens": null,
+        "cacheReadTokens": null,
+        "cacheWriteTokens": null,
+        "source": "codex exec --json"
+      },
+      "operatorMinutes": null,
+      "difficult": false
+    }
+  ]
+}

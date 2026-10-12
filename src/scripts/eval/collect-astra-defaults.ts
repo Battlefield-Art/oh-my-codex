@@ -8,7 +8,7 @@ import type { RunRecord } from '../../evals/astra-defaults/types.js';
 /**
  * Live collector runner for astra-defaults evaluation.
  * Usage:
- *   node dist/scripts/eval/collect-astra-defaults.js [suite-dir] [output-file] [config-ids...]
+ *   node dist/scripts/eval/collect-astra-defaults.js [suite-dir] [output-file] [--provider <name>] [config-ids...]
  *
  * Examples:
  *   # Run all configs
@@ -19,6 +19,13 @@ import type { RunRecord } from '../../evals/astra-defaults/types.js';
  *     missions/astra-default-evaluation \
  *     records.json \
  *     astra-defaults gpt-6.1-sol-candidate gpt-6-sol-control luna-uniform
+ *
+ *   # Run with custom provider (e.g., Layofflabs)
+ *   node dist/scripts/eval/collect-astra-defaults.js \
+ *     missions/astra-default-evaluation \
+ *     records.json \
+ *     --provider layofflabs \
+ *     gpt-6.1-sol-candidate gpt-6-sol-control
  */
 
 interface CollectionStats {
@@ -42,7 +49,27 @@ async function main() {
     ? args.shift()!
     : join(process.cwd(), 'astra-defaults-records.json');
 
+  let provider: string | undefined;
+  if (args[0] === '--provider') {
+    args.shift();
+    provider = args.shift();
+    if (!provider) {
+      throw new Error('--provider requires a provider name argument');
+    }
+  }
+
   const configIds = args.length > 0 ? args : ['astra-defaults', 'gpt-6.1-sol-candidate', 'gpt-6-sol-control', 'luna-uniform'];
+
+  // Preflight check: if a provider is specified, ensure the API key is available
+  if (provider) {
+    const apiKeyEnv = 'OPENAI_API_KEY'; // Default env var name used by collector
+    if (!process.env[apiKeyEnv]) {
+      throw new Error(
+        `${apiKeyEnv} environment variable is required for provider "${provider}".\n` +
+        `Export the key before running this script: export ${apiKeyEnv}=<your-key>`,
+      );
+    }
+  }
 
   process.stderr.write(`Loading suite from ${suiteDir}...\n`);
   const suite = loadSuite(suiteDir);
@@ -71,7 +98,7 @@ async function main() {
 
   let aborted = false;
 
-  for await (const { fixture, config, result } of collectMatrix(suite.fixtures, configs)) {
+  for await (const { fixture, config, result } of collectMatrix(suite.fixtures, configs, { provider })) {
     stats.total++;
     const { record } = result;
     records.push(record);
@@ -131,10 +158,14 @@ async function main() {
     `\n${renderReport(suite, records, null, 'observed')}\n`,
   );
 
-  process.exit(stats.error > 0 || stats.failed > 0 ? 1 : 0);
+  if (stats.error > 0 || stats.failed > 0) {
+    process.exit(1);
+  }
+
+  process.exit(0);
 }
 
 main().catch((error) => {
-  process.stderr.write(`${error.message}\n`);
+  process.stderr.write(`Collection failed: ${error.message}\n`);
   process.exit(1);
 });

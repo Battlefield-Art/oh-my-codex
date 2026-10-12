@@ -38,13 +38,16 @@ test('collector: pass when response matches checks', async () => {
   const mockCodexInvoker = async (): Promise<CodexOutput> => ({
     exitCode: 0,
     stdout: JSON.stringify({
-      response: 'Found a bug in the code. The variable is used correctly.',
+      type: 'item.completed',
+      item: { type: 'agent_message', text: 'Found a bug in the code. The variable is used correctly.' },
+    }) + '\n' + JSON.stringify({
+      type: 'turn.completed',
       usage: { input_tokens: 100, output_tokens: 50 },
     }),
     stderr: '',
   });
 
-  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker });
+  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker, skipGitClone: true });
 
   assert.strictEqual(result.record.outcome, 'pass');
   assert.strictEqual(result.record.checks.length, 2);
@@ -64,13 +67,16 @@ test('collector: fail when response does not match checks', async () => {
   const mockCodexInvoker = async (): Promise<CodexOutput> => ({
     exitCode: 0,
     stdout: JSON.stringify({
-      response: 'Maybe this is a bug. Perhaps you should check.',
+      type: 'item.completed',
+      item: { type: 'agent_message', text: 'Maybe this is a bug. Perhaps you should check.' },
+    }) + '\n' + JSON.stringify({
+      type: 'turn.completed',
       usage: { input_tokens: 100, output_tokens: 50 },
     }),
     stderr: '',
   });
 
-  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker });
+  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker, skipGitClone: true });
 
   assert.strictEqual(result.record.outcome, 'fail');
   assert.ok(result.record.checks.some((c) => !c.passed));
@@ -83,7 +89,7 @@ test('collector: error when Codex exits non-zero', async () => {
     stderr: 'Codex error: authentication failed',
   });
 
-  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker });
+  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker, skipGitClone: true });
 
   assert.strictEqual(result.record.outcome, 'error');
   assert.ok(result.record.notes?.includes('exit code 1'));
@@ -97,7 +103,7 @@ test('collector: error when JSON parsing fails', async () => {
     stderr: '',
   });
 
-  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker });
+  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker, skipGitClone: true });
 
   assert.strictEqual(result.record.outcome, 'error');
   assert.ok(result.record.notes?.includes('Failed to parse'));
@@ -118,7 +124,7 @@ test('collector: error when missing role config', async () => {
   const result = await collectRecord(
     { ...fixture, surface: 'executor' },
     badConfig,
-    { invokeCodex: mockCodexInvoker },
+    { invokeCodex: mockCodexInvoker, skipGitClone: true },
   );
 
   assert.strictEqual(result.record.outcome, 'error');
@@ -128,11 +134,16 @@ test('collector: error when missing role config', async () => {
 test('collector: handle null usage data gracefully', async () => {
   const mockCodexInvoker = async (): Promise<CodexOutput> => ({
     exitCode: 0,
-    stdout: JSON.stringify({ response: 'Found a bug in the code. The variable is used correctly.' }),
+    stdout: JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'agent_message', text: 'Found a bug in the code. The variable is used correctly.' },
+    }) + '\n' + JSON.stringify({
+      type: 'turn.completed',
+    }),
     stderr: '',
   });
 
-  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker });
+  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker, skipGitClone: true });
 
   assert.strictEqual(result.record.outcome, 'pass');
   assert.strictEqual(result.record.usage, null);
@@ -140,24 +151,27 @@ test('collector: handle null usage data gracefully', async () => {
 
 test('collector: records latency on success', async () => {
   const mockCodexInvoker = async (): Promise<CodexOutput> => {
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 50));
     return {
       exitCode: 0,
       stdout: JSON.stringify({
-        response: 'Found a bug in the code. The variable is used correctly.',
+        type: 'item.completed',
+        item: { type: 'agent_message', text: 'Found a bug in the code. The variable is used correctly.' },
+      }) + '\n' + JSON.stringify({
+        type: 'turn.completed',
       }),
       stderr: '',
     };
   };
 
-  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker });
+  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker, skipGitClone: true });
 
-  assert.ok((result.record.latencyMs ?? 0) >= 10);
+  assert.ok((result.record.latencyMs ?? 0) >= 50);
 });
 
 test('collector: records latency even on error', async () => {
   const mockCodexInvoker = async (): Promise<CodexOutput> => {
-    await new Promise((resolve) => setTimeout(resolve, 10));
+    await new Promise((resolve) => setTimeout(resolve, 50));
     return {
       exitCode: 1,
       stdout: '',
@@ -165,7 +179,38 @@ test('collector: records latency even on error', async () => {
     };
   };
 
-  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker });
+  const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker, skipGitClone: true });
 
-  assert.ok((result.record.latencyMs ?? 0) >= 10);
+  assert.ok((result.record.latencyMs ?? 0) >= 50);
+});
+
+test('collector: embeds fixture inputs into prompt', async () => {
+  let capturedPrompt = '';
+  const mockCodexInvoker = async (args: string[]): Promise<CodexOutput> => {
+    // The prompt is the last argument
+    capturedPrompt = args[args.length - 1] ?? '';
+    return {
+      exitCode: 0,
+      stdout: JSON.stringify({
+        type: 'item.completed',
+        item: { type: 'agent_message', text: 'Found a bug in the code. The variable is used correctly.' },
+      }) + '\n' + JSON.stringify({
+        type: 'turn.completed',
+      }),
+      stderr: '',
+    };
+  };
+
+  const fixtureWithInputs: EvalFixture = {
+    ...fixture,
+    inputs: { commandOutput: 'test output line 1\ntest output line 2' },
+  };
+
+  const result = await collectRecord(fixtureWithInputs, config, { invokeCodex: mockCodexInvoker, skipGitClone: true });
+
+  // Verify prompt includes both the template and the fixture inputs
+  assert.ok(capturedPrompt.includes('Find the bug in this code'));
+  assert.ok(capturedPrompt.includes('commandOutput'));
+  assert.ok(capturedPrompt.includes('test output line 1'));
+  assert.strictEqual(result.record.outcome, 'pass');
 });

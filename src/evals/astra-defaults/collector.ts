@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, execSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -9,6 +9,12 @@ export interface CollectorOptions {
   timeoutMs?: number;
   /** Called to invoke Codex CLI. Default: npx -y @openai/codex */
   invokeCodex?: (args: string[], cwd: string) => Promise<CodexOutput>;
+  /** Custom provider name to route through (e.g., 'layofflabs') */
+  provider?: string;
+  /** API key environment variable name when using custom provider */
+  apiKeyEnv?: string;
+  /** Skip git clone (for testing). Default: false */
+  skipGitClone?: boolean;
 }
 
 export interface CodexOutput {
@@ -20,11 +26,12 @@ export interface CodexOutput {
 export interface CollectionResult {
   record: RunRecord;
   error?: string;
+  responseDebug?: string;
 }
 
 /**
  * Collects a single RunRecord by executing Codex CLI against a fixture/config pair.
- * Creates a disposable temp workspace, seeds it with fixture inputs, runs Codex,
+ * Clones the pinned OMX revision, seeds it with fixture inputs, runs Codex,
  * captures output/token usage/latency, and grades against fixture checks.
  */
 export async function collectRecord(
@@ -34,36 +41,91 @@ export async function collectRecord(
 ): Promise<CollectionResult> {
   const timeoutMs = options.timeoutMs ?? 15 * 60 * 1000; // 15 minutes default
   const invokeCodex = options.invokeCodex ?? defaultCodexInvoker;
+  
+  // Auto-detect if we need layofflabs provider for OMX-internal model names
+  const roleConfig = config.roles[fixture.surface];
+  const modelName = roleConfig?.model ?? '';
+  const isOmxInternalModel = !modelName.includes('/') && /^(gpt-[0-9]|gpt-[0-9]\.[0-9]|o[0-9]\d?-[a-z])/.test(modelName);
+  
+  const provider = options.provider ?? (isOmxInternalModel ? 'layofflabs' : undefined);
+  const apiKeyEnv = options.apiKeyEnv ?? 'OPENAI_API_KEY';
 
   const startTime = Date.now();
   const tempDir = mkdtempSync(join(tmpdir(), 'codex-eval-'));
   let output: CodexOutput | null = null;
+  const skipGitClone = options.skipGitClone ?? false;
 
   try {
-    // Seed temp workspace with fixture inputs
+    // Clone the pinned OMX revision into the temp workspace (unless testing)
+    if (!skipGitClone) {
+      const gitUrl = 'https://github.com/Yeachan-Heo/oh-my-codex';
+      const gitRef = config.omxRevision;
+      try {
+        // Use git init + fetch --depth 1 + checkout to get a shallow clone at a specific revision
+        execSync('git init', {
+          cwd: tempDir,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        execSync(`git fetch --depth 1 ${gitUrl} ${gitRef}`, {
+          cwd: tempDir,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+        execSync('git checkout FETCH_HEAD', {
+          cwd: tempDir,
+          stdio: ['ignore', 'pipe', 'pipe'],
+        });
+      } catch (e) {
+        throw new Error(`Failed to clone OMX at revision ${gitRef}: ${(e as Error).message}`);
+      }
+    }
+
+    // Seed temp workspace with fixture inputs (overlay on repo)
     for (const [name, content] of Object.entries(fixture.inputs)) {
       writeFileSync(join(tempDir, name), content, 'utf-8');
     }
 
     // Build Codex args with config model/reasoning overrides
     // Use the surface from the fixture to select the right role config
-    const roleConfig = config.roles[fixture.surface];
     if (!roleConfig) {
       throw new Error(`No role config for surface "${fixture.surface}" in config "${config.id}"`);
     }
 
-    // Build args for: codex exec --json --skip-git-repo-check --ephemeral -m <model> -c reasoning_effort=<effort> <prompt>
+    // Build args for: codex exec --json -m <model> -c reasoning_effort=<effort> <prompt>
+    // Use the cloned repo context (do NOT use --skip-git-repo-check or --ephemeral)
     const args = [
       'exec',
       '--json',
-      '--skip-git-repo-check',
-      '--ephemeral',
       '-m',
       roleConfig.model,
       '-c',
       `reasoning_effort='${roleConfig.reasoningEffort}'`,
-      fixture.prompt,
     ];
+
+    // Add custom provider config if specified
+    if (provider) {
+      // Add provider configuration via -c flags
+      // These override codex's default model_providers configuration
+      // Note: Codex will resolve the API key from the environment variable specified by env_key
+      args.push(
+        '-c', `model_providers.${provider}.name=${provider}`,
+        '-c', `model_providers.${provider}.base_url=https://api.layofflabs.com/v1`,
+        '-c', `model_providers.${provider}.env_key=${apiKeyEnv}`,
+        '-c', `model_providers.${provider}.wire_api=responses`,
+        '-c', `model_provider=${provider}`,
+      );
+    }
+
+    // Construct the full prompt with fixture inputs embedded
+    let fullPrompt = fixture.prompt;
+    const inputKeys = Object.keys(fixture.inputs);
+    if (inputKeys.length > 0) {
+      // Append fixture inputs to the prompt for context
+      const inputContext = inputKeys
+        .map((key) => `${key}:\n${fixture.inputs[key]}`)
+        .join('\n\n');
+      fullPrompt = `${fullPrompt}\n\n${inputContext}`;
+    }
+    args.push(fullPrompt);
 
     // Run Codex CLI with timeout
     output = await Promise.race([
@@ -96,13 +158,29 @@ export async function collectRecord(
     }
 
     // Parse JSONL output (--json outputs one JSON object per line)
-    // The final event should contain the agent's final response
-    let finalEvent: Record<string, unknown> | null = null;
+    // Codex v0.162+ emits a stream of events:
+    // - item.completed events with type 'agent_message' contain the response in item.text
+    // - turn.completed events contain usage data
+    let responseText = '';
+    let usageData: Record<string, number> | undefined;
+
     try {
       const lines = output.stdout.trim().split('\n');
       for (const line of lines) {
-        if (line.trim()) {
-          finalEvent = JSON.parse(line);
+        if (!line.trim()) continue;
+        const event = JSON.parse(line);
+
+        // Extract response from agent_message items
+        if (event.type === 'item.completed' && event.item && typeof event.item === 'object') {
+          const item = event.item as Record<string, unknown>;
+          if (item.type === 'agent_message' && item.text) {
+            responseText = String(item.text);
+          }
+        }
+
+        // Extract usage from turn.completed
+        if (event.type === 'turn.completed' && event.usage) {
+          usageData = event.usage as Record<string, number>;
         }
       }
     } catch (e) {
@@ -123,7 +201,7 @@ export async function collectRecord(
       };
     }
 
-    if (!finalEvent) {
+    if (!responseText) {
       return {
         record: {
           fixtureId: fixture.id,
@@ -136,15 +214,10 @@ export async function collectRecord(
           usage: null,
           operatorMinutes: null,
           difficult: false,
-          notes: 'No output from Codex exec',
+          notes: 'No agent response from Codex exec',
         },
       };
     }
-
-    // Extract response text and usage from final event
-    // The structure depends on what Codex outputs
-    const responseText = String(finalEvent.response ?? finalEvent.message ?? '');
-    const usageData = finalEvent.usage as Record<string, number> | undefined;
 
     // Grade response
     const checks = scoreResponse(fixture, responseText);
@@ -162,6 +235,9 @@ export async function collectRecord(
         }
       : null;
 
+    // Capture first 500 chars of response for debugging
+    const responseDebug = responseText.slice(0, 500);
+
     return {
       record: {
         fixtureId: fixture.id,
@@ -175,6 +251,7 @@ export async function collectRecord(
         operatorMinutes: null,
         difficult: false,
       },
+      responseDebug,
     };
   } catch (error) {
     const latencyMs = Date.now() - startTime;
@@ -211,7 +288,7 @@ async function defaultCodexInvoker(args: string[], cwd: string): Promise<CodexOu
   return new Promise((resolve, reject) => {
     const child = spawn('npx', ['-y', '@openai/codex', ...args], {
       cwd,
-      stdio: ['pipe', 'pipe', 'pipe'],
+      stdio: ['ignore', 'pipe', 'pipe'],
       timeout: 16 * 60 * 1000, // 16 min hard timeout in spawn
     });
 
@@ -237,8 +314,6 @@ async function defaultCodexInvoker(args: string[], cwd: string): Promise<CodexOu
         stderr,
       });
     });
-
-    child.stdin?.end();
   });
 }
 
