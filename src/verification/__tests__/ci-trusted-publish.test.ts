@@ -257,11 +257,13 @@ describe('CI npm trusted publishing contract', () => {
   it('verifies registry publication with bounded retries after publishing', () => {
     const publishJob = jobBlock(readCiWorkflow(), PUBLISH_JOB);
 
-    assert.match(publishJob, /for i in \$\(seq 1 20\); do/);
+    // Verify bounded retries window: 60 tries x 15s = 900s = 15 min
+    assert.match(publishJob, /MAX_TRIES=60/);
+    assert.match(publishJob, /SLEEP_INTERVAL=15/);
+    assert.match(publishJob, /for i in \$\(seq 1 \$MAX_TRIES\); do/);
     assert.match(publishJob, /npm view "oh-my-codex@\$VERSION" version 2>\/dev\/null \|\| true/);
     assert.match(publishJob, /npm view oh-my-codex version dist-tags --json/);
-    assert.match(publishJob, /sleep 15/);
-    assert.match(publishJob, /npm did not expose oh-my-codex@\$VERSION in time/);
+    assert.match(publishJob, /npm did not expose oh-my-codex@\$VERSION within ~15 minutes/);
   });
 
   it('keeps ordinary push and pull_request CI free of any publish surface', () => {
