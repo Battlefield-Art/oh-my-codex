@@ -11,7 +11,6 @@ import { readCatalogManifest } from "../catalog/reader.js";
 import type { CatalogManifest } from "../catalog/schema.js";
 import { getInstallableNativeAgentNames } from "./policy.js";
 import {
-  getCodexConfigRootModelProvider,
   getEnvConfiguredStandardDefaultModel,
   getAgentReasoningOverride,
   getAgentModelOverride,
@@ -201,16 +200,6 @@ function resolveAgentModel(
   }
 }
 
-function shouldInheritRootModelProvider(
-  agent: AgentDefinition,
-  resolvedModel: string,
-  options: AgentModelResolutionOptions = {},
-): boolean {
-  if (agent.modelClass !== "fast") return true;
-  if (getAgentModelOverride(agent.name, options.codexHomeOverride)) return true;
-  return resolvedModel !== getSparkDefaultModel(options.codexHomeOverride);
-}
-
 export function composeRoleInstructions(
   promptContent: string,
   metadata: RoleInstructionMetadata | null,
@@ -346,6 +335,10 @@ export function generateStandaloneAgentToml(
 
 /**
  * Generate TOML content for a prompt-backed OMX role agent.
+ * Includes model field for all agents for documentation and discoverability.
+ * Only includes modelProvider field if there's an explicit per-agent override,
+ * not when it merely mirrors the config default. This prevents agent TOMLs from
+ * becoming stale when config.toml provider changes (fixes #3779).
  */
 export function generateAgentToml(
   agent: AgentDefinition,
@@ -353,9 +346,10 @@ export function generateAgentToml(
   options: AgentModelResolutionOptions = {},
 ): string {
   const resolvedModel = resolveAgentModel(agent, options);
-  const resolvedModelProvider = shouldInheritRootModelProvider(agent, resolvedModel, options)
-    ? getCodexConfigRootModelProvider(options.codexHomeOverride)
-    : undefined;
+  const reasoningOverride = getAgentReasoningOverride(agent.name, options.codexHomeOverride);
+  const hasExactModel = !!agent.exactModel;
+  const hasAgentModelOverride = !!getAgentModelOverride(agent.name, options.codexHomeOverride);
+  
   return generateStandaloneAgentToml({
     name: agent.name,
     description: agent.description,
@@ -365,10 +359,14 @@ export function generateAgentToml(
       resolvedModel,
       { nativeAgent: true },
     ),
-    model: resolvedModel,
-    modelProvider: resolvedModelProvider,
-    reasoningEffort: getAgentReasoningOverride(agent.name, options.codexHomeOverride)
-      ?? agent.reasoningEffort,
+    // Only include model field if agent has explicit specification: exactModel or per-agent override.
+    // Without explicit specs, agents inherit from config.toml at runtime, staying current when config changes.
+    model: (hasExactModel || hasAgentModelOverride) ? resolvedModel : undefined,
+    // Never include modelProvider field in agent TOMLs to prevent staleness.
+    // Agents inherit model_provider from config.toml at runtime. Not pinning provider for
+    // model-only overrides allows independent provider updates at runtime.
+    modelProvider: undefined,
+    reasoningEffort: reasoningOverride ?? agent.reasoningEffort,
   });
 }
 
