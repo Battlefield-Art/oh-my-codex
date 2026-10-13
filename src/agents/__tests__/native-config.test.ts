@@ -112,10 +112,18 @@ describe("agents/native-config", () => {
     };
     assert.deepEqual(Object.keys(AGENT_DEFINITIONS).sort(), Object.keys(expectedEfforts).sort());
     for (const [role, effort] of Object.entries(expectedEfforts)) {
-      const toml = parseToml(generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`));
-      assert.equal(toml.model, "gpt-6-astra", role);
-      assert.equal(toml.model_reasoning_effort, effort, role);
-      assert.doesNotMatch(String(toml.developer_instructions), /exact gpt-5\.6-terra model/, role);
+      const toml = generateAgentToml(AGENT_DEFINITIONS[role], `${role} prompt`);
+      // Agents without explicit overrides inherit default model at runtime; resolved_model documented
+      // Only agents with exactModel write model field
+      const parsedToml = parseToml(toml);
+      if (AGENT_DEFINITIONS[role].exactModel) {
+        assert.equal(parsedToml.model, "gpt-6-astra", `${role} with exactModel should write model`);
+      } else {
+        assert.equal(parsedToml.model, undefined, `${role} without exactModel should not write model field`);
+        assert.match(toml, /resolved_model: gpt-6-astra/, `${role} should document resolved model`);
+      }
+      assert.equal(parsedToml.model_reasoning_effort, effort, role);
+      assert.doesNotMatch(String(toml), /exact gpt-5\.6-terra model/, role);
     }
   });
 
