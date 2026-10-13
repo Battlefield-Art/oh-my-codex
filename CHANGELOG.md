@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.21.11] - 2026-10-13
+
+Patch release for `v0.21.10..7e0b5f2330b9d85c5fdb9709ec0104e099836f4c` (3 commits, 2 files, +68/−5, PR #3781, fixes #3779).
+
+### Fixed
+
+- Stop writing inherited `model_provider` defaults into native agent TOMLs. Provider changes in `config.toml` now take effect without `omx setup --force`, while explicit per-agent model overrides remain supported (#3781, fixes #3779; authored by @Yeachan-Heo, co-authored by @gaebal-gajae).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.11.md) and [release readiness](docs/qa/release-readiness-0.21.11.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.10...v0.21.11
+
 ## [0.21.10] - 2026-10-12
 
 Patch release for `v0.21.9..72fee0236cf8a4b45e6dd9b3d826871f402b84ae` (16 commits, 15 files, +1067/−82, PRs #3765/#3768/#3771/#3772/#3774/#3775/#3777, linked issues #3655/#3766/#3776).
