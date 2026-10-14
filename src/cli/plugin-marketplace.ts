@@ -1916,7 +1916,7 @@ export interface OmxPluginCacheMaterializeResult {
 	launcherTarget?: string;
 }
 
-export const PLUGIN_LAUNCHER_RECOVERY_HINT = "codex plugin remove oh-my-codex@oh-my-codex-local --json";
+export const PLUGIN_LAUNCHER_RECOVERY_HINT = "omx setup --plugin --force";
 
 async function canonicalRealpath(path: string): Promise<string | null> {
 	try {
@@ -2381,6 +2381,7 @@ async function materializePackagedOmxPluginCacheImpl(
 					await publicationLockGuard.assertOwned();
 					const claimDigest = await computeOmxPluginCacheClaimDigest(claimRef.path);
 					await createExclusiveFileChild(claimRef, ".omx-complete", `${JSON.stringify({ version, claimDigest })}\n`, durability);
+					await createExclusiveFileChild(claimRef, ".omx-live-pin", "", durability);
 					const claimDirSyncOutcome = await syncDirectory(claimRef.handle);
 					recordDirectorySyncOutcome(durability, claimDirSyncOutcome);
 					await assertDirectoryRef(claimRef, "publication commit");
