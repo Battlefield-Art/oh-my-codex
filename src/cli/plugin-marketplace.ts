@@ -1423,17 +1423,17 @@ export async function removeChildIfIdentity(
 			const completionValid = options.allowInvalidClaimDigest
 				? await hasManagedCompletionMarker(sourceRef.operationPath, options.expectedManagedVersion)
 				: await hasRegularPublicationMarker(sourceRef.operationPath, ".omx-complete");
+			const managedMarkerValid = options.allowInvalidClaimDigest
+				? await hasManagedSnapshotOwnershipRecord(sourceRef.operationPath, options.expectedManagedVersion!)
+				: await hasRegularPublicationMarker(sourceRef.operationPath, OMX_PLUGIN_MANAGED_MARKER);
 			const versionOwnershipValid = options.allowInvalidClaimDigest
-				? manifest?.version === options.expectedManagedVersion
-					|| await hasManagedSnapshotOwnershipRecord(sourceRef.operationPath, options.expectedManagedVersion!)
-				: manifest?.version === options.expectedManagedVersion;
+				? managedMarkerValid
+				: manifest?.name === OMX_PLUGIN_NAME && manifest.version === options.expectedManagedVersion;
 			const owned = sourceStats.dev === childStats.dev
 				&& sourceStats.ino === childStats.ino
-				&& manifest?.name === OMX_PLUGIN_NAME
 				&& versionOwnershipValid
 				&& completionValid
-				&& !(await hasPublicationMarkerEntry(sourceRef.operationPath, ".omx-incomplete"))
-				&& await hasRegularPublicationMarker(sourceRef.operationPath, OMX_PLUGIN_MANAGED_MARKER);
+				&& !(await hasPublicationMarkerEntry(sourceRef.operationPath, ".omx-incomplete"));
 			if (!owned || await isLivePinnedSnapshot(sourceRef)) {
 				options.preservedPaths?.push(join(cacheBaseRef.path, childName));
 				return false;
@@ -1492,15 +1492,15 @@ export async function removeChildIfIdentity(
 		const completionValid = options.allowInvalidClaimDigest
 			? await hasManagedCompletionMarker(quarantinePath, options.expectedManagedVersion!)
 			: await hasRegularPublicationMarker(quarantinePath, ".omx-complete");
+		const managedMarkerValid = options.allowInvalidClaimDigest
+			? await hasManagedSnapshotOwnershipRecord(quarantinePath, options.expectedManagedVersion!)
+			: await hasRegularPublicationMarker(quarantinePath, OMX_PLUGIN_MANAGED_MARKER);
 		const versionOwnershipValid = options.allowInvalidClaimDigest
-			? manifest?.version === options.expectedManagedVersion
-				|| await hasManagedSnapshotOwnershipRecord(quarantinePath, options.expectedManagedVersion!)
-			: manifest?.version === options.expectedManagedVersion;
-		const owned = manifest?.name === OMX_PLUGIN_NAME
-			&& versionOwnershipValid
+			? managedMarkerValid
+			: manifest?.name === OMX_PLUGIN_NAME && manifest.version === options.expectedManagedVersion;
+		const owned = versionOwnershipValid
 			&& completionValid
-			&& !(await hasPublicationMarkerEntry(quarantinePath, ".omx-incomplete"))
-			&& await hasRegularPublicationMarker(quarantinePath, OMX_PLUGIN_MANAGED_MARKER);
+			&& !(await hasPublicationMarkerEntry(quarantinePath, ".omx-incomplete"));
 		let quarantineRef: DirectoryRef | undefined;
 		let livePin = true;
 		try {
@@ -2634,15 +2634,11 @@ async function inspectManagedSnapshotForRepair(
 	version: string,
 ): Promise<{ stats: Stats; reason?: string }> {
 	const stats = await snapshotRef.handle.stat();
-	const manifest = await readRegularOmxPluginCacheManifest(snapshotRef.operationPath, snapshotRef.operationPath);
-	// The manifest version may be damaged; new owner records independently identify its intended cache version.
 	const owned = stats.isDirectory()
 		&& !stats.isSymbolicLink()
-		&& manifest?.name === OMX_PLUGIN_NAME
-		&& (manifest.version === version || await hasManagedSnapshotOwnershipRecord(snapshotRef.operationPath, version))
+		&& await hasManagedSnapshotOwnershipRecord(snapshotRef.operationPath, version)
 		&& await hasManagedCompletionMarker(snapshotRef.operationPath, version)
-		&& !(await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-incomplete"))
-		&& await hasRegularPublicationMarker(snapshotRef.operationPath, OMX_PLUGIN_MANAGED_MARKER);
+		&& !(await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-incomplete"));
 	if (!owned) {
 		return { stats, reason: `same-version cache at ${snapshotRef.path} is not a verified managed OMX snapshot` };
 	}

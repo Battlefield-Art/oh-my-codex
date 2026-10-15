@@ -407,14 +407,64 @@ function livePinDirectory(pluginRoot) {
   const codexHome = process.env.CODEX_HOME || join(homedir(), '.codex');
   const expectedRoot = join(codexHome, 'plugins', 'cache', 'oh-my-codex-local', 'oh-my-codex', manifest.version);
   if (!sameFilePath(pluginRoot, expectedRoot)) return null;
-  const pinDir = join(pluginRoot, '.omx-live-pin');
+  let rootFd = null;
+  const closeRoot = () => {
+    if (rootFd === null) return;
+    try { closeSync(rootFd); } catch {}
+    rootFd = null;
+  };
   try {
-    const pinDirStats = lstatSync(pinDir);
-    if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink()) return null;
+    if (process.platform === 'linux') {
+      rootFd = openSync(pluginRoot, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      const openedRootStats = fstatSync(rootFd);
+      if (
+        !openedRootStats.isDirectory()
+        || openedRootStats.isSymbolicLink()
+        || openedRootStats.dev !== rootStats.dev
+        || openedRootStats.ino !== rootStats.ino
+      ) {
+        closeRoot();
+        return null;
+      }
+    }
+    const operationRoot = rootFd === null ? pluginRoot : `/proc/self/fd/${rootFd}`;
+    const pinDir = join(operationRoot, '.omx-live-pin');
+    try {
+      const pinDirStats = lstatSync(pinDir);
+      if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink()) {
+        closeRoot();
+        return null;
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        closeRoot();
+        return null;
+      }
+    }
+    return { path: pinDir, pluginRoot, rootDev: rootStats.dev, rootIno: rootStats.ino, rootFd };
   } catch (error) {
-    if (error?.code !== 'ENOENT') return null;
+    closeRoot();
+    throw error;
   }
-  return pinDir;
+}
+
+function livePinRootMatches(pinState) {
+  try {
+    const currentStats = pinState.rootFd === null
+      ? lstatSync(pinState.pluginRoot)
+      : fstatSync(pinState.rootFd);
+    return currentStats.isDirectory()
+      && !currentStats.isSymbolicLink()
+      && currentStats.dev === pinState.rootDev
+      && currentStats.ino === pinState.rootIno;
+  } catch {
+    return false;
+  }
+}
+
+function closeLivePinDirectory(pinState) {
+  if (!pinState || pinState.rootFd === null) return;
+  try { closeSync(pinState.rootFd); } catch {}
 }
 
 function isProcessAlive(pid) {
@@ -428,63 +478,69 @@ function isProcessAlive(pid) {
 
 function hasLiveSessionPin(pluginRoot, sessionId) {
   const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
-  let pinDir;
+  let pinState;
   try {
-    pinDir = livePinDirectory(pluginRoot);
+    pinState = livePinDirectory(pluginRoot);
   } catch {
     return true;
   }
-  if (!pinDir) return true;
-  let entries;
+  if (!pinState) return true;
   try {
-    entries = readdirSync(pinDir, { withFileTypes: true });
+    const entries = readdirSync(pinState.path, { withFileTypes: true });
+    for (const entry of entries) {
+      const pinPath = join(pinState.path, entry.name);
+      let stats;
+      try {
+        stats = lstatSync(pinPath);
+      } catch {
+        return true;
+      }
+      const ageMs = Date.now() - stats.mtimeMs;
+      if (entry.name.startsWith('.stage-')) {
+        if (!stats.isFile() || stats.isSymbolicLink() || !Number.isFinite(ageMs) || ageMs < 0 || ageMs <= 5 * 60 * 1000) return true;
+        continue;
+      }
+      if (!entry.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || stats.size <= 0 || stats.size > 4096) return true;
+      const record = readJsonFile(pinPath);
+      if (
+        record?.version !== 1
+        || !Number.isSafeInteger(record.pid)
+        || record.pid <= 0
+        || (record.processStartHash !== null && (typeof record.processStartHash !== 'string' || !/^[0-9a-f]{24}$/.test(record.processStartHash)))
+        || typeof record.sessionHash !== 'string'
+        || !/^[0-9a-f]{64}$/.test(record.sessionHash)
+      ) return true;
+      if (isProcessAlive(record.pid)) {
+        if (record.sessionHash === sessionHash) return true;
+        continue;
+      }
+      try {
+        unlinkSync(pinPath);
+      } catch {
+        return true;
+      }
+    }
+    return false;
   } catch (error) {
     return error?.code !== 'ENOENT';
+  } finally {
+    closeLivePinDirectory(pinState);
   }
-  for (const entry of entries) {
-    const pinPath = join(pinDir, entry.name);
-    let stats;
-    try {
-      stats = lstatSync(pinPath);
-    } catch {
-      return true;
-    }
-    const ageMs = Date.now() - stats.mtimeMs;
-    if (entry.name.startsWith('.stage-')) {
-      if (!stats.isFile() || stats.isSymbolicLink() || !Number.isFinite(ageMs) || ageMs < 0 || ageMs <= 5 * 60 * 1000) return true;
-      continue;
-    }
-    if (!entry.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || stats.size <= 0 || stats.size > 4096) return true;
-    const record = readJsonFile(pinPath);
-    if (
-      record?.version !== 1
-      || !Number.isSafeInteger(record.pid)
-      || record.pid <= 0
-      || (record.processStartHash !== null && (typeof record.processStartHash !== 'string' || !/^[0-9a-f]{24}$/.test(record.processStartHash)))
-      || typeof record.sessionHash !== 'string'
-      || !/^[0-9a-f]{64}$/.test(record.sessionHash)
-    ) return true;
-    if (isProcessAlive(record.pid)) {
-      if (record.sessionHash === sessionHash) return true;
-      continue;
-    }
-    try {
-      unlinkSync(pinPath);
-    } catch {
-      return true;
-    }
-  }
-  return false;
 }
 
 function writePendingSessionPin(pluginRoot, sessionId) {
-  let pinDir;
+  let pinState;
   try {
-    pinDir = livePinDirectory(pluginRoot);
-    if (!pinDir) return null;
-    mkdirSync(pinDir, { recursive: true, mode: 0o700 });
+    pinState = livePinDirectory(pluginRoot);
+    if (!pinState || !livePinRootMatches(pinState)) return null;
+    const pinDir = pinState.path;
+    try {
+      mkdirSync(pinDir, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
     const pinDirStats = lstatSync(pinDir);
-    if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink()) return null;
+    if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink() || !livePinRootMatches(pinState)) return null;
     const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
     const record = {
       version: 1,
@@ -493,18 +549,31 @@ function writePendingSessionPin(pluginRoot, sessionId) {
       sessionHash,
     };
     const content = `${JSON.stringify(record)}\n`;
-    const stagePath = join(pinDir, `.stage-${process.pid}-${randomUUID()}`);
-    const pinPath = join(pinDir, `pin-${process.pid}-${sessionHash}-${randomUUID()}.json`);
+    const stageName = `.stage-${process.pid}-${randomUUID()}`;
+    const pinName = `pin-${process.pid}-${sessionHash}-${randomUUID()}.json`;
+    const stagePath = join(pinDir, stageName);
+    const pinPath = join(pinDir, pinName);
+    const cleanupPath = join(pluginRoot, '.omx-live-pin', pinName);
     try {
       writeFileSync(stagePath, content, { flag: 'wx', mode: 0o600 });
+      if (!livePinRootMatches(pinState)) {
+        removePendingSessionPin(stagePath);
+        return null;
+      }
       renameSync(stagePath, pinPath);
-      return pinPath;
+      if (!livePinRootMatches(pinState)) {
+        removePendingSessionPin(pinPath);
+        return null;
+      }
+      return cleanupPath;
     } catch (error) {
       try { unlinkSync(stagePath); } catch {}
       throw error;
     }
   } catch {
     return null;
+  } finally {
+    closeLivePinDirectory(pinState);
   }
 }
 

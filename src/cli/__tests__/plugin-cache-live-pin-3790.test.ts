@@ -542,7 +542,7 @@ describe("issue 3790 live plugin cache pins", () => {
 		}
 	});
 
-	it("repairs stale caches that still use the legacy numeric managed marker", async () => {
+	it("repairs a missing manifest from the legacy numeric managed marker", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-3790-legacy-managed-marker-"));
 		try {
 			await withIsolatedUserHome(wd, async (codexHomeDir) => {
@@ -551,11 +551,9 @@ describe("issue 3790 live plugin cache pins", () => {
 				const published = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
 				assert.equal(published.status, "materialized");
 				const cacheDir = published.cacheDir!;
-				const manifestPath = join(cacheDir, ".codex-plugin", "plugin.json");
-				const manifest = JSON.parse(await readFile(manifestPath, "utf-8")) as Record<string, unknown>;
 				await writeFile(join(cacheDir, ".omx-managed"), `${process.pid}\n`);
-				manifest.version = "corrupted-version";
-				await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+				const manifestPath = join(cacheDir, ".codex-plugin", "plugin.json");
+				await rm(manifestPath);
 				await writeFile(join(cacheDir, "hooks", "omx-command.json"), "stale launcher\n");
 
 				const repaired = await materializePackagedOmxPluginCache(codexHomeDir, packaged, { repairCache: true });
