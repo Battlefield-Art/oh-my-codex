@@ -777,7 +777,8 @@ async function main() {
   }
 
   if (!routedByLaunchCorrelation) {
-    if (pendingPin) await pinUnroutedSession(input, pinnedLauncherAtStart, pluginRoot, pendingPin);
+    const pinLauncher = process.env.OMX_NATIVE_HOOK_COMMAND ? configuredLauncherAtStart : pinnedLauncherAtStart;
+    if (pendingPin) await pinUnroutedSession(input, pinLauncher, pluginRoot, pendingPin);
     writePlainCodexNoop(isStop);
     return;
   }

@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import {
+	chmod,
 	cp,
 	lstat,
 	mkdir,
@@ -13,7 +14,7 @@ import {
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
+import { delimiter, dirname, join } from "node:path";
 import { describe, it } from "node:test";
 import { once } from "node:events";
 import {
@@ -189,6 +190,70 @@ describe("issue 3790 live plugin cache pins", () => {
 				);
 				assert.equal(retryResult.status, 0, retryResult.stderr || retryResult.stdout);
 				assert.equal((await readdir(markerDir)).length, 1);
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("uses the configured launcher to pin an unrouted session when the cache launcher is invalid", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-configured-pin-launcher-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+				assert.ok(packaged);
+				const published = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
+				assert.equal(published.status, "materialized");
+				const cacheDir = published.cacheDir!;
+				await writeFile(join(cacheDir, "hooks", "omx-command.json"), "invalid launcher\n");
+
+				const cliPath = join(packageRoot, "dist", "cli", "omx.js");
+				const overrideName = "omx-hook-override";
+				if (process.platform === "win32") {
+					await writeFile(
+						join(wd, `${overrideName}.cmd`),
+						`@echo off\r\n"${process.execPath}" "${cliPath}" %*\r\n`,
+					);
+				} else {
+					const overridePath = join(wd, overrideName);
+					await writeFile(
+						overridePath,
+						`#!/usr/bin/env node\nimport { spawnSync } from "node:child_process";\nimport { readFileSync } from "node:fs";\nconst result = spawnSync(${JSON.stringify(process.execPath)}, [${JSON.stringify(cliPath)}, ...process.argv.slice(2)], { input: readFileSync(0), stdio: ["pipe", "inherit", "inherit"], env: process.env });\nprocess.exitCode = result.status ?? 1;\n`,
+					);
+					await chmod(overridePath, 0o755);
+				}
+
+				const sessionId = "configured-launcher-session";
+				const hookResult = spawnSync(
+					process.execPath,
+					[join(cacheDir, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						input: JSON.stringify({
+							hook_event_name: "SessionStart",
+							session_id: sessionId,
+							codex_pid: process.pid,
+							cwd: wd,
+						}),
+						encoding: "utf-8",
+						env: {
+							...process.env,
+							CODEX_HOME: codexHomeDir,
+							OMX_NATIVE_HOOK_COMMAND: overrideName,
+							PATH: `${wd}${delimiter}${process.env.PATH ?? ""}`,
+						},
+					},
+				);
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				const markerDir = join(cacheDir, ".omx-live-pin");
+				const entries = await readdir(markerDir);
+				assert.equal(entries.length, 1);
+				const pin = JSON.parse(await readFile(join(markerDir, entries[0]!), "utf-8")) as {
+					pid: number;
+					sessionHash: string;
+				};
+				assert.equal(pin.pid, process.pid);
+				assert.equal(pin.sessionHash, createHash("sha256").update(sessionId).digest("hex"));
 			});
 		} finally {
 			await rm(wd, { recursive: true, force: true });
