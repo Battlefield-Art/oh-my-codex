@@ -273,6 +273,7 @@ describe("issue 3790 live plugin cache pins", () => {
 				const helperPath = join(wd, "hanging-pin-helper.mjs");
 				await writeFile(helperPath, `
 const parentPid = process.ppid;
+process.on("SIGTERM", () => {});
 setInterval(() => {
 	try { process.kill(parentPid, 0); } catch { process.exit(0); }
 }, 50);
