@@ -999,11 +999,14 @@ command = "node"
 			const res = runOmx(wd, ["doctor"], { HOME: home, CODEX_HOME: codexDir });
 			if (shouldSkipForSpawnPermissions(res.error)) return;
 			assert.equal(res.status, 0, res.stderr || res.stdout);
-			const nativeHooksWarning = res.stdout.split(/\r?\n/).find((line) => line.includes("Native hooks:"));
-			assert.ok(nativeHooksWarning, res.stdout);
-			assert.match(nativeHooksWarning, /expected plugin cache path .* is a symlink; automatic repair preserves unverified content/);
-			assert.match(nativeHooksWarning, /remove only the cache entry at .* itself without following symlinks, then rerun omx setup --plugin/);
-			assert.doesNotMatch(nativeHooksWarning, /--repair-plugin-cache|codex plugin remove/);
+			const doctorLines = res.stdout.split(/\r?\n/);
+			for (const section of ["Skills:", "Plugin versions:", "Native hooks:"]) {
+				const warning = doctorLines.find((line) => line.includes(section));
+				assert.ok(warning, res.stdout);
+				assert.match(warning, /expected plugin cache path .* is a symlink; automatic repair preserves unverified content/);
+				assert.match(warning, /remove only the cache entry at .* itself without following symlinks, then rerun omx setup --plugin/);
+				assert.doesNotMatch(warning, /--repair-plugin-cache|codex plugin remove/);
+			}
 			assert.equal(existsSync(join(externalCache, "hooks", "codex-native-hook.mjs")), true);
 		} finally {
 			await rm(wd, { recursive: true, force: true });

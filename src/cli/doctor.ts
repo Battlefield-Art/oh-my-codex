@@ -2566,6 +2566,21 @@ function pluginHooksJsonHasNativeCoverage(content: string): boolean | null {
 	}
 }
 
+async function getUntrustedOmxPluginCacheEntryKind(cacheDir: string): Promise<"a symlink" | "a non-directory entry" | null> {
+	try {
+		const stats = await lstat(cacheDir);
+		if (stats.isSymbolicLink()) return "a symlink";
+		if (!stats.isDirectory()) return "a non-directory entry";
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "ENOENT") return null;
+	}
+	return null;
+}
+
+function untrustedOmxPluginCacheRecoveryMessage(cacheDir: string, entryKind: "a symlink" | "a non-directory entry"): string {
+	return `expected plugin cache path ${cacheDir} is ${entryKind}; automatic repair preserves unverified content; ${getUntrustedOmxPluginCacheRecoveryHint(cacheDir)}`;
+}
+
 async function checkPluginScopedNativeHooks(
 	codexHomeDir: string,
 	setupHooksPath: string,
@@ -2590,13 +2605,12 @@ async function checkPluginScopedNativeHooks(
 	const expectedHooksPath = join(expectedCacheDir, "hooks", "hooks.json");
 	const expectedHookLauncherPath = join(expectedCacheDir, "hooks", "codex-native-hook.mjs");
 	const expectedPinnedLauncherPath = join(expectedCacheDir, "hooks", "omx-command.json");
-	const expectedCacheStats = await lstat(expectedCacheDir).catch(() => null);
-	if (expectedCacheStats && (expectedCacheStats.isSymbolicLink() || !expectedCacheStats.isDirectory())) {
-		const entryKind = expectedCacheStats.isSymbolicLink() ? "a symlink" : "a non-directory entry";
+	const untrustedCacheEntryKind = await getUntrustedOmxPluginCacheEntryKind(expectedCacheDir);
+	if (untrustedCacheEntryKind) {
 		return {
 			name: "Native hooks",
 			status: "warn",
-			message: `plugin-scoped hooks are enabled, but expected plugin cache path ${expectedCacheDir} is ${entryKind}; automatic repair preserves unverified content; ${getUntrustedOmxPluginCacheRecoveryHint(expectedCacheDir)}`,
+			message: `plugin-scoped hooks are enabled, but ${untrustedOmxPluginCacheRecoveryMessage(expectedCacheDir, untrustedCacheEntryKind)}`,
 		};
 	}
 	const state = await readOmxPluginCacheState(expectedCacheDir);
@@ -3660,6 +3674,14 @@ async function checkPluginMarketplaceRegistration(
 			"oh-my-codex",
 			packagedManifestVersion,
 		);
+		const untrustedCacheEntryKind = await getUntrustedOmxPluginCacheEntryKind(expectedCacheDir);
+		if (untrustedCacheEntryKind) {
+			return {
+				name: "Skills",
+				status: "warn",
+				message: `plugin marketplace ${OMX_LOCAL_MARKETPLACE_NAME} has ${untrustedOmxPluginCacheRecoveryMessage(expectedCacheDir, untrustedCacheEntryKind)} so /skills can discover OMX plugin skills`,
+			};
+		}
 		if (existsSync(expectedCacheDir)) {
 			const provenanceReason = await omxPluginCacheProvenanceReason(
 				expectedCacheDir,
@@ -3778,6 +3800,14 @@ async function checkPluginVersionDiagnostics(
 		"oh-my-codex",
 		manifestVersion,
 	);
+	const untrustedCacheEntryKind = await getUntrustedOmxPluginCacheEntryKind(cacheDir);
+	if (untrustedCacheEntryKind) {
+		return {
+			name: "Plugin versions",
+			status: "warn",
+			message: untrustedOmxPluginCacheRecoveryMessage(cacheDir, untrustedCacheEntryKind),
+		};
+	}
 	if (existsSync(cacheDir)) {
 		const provenanceReason = await omxPluginCacheProvenanceReason(
 			cacheDir,
