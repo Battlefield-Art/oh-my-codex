@@ -40,6 +40,7 @@ import {
   injectModelInstructionsBypassArgs,
   resolveWorkerSparkModel,
   resolveSetupInstallModeArg,
+  resolveSetupRepairPluginCacheArg,
   resolveSetupMcpModeArg,
   resolveSetupScopeArg,
   resolveSetupTeamModeArg,
@@ -2672,6 +2673,20 @@ describe("resolveSetupInstallModeArg", () => {
     assert.throws(
       () => resolveSetupInstallModeArg(["--legacy", "--install-mode=plugin"]),
       /Conflicting setup install mode flags/,
+    );
+  });
+});
+
+describe("resolveSetupRepairPluginCacheArg", () => {
+  it("recognizes the scoped plugin-cache repair flag", () => {
+    assert.equal(resolveSetupRepairPluginCacheArg(["--plugin"]), false);
+    assert.equal(
+      resolveSetupRepairPluginCacheArg(["--plugin", "--repair-plugin-cache"]),
+      true,
+    );
+    assert.throws(
+      () => resolveSetupRepairPluginCacheArg(["--repair-plugin-cache=true"]),
+      /--repair-plugin-cache does not accept a value/,
     );
   });
 });

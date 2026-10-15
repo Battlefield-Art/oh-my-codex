@@ -251,7 +251,7 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
         assert.equal(await hasExpectedOmxPluginCache(codexHomeDir, packaged), false);
         const result = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
         assert.equal(result.status, "stale-launcher");
-        assert.match(result.reason ?? "", /managed snapshots|publication marker|omx setup --plugin --force/);
+        assert.match(result.reason ?? "", /managed snapshots|publication marker|omx setup --plugin --repair-plugin-cache/);
       });
     } finally {
       await rm(wd, { recursive: true, force: true });

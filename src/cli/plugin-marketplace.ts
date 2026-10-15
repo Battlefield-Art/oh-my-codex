@@ -2175,7 +2175,7 @@ export interface OmxPluginCacheMaterializeResult {
 	launcherTarget?: string;
 }
 
-export const PLUGIN_LAUNCHER_RECOVERY_HINT = "omx setup --plugin --force";
+export const PLUGIN_LAUNCHER_RECOVERY_HINT = "omx setup --plugin --repair-plugin-cache";
 
 async function canonicalRealpath(path: string): Promise<string | null> {
 	try {

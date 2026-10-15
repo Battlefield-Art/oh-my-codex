@@ -196,6 +196,8 @@ interface SetupOptions {
 	codexVersionProbe?: () => string | null;
 	disableHooks?: boolean;
 	force?: boolean;
+	/** Rebuild only a stale, verified managed plugin-cache snapshot. */
+	repairPluginCache?: boolean;
 	mergeAgents?: boolean;
 	mergeAgentsPolicy?: { kind: "set"; value: boolean } | { kind: "clear" };
 	dryRun?: boolean;
@@ -4112,6 +4114,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	const {
 		disableHooks = false,
 		force = false,
+		repairPluginCache = false,
 		dryRun = false,
 		installMode: requestedInstallMode,
 		mcpMode: requestedMcpMode,
@@ -4319,6 +4322,9 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 	const backupContext = getBackupContext(resolvedScope.scope, projectRoot);
 	const skillReceiptPath = installedSkillReceiptPath(resolvedScope.scope, projectRoot);
 	const isPluginInstallMode = resolvedInstallMode?.installMode === "plugin";
+	if (repairPluginCache && !isPluginInstallMode) {
+		throw new Error("--repair-plugin-cache requires plugin setup mode; add --plugin.");
+	}
 	const pluginAgentsMdDst =
 		resolvedScope.scope === "project"
 			? join(projectRoot, "AGENTS.md")
@@ -4777,7 +4783,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		const pluginCacheMaterialize = await materializePackagedOmxPluginCache(
 			scopeDirs.codexHomeDir,
 			preflightMarketplace,
-			{ dryRun, repairCache: force, teamMode: resolvedTeamMode },
+			{ dryRun, repairCache: force || repairPluginCache, teamMode: resolvedTeamMode },
 		);
 		if (pluginCacheMaterialize.status === "materialized") {
 			console.log(

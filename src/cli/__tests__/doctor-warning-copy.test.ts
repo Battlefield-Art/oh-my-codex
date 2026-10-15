@@ -752,13 +752,13 @@ command = "node"
 			assert.match(
 				res.stdout,
 				new RegExp(
-					`Skills: plugin marketplace oh-my-codex-local is registered, but (?:installed Codex plugin cache manifest version 0\\.0\\.0-stale does not match packaged version ${escapedVersion}|no installed Codex plugin cache was found); run .*omx setup --plugin --force.*so /skills can discover OMX plugin skills`,
+					`Skills: plugin marketplace oh-my-codex-local is registered, but (?:installed Codex plugin cache manifest version 0\\.0\\.0-stale does not match packaged version ${escapedVersion}|no installed Codex plugin cache was found); run .*omx setup --plugin --repair-plugin-cache.*so /skills can discover OMX plugin skills`,
 				),
 			);
 			assert.match(
 				res.stdout,
 				new RegExp(
-					`Plugin versions: expected cache directory .*${escapedVersion} is not materialized with packaged plugin manifest version ${escapedVersion}; run .*omx setup --plugin --force`,
+					`Plugin versions: expected cache directory .*${escapedVersion} is not materialized with packaged plugin manifest version ${escapedVersion}; run .*omx setup --plugin --repair-plugin-cache`,
 				),
 			);
 		} finally {
@@ -797,8 +797,8 @@ command = "node"
 			const res = runOmx(wd, ["doctor"], { HOME: home, CODEX_HOME: codexDir });
 			if (shouldSkipForSpawnPermissions(res.error)) return;
 			assert.equal(res.status, 0, res.stderr || res.stdout);
-			assert.match(res.stdout, /Skills: plugin marketplace oh-my-codex-local cache provenance is invalid: expected skill file content differs.*omx setup --plugin --force/);
-			assert.match(res.stdout, /Plugin versions: expected cache directory .* has invalid plugin cache provenance: expected skill file content differs.*omx setup --plugin --force/);
+			assert.match(res.stdout, /Skills: plugin marketplace oh-my-codex-local cache provenance is invalid: expected skill file content differs.*omx setup --plugin --repair-plugin-cache/);
+			assert.match(res.stdout, /Plugin versions: expected cache directory .* has invalid plugin cache provenance: expected skill file content differs.*omx setup --plugin --repair-plugin-cache/);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
 		}
@@ -836,8 +836,8 @@ command = "node"
 			const res = runOmx(wd, ["doctor"], { HOME: home, CODEX_HOME: codexDir });
 			if (shouldSkipForSpawnPermissions(res.error)) return;
 			assert.equal(res.status, 0, res.stderr || res.stdout);
-			assert.match(res.stdout, /Skills: plugin marketplace oh-my-codex-local cache provenance is invalid: plugin manifest skills pointer is not \.\/skills\/.*omx setup --plugin --force/);
-			assert.match(res.stdout, /Plugin versions: expected cache directory .* has invalid plugin cache provenance: plugin manifest skills pointer is not \.\/skills\/.*omx setup --plugin --force/);
+			assert.match(res.stdout, /Skills: plugin marketplace oh-my-codex-local cache provenance is invalid: plugin manifest skills pointer is not \.\/skills\/.*omx setup --plugin --repair-plugin-cache/);
+			assert.match(res.stdout, /Plugin versions: expected cache directory .* has invalid plugin cache provenance: plugin manifest skills pointer is not \.\/skills\/.*omx setup --plugin --repair-plugin-cache/);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
 		}
@@ -876,8 +876,8 @@ command = "node"
 				const res = runOmx(wd, ["doctor"], { HOME: home, CODEX_HOME: codexDir });
 				if (shouldSkipForSpawnPermissions(res.error)) continue;
 				assert.equal(res.status, 0, res.stderr || res.stdout);
-				assert.match(res.stdout, new RegExp(`Skills: plugin marketplace oh-my-codex-local cache provenance is invalid: plugin manifest ${field} pointer is not [^;]+; run omx setup --plugin --force`));
-				assert.match(res.stdout, new RegExp(`Plugin versions: expected cache directory .* has invalid plugin cache provenance: plugin manifest ${field} pointer is not [^;]+; run omx setup --plugin --force`));
+				assert.match(res.stdout, new RegExp(`Skills: plugin marketplace oh-my-codex-local cache provenance is invalid: plugin manifest ${field} pointer is not [^;]+; run omx setup --plugin --repair-plugin-cache`));
+				assert.match(res.stdout, new RegExp(`Plugin versions: expected cache directory .* has invalid plugin cache provenance: plugin manifest ${field} pointer is not [^;]+; run omx setup --plugin --repair-plugin-cache`));
 			} finally {
 				await rm(wd, { recursive: true, force: true });
 			}
@@ -915,7 +915,7 @@ command = "node"
 					if (shouldSkipForSpawnPermissions(res.error)) continue;
 					assert.equal(res.status, 0, res.stderr || res.stdout);
 					const reason = mode === "mutated" ? ".*companion file content differs" : ".*companion file .*symlink";
-					const guidance = "omx setup --plugin --force";
+					const guidance = "omx setup --plugin --repair-plugin-cache";
 					assert.match(res.stdout, new RegExp(`Skills: plugin marketplace oh-my-codex-local cache provenance is invalid: ${reason}.*${guidance}`));
 					assert.match(res.stdout, new RegExp(`Plugin versions: expected cache directory .* has invalid plugin cache provenance: ${reason}.*${guidance}`));
 				} finally {
@@ -960,15 +960,15 @@ command = "node"
 			assert.equal(res.status, 0, res.stderr || res.stdout);
 			assert.match(
 				res.stdout,
-				/Skills: plugin marketplace oh-my-codex-local is registered, but no installed Codex plugin cache was found; run .*omx setup --plugin --force.*so \/skills can discover OMX plugin skills/,
+				/Skills: plugin marketplace oh-my-codex-local is registered, but no installed Codex plugin cache was found; run .*omx setup --plugin --repair-plugin-cache.*so \/skills can discover OMX plugin skills/,
 			);
 			assert.match(
 				res.stdout,
-				/Plugin versions: expected cache directory .* is not materialized with packaged plugin manifest version .*; run .*omx setup --plugin --force/,
+				/Plugin versions: expected cache directory .* is not materialized with packaged plugin manifest version .*; run .*omx setup --plugin --repair-plugin-cache/,
 			);
 			assert.match(
 				res.stdout,
-				/Native hooks: plugin-scoped hooks are enabled, but the expected Codex plugin cache manifest is missing .*omx setup --plugin --force/,
+				/Native hooks: plugin-scoped hooks are enabled, but the expected Codex plugin cache manifest is missing .*omx setup --plugin --repair-plugin-cache/,
 			);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
@@ -1973,7 +1973,7 @@ OMX_LORE_COMMIT_GUARD = "truee"
 				new RegExp(
 					"\\[!!\\] Native hooks: plugin-scoped hooks are enabled, but cached launcher in " +
 						cacheDir.replace(/[.*+?^${}()|[\]\\]/g, "\\$&") +
-						" is incompatible \\(.*pinned launcher target does not exist.*omx setup --plugin --force.*\\); setup-owned hooks\\.json is intentionally absent at .*\\.codex[\\/]+hooks\\.json; run `omx setup --plugin --force`",
+						" is incompatible \\(.*pinned launcher target does not exist.*omx setup --plugin --repair-plugin-cache.*\\); setup-owned hooks\\.json is intentionally absent at .*\\.codex[\\/]+hooks\\.json; run `omx setup --plugin --repair-plugin-cache`",
 				),
 			);
 			assert.doesNotMatch(res.stdout, /plugin cache native hook coverage smoke passed/);
