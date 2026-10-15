@@ -503,9 +503,7 @@ function parseSingleJsonObjectOutput(raw) {
 async function pinUnroutedSession(input) {
   let launcher;
   try {
-    launcher = process.env.OMX_NATIVE_HOOK_COMMAND
-      ? readConfiguredLauncher()
-      : readPinnedLauncher();
+    launcher = readPinnedLauncher();
     if (!launcher) return;
   } catch {
     return;
