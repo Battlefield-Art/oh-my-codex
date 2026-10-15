@@ -260,6 +260,52 @@ describe("issue 3790 live plugin cache pins", () => {
 		}
 	});
 
+	it("returns a no-op when an unrouted pin helper hangs", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-pin-helper-timeout-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+				assert.ok(packaged);
+				const materialized = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
+				assert.equal(materialized.status, "materialized");
+				const cacheDir = materialized.cacheDir!;
+				const launcherPath = join(cacheDir, "hooks", "omx-command.json");
+				const helperPath = join(wd, "hanging-pin-helper.mjs");
+				await writeFile(helperPath, `
+const parentPid = process.ppid;
+setInterval(() => {
+	try { process.kill(parentPid, 0); } catch { process.exit(0); }
+}, 50);
+setInterval(() => {}, 60_000);
+`);
+				await writeFile(launcherPath, JSON.stringify({ command: process.execPath, argsPrefix: [helperPath] }));
+
+				const hookResult = spawnSync(
+					process.execPath,
+					[join(cacheDir, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						input: JSON.stringify({
+							hook_event_name: "SessionStart",
+							session_id: "hung-pin-helper-session",
+							codex_pid: process.pid,
+							cwd: wd,
+						}),
+						encoding: "utf-8",
+						timeout: 12_000,
+						env: { ...process.env, CODEX_HOME: codexHomeDir },
+					},
+				);
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				assert.equal(hookResult.stdout, "");
+				assert.match(hookResult.stderr, /live plugin cache pin helper timed out/);
+				assert.deepEqual(await readdir(join(cacheDir, ".omx-live-pin")), []);
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
 	it("pins a running hook wrapper before it waits for stdin", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-3790-startup-pin-"));
 		try {

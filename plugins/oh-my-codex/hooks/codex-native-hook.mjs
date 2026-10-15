@@ -15,6 +15,7 @@ const MAX_WRAPPER_STDIN_BYTES = 1024 * 1024;
 const RAW_EVENT_SCAN_BYTES = 64 * 1024;
 const MAX_STOP_STDOUT_BYTES = 1024 * 1024;
 const MAX_ROUTING_RECORD_BYTES = 4 * 1024;
+const LIVE_PIN_HELPER_TIMEOUT_MS = 5_000;
 const CODEX_HOOK_EVENT_NAMES = new Set([
   'SessionStart',
   'PreToolUse',
@@ -730,9 +731,16 @@ async function pinUnroutedSession(input, launcher, pluginRoot, pendingPin) {
     child.stdin.end(input);
     await new Promise((resolveChild) => {
       let settled = false;
+      const timeout = setTimeout(() => {
+        if (settled) return;
+        console.error('[oh-my-codex] live plugin cache pin helper timed out; a later hook may retry');
+        child.kill();
+        finish();
+      }, LIVE_PIN_HELPER_TIMEOUT_MS);
       const finish = () => {
         if (settled) return;
         settled = true;
+        clearTimeout(timeout);
         resolveChild();
       };
       child.once('error', (error) => {
