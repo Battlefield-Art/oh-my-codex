@@ -788,6 +788,64 @@ syncBuiltinESMExports();
 		}
 	});
 
+	it("retries pin registration on later hooks when a same-session PID has stale identity", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-stale-later-hook-pin-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const snapshots = await Promise.all(
+					["0.20.0", "0.20.1", "0.20.2"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
+				const sessionId = "resumed-session";
+				const sessionHash = createHash("sha256").update(sessionId).digest("hex");
+				const staleProcessStartHash = "000000000000000000000000";
+				const pinDirectory = join(snapshots[0]!, ".omx-live-pin");
+				await mkdir(pinDirectory, { recursive: true });
+				await writeFile(
+					join(pinDirectory, "stale-reused-pid.json"),
+					`${JSON.stringify({
+						version: 1,
+						pid: process.pid,
+						processStartHash: staleProcessStartHash,
+						sessionHash,
+					})}\n`,
+				);
+
+				const hookResult = spawnSync(
+					process.execPath,
+					[join(snapshots[0]!, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						input: JSON.stringify({
+							hook_event_name: "UserPromptSubmit",
+							session_id: sessionId,
+							codex_pid: process.pid,
+							cwd: wd,
+						}),
+						encoding: "utf-8",
+						env: { ...process.env, CODEX_HOME: codexHomeDir },
+					},
+				);
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				const pinRecords = await Promise.all(
+					(await readdir(pinDirectory)).map(async (name) =>
+						JSON.parse(await readFile(join(pinDirectory, name), "utf-8")) as {
+							pid: number;
+							processStartHash: string | null;
+							sessionHash: string;
+						},
+					),
+				);
+				assert.ok(pinRecords.some((record) =>
+					record.pid === process.pid
+					&& record.sessionHash === sessionHash
+					&& record.processStartHash !== staleProcessStartHash,
+				));
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
 	it("refreshes a resumed SessionStart pin when its prior process identity is stale", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-3790-resumed-session-pin-"));
 		try {

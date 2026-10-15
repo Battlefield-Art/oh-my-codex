@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { extname } from 'node:path';
 import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
@@ -495,6 +495,39 @@ function isProcessAlive(pid) {
   }
 }
 
+function readProcessStartHash(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+  try {
+    let identity;
+    if (process.platform === 'linux') {
+      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
+      const close = stat.lastIndexOf(')');
+      if (close < 0) return null;
+      const fields = stat.slice(close + 2).trim().split(/\s+/);
+      const startTicks = fields[19];
+      const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
+      if (!startTicks || !/^\d+$/.test(startTicks) || !bootId) return null;
+      identity = `linux:${bootId}:${startTicks}`;
+    } else if (process.platform === 'darwin') {
+      const result = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 2_000 });
+      const value = result.stdout?.trim();
+      if (result.error || result.status !== 0 || !value) return null;
+      identity = `darwin:${value}`;
+    } else if (process.platform === 'win32') {
+      const script = `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`;
+      const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 3_000 });
+      const value = result.stdout?.trim();
+      if (result.error || result.status !== 0 || !value || !/^\d+$/.test(value)) return null;
+      identity = `win32:${value}`;
+    } else {
+      return null;
+    }
+    return createHash('sha256').update(identity).digest('hex').slice(0, 24);
+  } catch {
+    return null;
+  }
+}
+
 function hasLiveSessionPin(pluginRoot, sessionId) {
   const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
   let pinState;
@@ -530,7 +563,10 @@ function hasLiveSessionPin(pluginRoot, sessionId) {
         || !/^[0-9a-f]{64}$/.test(record.sessionHash)
       ) return true;
       if (isProcessAlive(record.pid)) {
-        if (record.sessionHash === sessionHash) return true;
+        if (record.sessionHash === sessionHash && record.processStartHash) {
+          const currentProcessStartHash = readProcessStartHash(record.pid);
+          if (currentProcessStartHash === record.processStartHash) return true;
+        }
         continue;
       }
       try {
