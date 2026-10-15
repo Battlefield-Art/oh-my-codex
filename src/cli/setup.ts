@@ -145,7 +145,6 @@ import {
 import {
 	OMX_LOCAL_MARKETPLACE_NAME,
 	OMX_PLUGIN_NAME,
-	PLUGIN_LAUNCHER_RECOVERY_HINT,
 	discoverOmxPluginCacheDirs,
 	materializePackagedOmxPluginCache,
 	resolvePackagedOmxMarketplace,
@@ -196,7 +195,7 @@ interface SetupOptions {
 	codexVersionProbe?: () => string | null;
 	disableHooks?: boolean;
 	force?: boolean;
-	/** Rebuild only a stale, verified managed plugin-cache snapshot. */
+	/** Repair stale managed caches and verified claims from exited publishers. */
 	repairPluginCache?: boolean;
 	mergeAgents?: boolean;
 	mergeAgentsPolicy?: { kind: "set"; value: boolean } | { kind: "clear" };
@@ -4793,10 +4792,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 			console.log("  Local Codex plugin cache already exposes packaged OMX skills.");
 		} else if (pluginCacheMaterialize.status === "stale-launcher") {
 			console.log(
-				`  warning: local Codex plugin cache at ${pluginCacheMaterialize.cacheDir} has incompatible launcher provenance (${pluginCacheMaterialize.reason}); not reporting as current.`,
-			);
-			console.log(
-				`  Run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\` to rebuild the snapshot for ${preflightMarketplace?.packageRoot ?? pkgRoot}.`,
+				`  warning: local Codex plugin cache at ${pluginCacheMaterialize.cacheDir} is not safe to use as current (${pluginCacheMaterialize.reason}); not reporting as current.`,
 			);
 		}
 		if (

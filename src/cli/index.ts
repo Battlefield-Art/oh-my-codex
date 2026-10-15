@@ -258,7 +258,7 @@ Usage:
   omx setup     Install skills, prompts, CLI-first config, and scope-specific AGENTS.md
                 (user scope prompts for legacy vs plugin skill delivery when needed)
   omx setup --plugin --repair-plugin-cache
-                Repair a stale managed plugin cache without enabling global force mode
+                Repair stale managed caches or verified dead-publisher claims without global force mode
   omx update    Install the stable channel now, then refresh setup
   omx update --stable
                 Install/rollback to npm stable (oh-my-codex@latest), then refresh setup

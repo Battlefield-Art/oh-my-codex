@@ -139,6 +139,65 @@ describe("issue 3790 live plugin cache pins", () => {
 					pin.processStartHash === null ||
 						/^[0-9a-f]{24}$/.test(pin.processStartHash),
 				);
+				await rm(join(markerDir, entries[0]!), { force: true });
+				const retryResult = spawnSync(
+					process.execPath,
+					[join(cacheDir, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						input: JSON.stringify({
+							hook_event_name: "UserPromptSubmit",
+							session_id: "issue-3790-session",
+							codex_pid: process.pid,
+							cwd: wd,
+						}),
+						encoding: "utf-8",
+						env: { ...process.env, CODEX_HOME: codexHomeDir },
+					},
+				);
+				assert.equal(retryResult.status, 0, retryResult.stderr || retryResult.stdout);
+				assert.equal((await readdir(markerDir)).length, 1);
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("retries pin registration after a concurrent cache publication releases its lock", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-pin-lock-retry-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const oldSnapshot = await seedManagedSnapshot(codexHomeDir, "0.20.0");
+				const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+				assert.ok(packaged);
+				let signalPrepared!: () => void;
+				let releasePublication!: () => void;
+				const prepared = new Promise<void>((resolvePrepared) => { signalPrepared = resolvePrepared; });
+				const publicationGate = new Promise<void>((resolvePublication) => { releasePublication = resolvePublication; });
+				const publication = materializePackagedOmxPluginCache(codexHomeDir, packaged, {
+					onCacheDirPrepared: async () => {
+						signalPrepared();
+						await publicationGate;
+					},
+				});
+				try {
+					await prepared;
+					let pinSettled = false;
+					const pinning = registerOmxPluginCacheLivePin(
+						oldSnapshot,
+						"lock-contention-session",
+						process.pid,
+					).finally(() => { pinSettled = true; });
+					await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
+					assert.equal(pinSettled, false, "pin registration must wait for the publication lock");
+					releasePublication();
+					const published = await publication;
+					assert.equal(published.status, "materialized");
+					assert.equal(await pinning, true);
+					await lstat(oldSnapshot);
+				} finally {
+					releasePublication();
+				}
 			});
 		} finally {
 			await rm(wd, { recursive: true, force: true });

@@ -500,7 +500,7 @@ function parseSingleJsonObjectOutput(raw) {
   return parseJsonObjectCandidate(lastLine);
 }
 
-async function pinUnroutedSessionStart(input) {
+async function pinUnroutedSession(input) {
   let launcher;
   try {
     launcher = process.env.OMX_NATIVE_HOOK_COMMAND
@@ -538,8 +538,9 @@ async function main() {
   const isCompact = detectCompactHookInput(input);
 
   if (!routedByLaunchCorrelation) {
-    if (!oversized && (payload?.hook_event_name ?? payload?.hookEventName) === 'SessionStart') {
-      await pinUnroutedSessionStart(input);
+    const sessionId = payload?.session_id ?? payload?.sessionId;
+    if (!oversized && typeof sessionId === 'string' && sessionId.trim()) {
+      await pinUnroutedSession(input);
     }
     writePlainCodexNoop(isStop);
     return;

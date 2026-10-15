@@ -1477,7 +1477,7 @@ describe("omx setup install mode behavior", () => {
 					assert.deepEqual(launcher.argsPrefix, ["/stale/omx.js"]);
 					assert.doesNotMatch(output, /Invalidated .* stale Codex plugin discovery cache/);
 					assert.doesNotMatch(output, /Local Codex plugin cache already exposes packaged OMX skills/);
-					assert.match(output, /incompatible launcher provenance/);
+					assert.match(output, /not safe to use as current/);
 					assert.match(output, /omx setup --plugin --repair-plugin-cache/);
 					const packagedMarketplace = await resolvePackagedOmxMarketplace(packageRoot);
 					assert.ok(packagedMarketplace);
@@ -1509,6 +1509,13 @@ describe("omx setup install mode behavior", () => {
 					await writeFile(launcherPath, `${JSON.stringify({ command: "/stale/node", argsPrefix: ["/stale/omx.js"] })}\n`);
 					await writeBoundCompletionMarker(cacheDir);
 					assert.equal(await registerOmxPluginCacheLivePin(cacheDir, "scoped-repair-live-session", process.pid), true);
+					const pinnedDryRun = await materializePackagedOmxPluginCache(
+						codexHomeDir,
+						packagedMarketplace,
+						{ dryRun: true, repairCache: true },
+					);
+					assert.equal(pinnedDryRun.status, "stale-launcher");
+					assert.match(pinnedDryRun.reason ?? "", /pinned by a live Codex session/);
 
 					const pinnedOutput = await captureConsoleOutput(async () => {
 						await setup({
@@ -1541,6 +1548,16 @@ describe("omx setup install mode behavior", () => {
 					assert.equal(repaired.status, "unchanged");
 					assert.equal((JSON.parse(await readFile(launcherPath, "utf-8")) as { command: string }).command, process.execPath);
 					await assert.rejects(lstat(join(cacheDir, ".omx-live-pin")), { code: "ENOENT" });
+
+					await rm(join(cacheDir, ".omx-managed"), { force: true });
+					const unverifiedDryRun = await materializePackagedOmxPluginCache(
+						codexHomeDir,
+						packagedMarketplace,
+						{ dryRun: true, repairCache: true },
+					);
+					assert.equal(unverifiedDryRun.status, "stale-launcher");
+					assert.match(unverifiedDryRun.reason ?? "", /not a verified managed OMX snapshot/);
+					assert.equal(existsSync(join(cacheDir, ".omx-managed")), false);
 				});
 			});
 		} finally {
