@@ -23011,13 +23011,16 @@ export async function runCodexNativeHookCli(): Promise<void> {
   const pluginCachePinOnly = process.argv.includes("--plugin-cache-pin-only");
   const pluginRoot = safeString(process.env.OMX_PLUGIN_ROOT).trim();
   const sessionId = readPayloadSessionId(payload);
-  const ownerPid = resolveSessionOwnerPid(payload, { requireCodexAncestor: true });
-  if (pluginRoot && sessionId && ownerPid) {
-    try {
-      await registerOmxPluginCacheLivePin(pluginRoot, sessionId, ownerPid);
-    } catch (error) {
-      const detail = error instanceof Error ? error.message : String(error);
-      console.error(`[oh-my-codex] unable to record live plugin cache pin: ${detail}`);
+  const pluginCachePinPending = process.env.OMX_PLUGIN_CACHE_PIN_PENDING === "1";
+  if (pluginRoot && sessionId && (pluginCachePinOnly || pluginCachePinPending)) {
+    const ownerPid = resolveSessionOwnerPid(payload, { requireCodexAncestor: true });
+    if (ownerPid) {
+      try {
+        await registerOmxPluginCacheLivePin(pluginRoot, sessionId, ownerPid);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.error(`[oh-my-codex] unable to record live plugin cache pin: ${detail}`);
+      }
     }
   }
   if (pluginCachePinOnly) {

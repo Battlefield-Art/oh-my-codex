@@ -1,7 +1,9 @@
 #!/usr/bin/env node
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { extname } from 'node:path';
-import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, realpathSync, writeFileSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -360,13 +362,6 @@ function readPinnedLauncher() {
   }
 }
 
-function readConfiguredLauncher() {
-  if (process.env.OMX_NATIVE_HOOK_COMMAND) {
-    return { command: process.env.OMX_NATIVE_HOOK_COMMAND, argsPrefix: [] };
-  }
-  return readPinnedLauncher() ?? { command: 'omx', argsPrefix: [] };
-}
-
 function buildSpawnOptions(command, extraEnv = {}) {
   const options = {
     stdio: ['pipe', 'pipe', 'pipe'],
@@ -389,6 +384,136 @@ function readJsonFile(path) {
   } catch {
     return null;
   }
+}
+
+function livePinDirectory(pluginRoot) {
+  const rootStats = lstatSync(pluginRoot);
+  if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) return null;
+  const manifest = readJsonFile(join(pluginRoot, '.codex-plugin', 'plugin.json'));
+  if (
+    manifest?.name !== 'oh-my-codex'
+    || typeof manifest.version !== 'string'
+    || !manifest.version
+    || manifest.version === '.'
+    || manifest.version === '..'
+    || manifest.version.includes('/')
+    || manifest.version.includes('\\')
+    || manifest.version.includes('\0')
+  ) return null;
+  for (const marker of ['.omx-managed', '.omx-complete']) {
+    const stats = lstatSync(join(pluginRoot, marker));
+    if (!stats.isFile() || stats.isSymbolicLink()) return null;
+  }
+  const codexHome = process.env.CODEX_HOME || join(homedir(), '.codex');
+  const expectedRoot = join(codexHome, 'plugins', 'cache', 'oh-my-codex-local', 'oh-my-codex', manifest.version);
+  if (!sameFilePath(pluginRoot, expectedRoot)) return null;
+  const pinDir = join(pluginRoot, '.omx-live-pin');
+  try {
+    const pinDirStats = lstatSync(pinDir);
+    if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink()) return null;
+  } catch (error) {
+    if (error?.code !== 'ENOENT') return null;
+  }
+  return pinDir;
+}
+
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return error?.code !== 'ESRCH';
+  }
+}
+
+function hasLiveSessionPin(pluginRoot, sessionId) {
+  const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
+  let pinDir;
+  try {
+    pinDir = livePinDirectory(pluginRoot);
+  } catch {
+    return true;
+  }
+  if (!pinDir) return true;
+  let entries;
+  try {
+    entries = readdirSync(pinDir, { withFileTypes: true });
+  } catch (error) {
+    return error?.code !== 'ENOENT';
+  }
+  for (const entry of entries) {
+    const pinPath = join(pinDir, entry.name);
+    let stats;
+    try {
+      stats = lstatSync(pinPath);
+    } catch {
+      return true;
+    }
+    const ageMs = Date.now() - stats.mtimeMs;
+    if (entry.name.startsWith('.stage-')) {
+      if (!stats.isFile() || stats.isSymbolicLink() || !Number.isFinite(ageMs) || ageMs < 0 || ageMs <= 5 * 60 * 1000) return true;
+      continue;
+    }
+    if (!entry.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || stats.size <= 0 || stats.size > 4096) return true;
+    const record = readJsonFile(pinPath);
+    if (
+      record?.version !== 1
+      || !Number.isSafeInteger(record.pid)
+      || record.pid <= 0
+      || (record.processStartHash !== null && (typeof record.processStartHash !== 'string' || !/^[0-9a-f]{24}$/.test(record.processStartHash)))
+      || typeof record.sessionHash !== 'string'
+      || !/^[0-9a-f]{64}$/.test(record.sessionHash)
+    ) return true;
+    if (isProcessAlive(record.pid)) {
+      if (record.sessionHash === sessionHash) return true;
+      continue;
+    }
+    try {
+      unlinkSync(pinPath);
+    } catch {
+      return true;
+    }
+  }
+  return false;
+}
+
+function writePendingSessionPin(pluginRoot, sessionId) {
+  let pinDir;
+  try {
+    pinDir = livePinDirectory(pluginRoot);
+    if (!pinDir) return null;
+    mkdirSync(pinDir, { recursive: true, mode: 0o700 });
+    const pinDirStats = lstatSync(pinDir);
+    if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink()) return null;
+    const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
+    const record = {
+      version: 1,
+      pid: process.pid,
+      processStartHash: null,
+      sessionHash,
+    };
+    const content = `${JSON.stringify(record)}\n`;
+    const stagePath = join(pinDir, `.stage-${process.pid}-${randomUUID()}`);
+    const pinPath = join(pinDir, `pin-${process.pid}-${sessionHash}-${randomUUID()}.json`);
+    try {
+      writeFileSync(stagePath, content, { flag: 'wx', mode: 0o600 });
+      renameSync(stagePath, pinPath);
+      return pinPath;
+    } catch (error) {
+      try { unlinkSync(stagePath); } catch {}
+      throw error;
+    }
+  } catch {
+    return null;
+  }
+}
+
+function removePendingSessionPin(pinPath) {
+  if (!pinPath) return;
+  try {
+    const stats = lstatSync(pinPath);
+    if (stats.isFile() && !stats.isSymbolicLink()) unlinkSync(pinPath);
+  } catch {}
 }
 
 function isTerminalOutcome(value) {
@@ -500,46 +625,88 @@ function parseSingleJsonObjectOutput(raw) {
   return parseJsonObjectCandidate(lastLine);
 }
 
-async function pinUnroutedSession(input) {
-  let launcher;
+async function pinUnroutedSession(input, launcher, pluginRoot, pendingPin) {
   try {
-    launcher = readPinnedLauncher();
     if (!launcher) return;
-  } catch {
-    return;
-  }
-
-  const { command, argsPrefix } = launcher;
-  const child = spawn(
-    command,
-    [...argsPrefix, 'codex-native-hook', '--plugin-cache-pin-only'],
-    buildSpawnOptions(command, { OMX_PLUGIN_ROOT: resolve(hookDir, '..') }),
-  );
-  child.stdout.resume();
-  child.stderr.pipe(process.stderr);
-  child.stdin.on('error', () => {});
-  child.stdin.end(input);
-  await new Promise((resolveChild) => {
-    child.once('error', (error) => {
-      console.error(`[oh-my-codex] unable to launch live plugin cache pin writer: ${error.message}`);
-      resolveChild();
+    const { command, argsPrefix } = launcher;
+    const child = spawn(
+      command,
+      [...argsPrefix, 'codex-native-hook', '--plugin-cache-pin-only'],
+      buildSpawnOptions(command, {
+        OMX_PLUGIN_ROOT: pluginRoot,
+        OMX_PLUGIN_CACHE_PIN_PENDING: '1',
+      }),
+    );
+    child.stdout.resume();
+    child.stderr.pipe(process.stderr);
+    child.stdin.on('error', () => {});
+    child.stdin.end(input);
+    await new Promise((resolveChild) => {
+      let settled = false;
+      const finish = () => {
+        if (settled) return;
+        settled = true;
+        resolveChild();
+      };
+      child.once('error', (error) => {
+        console.error(`[oh-my-codex] unable to launch live plugin cache pin writer: ${error.message}`);
+        finish();
+      });
+      child.once('close', finish);
     });
-    child.once('close', resolveChild);
-  });
+  } catch (error) {
+    console.error(`[oh-my-codex] unable to launch live plugin cache pin writer: ${error instanceof Error ? error.message : String(error)}`);
+  } finally {
+    removePendingSessionPin(pendingPin);
+  }
 }
 
 async function main() {
+  const pluginRoot = resolve(hookDir, '..');
+  const startupPendingPin = writePendingSessionPin(pluginRoot, `wrapper-${process.pid}-${randomUUID()}`);
+  if (startupPendingPin) {
+    process.once('exit', () => removePendingSessionPin(startupPendingPin));
+  }
+
+  let pinnedLauncherAtStart = null;
+  let pinnedLauncherReadError = null;
+  try {
+    pinnedLauncherAtStart = readPinnedLauncher();
+  } catch (error) {
+    pinnedLauncherReadError = error;
+  }
+  let configuredLauncherAtStart = null;
+  let configuredLauncherError = null;
+  try {
+    configuredLauncherAtStart = process.env.OMX_NATIVE_HOOK_COMMAND
+      ? { command: process.env.OMX_NATIVE_HOOK_COMMAND, argsPrefix: [] }
+      : pinnedLauncherAtStart ?? { command: 'omx', argsPrefix: [] };
+    if (!process.env.OMX_NATIVE_HOOK_COMMAND && pinnedLauncherReadError) {
+      configuredLauncherError = pinnedLauncherReadError;
+    }
+  } catch (error) {
+    configuredLauncherError = error;
+  }
+
   const { input, oversized, totalBytes } = await readBoundedStdin({ drainOversized: true });
   const payload = parseHookPayload(input);
   const routedByLaunchCorrelation = isPluginHookRoutingSession(input, payload);
   const isStop = detectStopHookInput(input);
   const isCompact = detectCompactHookInput(input);
+  const sessionId = payload?.session_id ?? payload?.sessionId;
+  let pendingPin = null;
+  if (
+    !oversized
+    && typeof sessionId === 'string'
+    && sessionId.trim()
+    && sessionId.trim().length <= 256
+    && !hasLiveSessionPin(pluginRoot, sessionId)
+  ) {
+    pendingPin = startupPendingPin ?? writePendingSessionPin(pluginRoot, sessionId);
+  }
 
   if (!routedByLaunchCorrelation) {
-    const sessionId = payload?.session_id ?? payload?.sessionId;
-    if (!oversized && typeof sessionId === 'string' && sessionId.trim()) {
-      await pinUnroutedSession(input);
-    }
+    if (pendingPin) await pinUnroutedSession(input, pinnedLauncherAtStart, pluginRoot, pendingPin);
     writePlainCodexNoop(isStop);
     return;
   }
@@ -565,19 +732,19 @@ async function main() {
     return;
   }
 
-  let launcher;
-  try {
-    launcher = readConfiguredLauncher();
-  } catch (error) {
-    failLauncher(error, isStop, isCompact);
+  if (configuredLauncherError || !configuredLauncherAtStart) {
+    removePendingSessionPin(pendingPin);
+    failLauncher(configuredLauncherError ?? new Error('plugin hook launcher is unavailable'), isStop, isCompact);
     return;
   }
 
-  const { command, argsPrefix } = launcher;
+  const { command, argsPrefix } = configuredLauncherAtStart;
+  const extraEnv = { OMX_PLUGIN_ROOT: pluginRoot };
+  if (pendingPin) extraEnv.OMX_PLUGIN_CACHE_PIN_PENDING = '1';
   const child = spawn(
     command,
     [...argsPrefix, 'codex-native-hook'],
-    buildSpawnOptions(command, { OMX_PLUGIN_ROOT: resolve(hookDir, '..') }),
+    buildSpawnOptions(command, extraEnv),
   );
 
   const stdoutChunks = [];
@@ -614,8 +781,10 @@ async function main() {
   });
   child.on('error', (error) => {
     childSpawnError = error;
+    removePendingSessionPin(pendingPin);
   });
   child.on('close', (code, signal) => {
+    removePendingSessionPin(pendingPin);
     if (isStop && stopStdoutOversized) {
       writeStopFallback('plugin_stop_hook_launcher_stdout_oversized', `codex-native-hook produced more than ${MAX_STOP_STDOUT_BYTES} bytes of Stop hook stdout`);
       return;

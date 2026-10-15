@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import {
 	cp,
 	lstat,
@@ -9,11 +9,13 @@ import {
 	readFile,
 	readdir,
 	rm,
+	utimes,
 	writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { describe, it } from "node:test";
+import { once } from "node:events";
 import {
 	computeOmxPluginCacheClaimDigest,
 	materializePackagedOmxPluginCache,
@@ -21,6 +23,7 @@ import {
 	registerOmxPluginCacheLivePin,
 	resolvePackagedOmxMarketplace,
 	retireUnpinnedManagedSnapshots,
+	setPluginCacheMutationHooksForTest,
 } from "../plugin-marketplace.js";
 
 const packageRoot = process.cwd();
@@ -62,6 +65,13 @@ async function seedManagedSnapshot(
 	>;
 	manifest.version = version;
 	await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+	await writeFile(
+		join(cacheDir, "hooks", "omx-command.json"),
+		`${JSON.stringify({
+			command: process.execPath,
+			argsPrefix: [join(packageRoot, "dist", "cli", "omx.js")],
+		})}\n`,
+	);
 	await writeFile(join(cacheDir, ".omx-managed"), "managed\n");
 	const claimDigest = await computeOmxPluginCacheClaimDigest(cacheDir);
 	await writeFile(
@@ -97,6 +107,8 @@ describe("issue 3790 live plugin cache pins", () => {
 				assert.equal(materialized.status, "materialized");
 				const cacheDir = materialized.cacheDir!;
 				const markerDir = join(cacheDir, ".omx-live-pin");
+				const launcherPath = join(cacheDir, "hooks", "omx-command.json");
+				const launcherContent = await readFile(launcherPath, "utf-8");
 				await assert.rejects(lstat(markerDir), { code: "ENOENT" });
 
 				const hookResult = spawnSync(
@@ -139,6 +151,26 @@ describe("issue 3790 live plugin cache pins", () => {
 					pin.processStartHash === null ||
 						/^[0-9a-f]{24}$/.test(pin.processStartHash),
 				);
+				const helperCalls = join(wd, "pin-helper-calls.txt");
+				const fakeLauncher = join(wd, "fake-pin-launcher.mjs");
+				await writeFile(
+					fakeLauncher,
+					`import { appendFileSync } from "node:fs";\nappendFileSync(process.env.OMX_PIN_HELPER_CALLS, "called\\n");\nprocess.stdout.write("{}\\n");\n`,
+				);
+				await writeFile(launcherPath, JSON.stringify({ command: process.execPath, argsPrefix: [fakeLauncher] }));
+				const alreadyPinnedResult = spawnSync(
+					process.execPath,
+					[join(cacheDir, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						input: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: "issue-3790-session", codex_pid: process.pid, cwd: wd }),
+						encoding: "utf-8",
+						env: { ...process.env, CODEX_HOME: codexHomeDir, OMX_PIN_HELPER_CALLS: helperCalls },
+					},
+				);
+				assert.equal(alreadyPinnedResult.status, 0, alreadyPinnedResult.stderr || alreadyPinnedResult.stdout);
+				await assert.rejects(lstat(helperCalls), { code: "ENOENT" });
+				await writeFile(launcherPath, launcherContent);
 				await rm(join(markerDir, entries[0]!), { force: true });
 				const retryResult = spawnSync(
 					process.execPath,
@@ -157,6 +189,74 @@ describe("issue 3790 live plugin cache pins", () => {
 				);
 				assert.equal(retryResult.status, 0, retryResult.stderr || retryResult.stdout);
 				assert.equal((await readdir(markerDir)).length, 1);
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("pins a running hook wrapper before it waits for stdin", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-startup-pin-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const snapshots = await Promise.all(
+					["0.19.0", "0.20.0", "0.20.1"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
+				const pluginRoot = snapshots[1]!;
+				const pinDirectory = join(pluginRoot, ".omx-live-pin");
+				const expiredAt = new Date(Date.now() - 60 * 60 * 1000);
+				await utimes(pluginRoot, expiredAt, expiredAt);
+				const hook = spawn(
+					process.execPath,
+					[join(pluginRoot, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						stdio: ["pipe", "pipe", "pipe"],
+						env: { ...process.env, CODEX_HOME: codexHomeDir },
+					},
+				);
+				hook.stdout.resume();
+				let hookStderr = "";
+				hook.stderr.setEncoding("utf-8");
+				hook.stderr.on("data", (chunk: string) => { hookStderr += chunk; });
+				const closed = once(hook, "close");
+				try {
+					let pendingEntries: string[] = [];
+					for (let attempt = 0; attempt < 100; attempt += 1) {
+						try {
+							pendingEntries = await readdir(pinDirectory);
+							if (pendingEntries.length > 0) break;
+						} catch {
+						// The launcher may not have created its startup guard yet.
+						}
+						await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+					}
+					assert.equal(pendingEntries.length, 1, "startup pin must exist while the wrapper waits for stdin");
+					const pending = JSON.parse(await readFile(join(pinDirectory, pendingEntries[0]!), "utf-8")) as { pid: number };
+					assert.equal(pending.pid, hook.pid);
+
+					const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.2");
+					assert.equal(retired.includes(pluginRoot), false);
+					assert.equal(retired.includes(snapshots[0]!), true);
+					await lstat(pluginRoot);
+					await lstat(snapshots[2]!);
+					await assert.rejects(lstat(snapshots[0]!), { code: "ENOENT" });
+
+					hook.stdin.end(JSON.stringify({
+						hook_event_name: "SessionStart",
+						session_id: "startup-pin-session",
+						codex_pid: process.pid,
+						cwd: wd,
+					}));
+					const [code] = await closed as [number | null];
+					assert.equal(code, 0, hookStderr);
+					assert.equal((await readdir(pinDirectory)).length, 1);
+				} finally {
+					if (hook.exitCode === null) {
+						hook.kill();
+						await closed;
+					}
+				}
 			});
 		} finally {
 			await rm(wd, { recursive: true, force: true });
@@ -223,6 +323,69 @@ describe("issue 3790 live plugin cache pins", () => {
 				await lstat(snapshots[0]!);
 				assert.deepEqual(await readdir(pinDirectory), []);
 				await assert.rejects(lstat(snapshots[1]!), { code: "ENOENT" });
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("reclaims an abandoned empty live-pin directory after its initialization lease", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-expired-empty-pin-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const snapshots = await Promise.all(
+					["0.20.0", "0.20.1", "0.20.2"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
+				const pinDirectory = join(snapshots[0]!, ".omx-live-pin");
+				await mkdir(pinDirectory);
+				const expiredAt = new Date(Date.now() - 6 * 60 * 1000);
+				await utimes(pinDirectory, expiredAt, expiredAt);
+
+				const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.3");
+
+				assert.equal(retired.includes(snapshots[0]!), true);
+				await assert.rejects(lstat(snapshots[0]!), { code: "ENOENT" });
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("restores a snapshot if a live pin appears after it is quarantined", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-late-pin-restore-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const snapshots = await Promise.all(
+					["0.20.0", "0.20.1", "0.20.2"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
+				let interposed = false;
+				const resetHooks = setPluginCacheMutationHooksForTest({
+					beforeRemove: async (quarantinePath) => {
+						if (interposed || !quarantinePath.includes(".0.20.0.reclaim-")) return;
+						interposed = true;
+						const pinDirectory = join(quarantinePath, ".omx-live-pin");
+						await mkdir(pinDirectory);
+						await writeFile(
+							join(pinDirectory, "late-pin.json"),
+							`${JSON.stringify({
+								version: 1,
+								pid: process.pid,
+								processStartHash: null,
+								sessionHash: createHash("sha256").update("late-session").digest("hex"),
+							})}\n`,
+						);
+					},
+				});
+				try {
+					const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.3");
+					assert.equal(interposed, true);
+					assert.equal(retired.includes(snapshots[0]!), false);
+					assert.equal(retired.includes(snapshots[1]!), true);
+					await lstat(snapshots[0]!);
+					await assert.rejects(lstat(snapshots[1]!), { code: "ENOENT" });
+				} finally {
+					resetHooks();
+				}
 			});
 		} finally {
 			await rm(wd, { recursive: true, force: true });

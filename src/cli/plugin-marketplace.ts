@@ -47,6 +47,8 @@ const OMX_PLUGIN_HOOK_LAUNCHER_FILE = "omx-command.json";
 const OMX_PLUGIN_MANAGED_MARKER = ".omx-managed";
 const OMX_PLUGIN_LIVE_PIN_MARKER = ".omx-live-pin";
 const OMX_PLUGIN_LIVE_PIN_RECORD_MAX_BYTES = 4096;
+// Empty pin directories can be initialization races, but abandoned ones must not pin forever.
+const OMX_PLUGIN_LIVE_PIN_INITIALIZATION_LEASE_MS = 5 * 60 * 1000;
 const OMX_PLUGIN_CACHE_STAGING_PREFIX = ".omx-plugin-";
 const TEAM_MODE_PLUGIN_SKILL_NAMES = new Set(["team", "worker"]);
 
@@ -798,8 +800,19 @@ async function isLivePinnedSnapshot(snapshotRef: DirectoryRef): Promise<boolean>
 	}
 	try {
 		const entries = await readdir(pinDirectoryRef.scanOperationPath, { withFileTypes: true });
-		if (entries.length === 0) return true;
+		if (entries.length === 0) {
+			const currentStats = await pinDirectoryRef.handle.stat();
+			const ageMs = Date.now() - currentStats.mtimeMs;
+			return !Number.isFinite(ageMs) || ageMs < 0 || ageMs <= OMX_PLUGIN_LIVE_PIN_INITIALIZATION_LEASE_MS;
+		}
 		for (const entry of entries) {
+			if (entry.name.startsWith(".stage-")) {
+				const stats = await lstat(join(pinDirectoryRef.operationPath, entry.name));
+				if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink < 1) return true;
+				const ageMs = Date.now() - stats.mtimeMs;
+				if (!Number.isFinite(ageMs) || ageMs < 0 || ageMs <= OMX_PLUGIN_LIVE_PIN_INITIALIZATION_LEASE_MS) return true;
+				continue;
+			}
 			if (!entry.isFile() || entry.isSymbolicLink()) return true;
 			const pinPath = join(pinDirectoryRef.operationPath, entry.name);
 			const stats = await lstat(pinPath);
@@ -1420,7 +1433,25 @@ export async function removeChildIfIdentity(
 		throw new Error(`identity-bound removal target changed during reclamation; preserved quarantine ${quarantinePath}`);
 	}
 	if (options.expectedManagedVersion) {
-		const verifyQuarantineOwnership = async (): Promise<boolean> => {
+		const restoreQuarantinedSnapshot = async (): Promise<boolean> => {
+			if (!quarantineStats.isDirectory() || quarantineStats.isSymbolicLink()) return false;
+			const sourcePath = childOperationPath(cacheBaseRef, childName);
+			const sourceStats = await lstat(sourcePath).catch((error) => {
+				if (isMissingPathError(error)) return null;
+				throw error;
+			});
+			if (sourceStats) return false;
+			const currentQuarantineStats = await lstat(quarantinePath).catch(() => null);
+			if (!currentQuarantineStats || !sameFileIdentity(currentQuarantineStats, quarantineStats)) return false;
+			try {
+				await renameChild(cacheBaseRef, quarantineName, cacheBaseRef, childName);
+			} catch {
+				return false;
+			}
+			const restoredStats = await lstat(sourcePath).catch(() => null);
+			return restoredStats !== null && sameFileIdentity(restoredStats, quarantineStats);
+		};
+		const verifyQuarantineOwnership = async (): Promise<{ owned: boolean; livePin: boolean }> => {
 		const manifest = await readRegularOmxPluginCacheManifest(quarantinePath, quarantinePath);
 		const completionValid = options.allowInvalidClaimDigest
 			? await hasManagedCompletionMarker(quarantinePath, options.expectedManagedVersion!)
@@ -1440,25 +1471,34 @@ export async function removeChildIfIdentity(
 		} finally {
 			if (quarantineRef) await quarantineRef.handle.close();
 		}
-		if (!owned || livePin) {
-			return false;
-		}
-		return true;
+		return { owned, livePin };
 		};
 		await pluginCacheMutationTestHooks?.beforeRemove?.(quarantinePath, quarantineStats);
-		if (!await verifyQuarantineOwnership()) {
-			options.preservedPaths?.push(join(cacheBaseRef.path, quarantineName));
+		const quarantineState = await verifyQuarantineOwnership();
+		if (!quarantineState.owned || quarantineState.livePin) {
+			const restored = quarantineState.livePin && await restoreQuarantinedSnapshot();
+			options.preservedPaths?.push(join(cacheBaseRef.path, restored ? childName : quarantineName));
 			return false;
 		}
-		return removeChild(cacheBaseRef, quarantineName, {
+		let preservationNeeded = false;
+		let livePinAtDestructiveCheck = false;
+		const removed = await removeChild(cacheBaseRef, quarantineName, {
 			...options,
 			preserveRecursive: false,
 			beforeDestructiveRemove: async () => {
-				const owned = await verifyQuarantineOwnership();
-				if (!owned) options.preservedPaths?.push(join(cacheBaseRef.path, quarantineName));
-				return owned;
+				const state = await verifyQuarantineOwnership();
+				if (!state.owned || state.livePin) {
+					preservationNeeded = true;
+					livePinAtDestructiveCheck ||= state.livePin;
+				}
+				return state.owned && !state.livePin;
 			},
 		});
+		if (!removed && preservationNeeded) {
+			const restored = livePinAtDestructiveCheck && await restoreQuarantinedSnapshot();
+			options.preservedPaths?.push(join(cacheBaseRef.path, restored ? childName : quarantineName));
+		}
+		return removed;
 	}
 	return removeChild(cacheBaseRef, quarantineName, {
 		...options,
