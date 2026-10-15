@@ -444,4 +444,37 @@ describe("issue 3790 live plugin cache pins", () => {
 			await rm(staleWd, { recursive: true, force: true });
 		}
 	});
+
+	it("repairs manifest version drift from verified publication ownership without removing live pins", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-manifest-version-drift-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+				assert.ok(packaged);
+				const published = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
+				assert.equal(published.status, "materialized");
+				const cacheDir = published.cacheDir!;
+				const manifestPath = join(cacheDir, ".codex-plugin", "plugin.json");
+				const manifest = JSON.parse(await readFile(manifestPath, "utf-8")) as Record<string, unknown>;
+				const expectedVersion = String(manifest.version);
+				assert.equal(expectedVersion, published.version);
+				assert.equal(await registerOmxPluginCacheLivePin(cacheDir, "drifted-manifest-session", process.pid), true);
+
+				manifest.version = "corrupted-version";
+				await writeFile(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+				const blocked = await materializePackagedOmxPluginCache(codexHomeDir, packaged, { repairCache: true });
+				assert.equal(blocked.status, "stale-launcher");
+				assert.match(blocked.reason ?? "", /pinned by a live Codex session/);
+				assert.equal(JSON.parse(await readFile(manifestPath, "utf-8")).version, "corrupted-version");
+
+				await rm(join(cacheDir, ".omx-live-pin"), { recursive: true, force: true });
+				const repaired = await materializePackagedOmxPluginCache(codexHomeDir, packaged, { repairCache: true });
+				assert.equal(repaired.status, "materialized", JSON.stringify(repaired));
+				assert.equal(repaired.version, expectedVersion);
+				assert.equal(JSON.parse(await readFile(manifestPath, "utf-8")).version, expectedVersion);
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
 });
