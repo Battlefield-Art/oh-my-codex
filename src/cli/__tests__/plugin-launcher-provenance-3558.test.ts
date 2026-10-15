@@ -231,7 +231,7 @@ describe("issue 3558 launcher provenance", () => {
           assert.match(output, /does not exist/);
           assert.match(
             output,
-            /codex plugin remove oh-my-codex@oh-my-codex-local --json/,
+            /omx setup --plugin --force/,
           );
           const packaged = await resolvePackagedOmxMarketplace(packageRoot);
           assert.ok(packaged);
@@ -683,7 +683,7 @@ describe("issue 3558 launcher provenance", () => {
           assert.equal(r.status, "stale-launcher");
           const incompat = await getPinnedLauncherIncompatibilityReason(cacheDir, packaged);
           assert.ok(incompat);
-          assert.match(incompat!.reason, /codex plugin remove oh-my-codex@oh-my-codex-local --json/);
+          assert.match(incompat!.reason, /omx setup --plugin --force/);
           // Persist plugin install mode so doctor resolves plugin-scoped check deterministically
           await mkdir(join(wd, ".omx"), { recursive: true });
           await writeFile(join(wd, ".omx", "setup-scope.json"), JSON.stringify({ scope: "user", installMode: "plugin", mcpMode: "none" }) + "\n", "utf-8");
@@ -713,7 +713,7 @@ describe("issue 3558 launcher provenance", () => {
           const output = logs.join("\n");
           assert.match(output, /Native hooks/);
           assert.match(output, /incompatible/);
-          assert.match(output, /codex plugin remove oh-my-codex@oh-my-codex-local --json/);
+          assert.match(output, /omx setup --plugin --force/);
         });
       });
     } finally {
@@ -736,7 +736,7 @@ describe("issue 3558 launcher provenance", () => {
           const incompat = await getPinnedLauncherIncompatibilityReason(cacheDir, packaged);
           assert.ok(incompat);
           assert.match(incompat!.reason, /pinned launcher missing/);
-          assert.match(incompat!.reason, /codex plugin remove oh-my-codex@oh-my-codex-local --json/);
+          assert.match(incompat!.reason, /omx setup --plugin --force/);
           const r = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
           assert.equal(r.status, "stale-launcher");
           // Invoke doctor and ensure missing launcher goes through stale-launcher warn, not generic "expected plugin hook file is missing" for launcher
@@ -759,7 +759,7 @@ describe("issue 3558 launcher provenance", () => {
           const output = logs.join("\n");
           assert.match(output, /Native hooks/);
           assert.match(output, /incompatible|cached launcher/);
-          assert.match(output, /codex plugin remove oh-my-codex@oh-my-codex-local --json/);
+          assert.match(output, /omx setup --plugin --force/);
           assert.match(output, /omx-command\.json|incompatible/);
         });
       });

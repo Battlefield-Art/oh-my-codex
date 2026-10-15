@@ -367,10 +367,10 @@ function readConfiguredLauncher() {
   return readPinnedLauncher() ?? { command: 'omx', argsPrefix: [] };
 }
 
-function buildSpawnOptions(command) {
+function buildSpawnOptions(command, extraEnv = {}) {
   const options = {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: process.env,
+    env: { ...process.env, ...extraEnv },
   };
 
   if (process.platform !== 'win32') return options;
@@ -500,6 +500,36 @@ function parseSingleJsonObjectOutput(raw) {
   return parseJsonObjectCandidate(lastLine);
 }
 
+async function pinUnroutedSessionStart(input) {
+  let launcher;
+  try {
+    launcher = process.env.OMX_NATIVE_HOOK_COMMAND
+      ? readConfiguredLauncher()
+      : readPinnedLauncher();
+    if (!launcher) return;
+  } catch {
+    return;
+  }
+
+  const { command, argsPrefix } = launcher;
+  const child = spawn(
+    command,
+    [...argsPrefix, 'codex-native-hook', '--plugin-cache-pin-only'],
+    buildSpawnOptions(command, { OMX_PLUGIN_ROOT: resolve(hookDir, '..') }),
+  );
+  child.stdout.resume();
+  child.stderr.pipe(process.stderr);
+  child.stdin.on('error', () => {});
+  child.stdin.end(input);
+  await new Promise((resolveChild) => {
+    child.once('error', (error) => {
+      console.error(`[oh-my-codex] unable to launch live plugin cache pin writer: ${error.message}`);
+      resolveChild();
+    });
+    child.once('close', resolveChild);
+  });
+}
+
 async function main() {
   const { input, oversized, totalBytes } = await readBoundedStdin({ drainOversized: true });
   const payload = parseHookPayload(input);
@@ -508,6 +538,9 @@ async function main() {
   const isCompact = detectCompactHookInput(input);
 
   if (!routedByLaunchCorrelation) {
+    if (!oversized && (payload?.hook_event_name ?? payload?.hookEventName) === 'SessionStart') {
+      await pinUnroutedSessionStart(input);
+    }
     writePlainCodexNoop(isStop);
     return;
   }
@@ -542,7 +575,11 @@ async function main() {
   }
 
   const { command, argsPrefix } = launcher;
-  const child = spawn(command, [...argsPrefix, 'codex-native-hook'], buildSpawnOptions(command));
+  const child = spawn(
+    command,
+    [...argsPrefix, 'codex-native-hook'],
+    buildSpawnOptions(command, { OMX_PLUGIN_ROOT: resolve(hookDir, '..') }),
+  );
 
   const stdoutChunks = [];
   let stdoutBytes = 0;

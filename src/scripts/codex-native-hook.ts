@@ -50,6 +50,7 @@ import {
   resolveConductorPolicyRoot,
 } from "../team/worker-provenance.js";
 import { inferTerminalLifecycleOutcome } from "../runtime/run-outcome.js";
+import { registerOmxPluginCacheLivePin } from "../cli/plugin-marketplace.js";
 import { syncRegularFile } from "../utils/file-durability.js";
 import {
   appendPromptSessionProvenanceRejection,
@@ -1623,6 +1624,7 @@ function looksLikeCodexProcess(entry: ProcessLineageEntry): boolean {
 export function resolveSessionOwnerPidFromAncestry(
   startPid: number,
   options: {
+    requireCodexAncestor?: boolean;
     readParentPid?: (pid: number) => number | null;
     readProcessCommand?: (pid: number) => string;
     readProcessLineage?: (pid: number) => ProcessLineageEntry[] | null;
@@ -1651,6 +1653,7 @@ export function resolveSessionOwnerPidFromAncestry(
 
   const codexAncestor = lineage.find(looksLikeCodexProcess);
   if (codexAncestor) return codexAncestor.pid;
+  if (options.requireCodexAncestor) return null;
 
   if (lineage.length >= 2 && looksLikeShellCommand(lineage[0]?.command || "")) {
     return lineage[1].pid;
@@ -1660,7 +1663,15 @@ export function resolveSessionOwnerPidFromAncestry(
   return null;
 }
 
-function resolveSessionOwnerPid(payload: CodexHookPayload): number {
+function resolveSessionOwnerPid(payload: CodexHookPayload): number;
+function resolveSessionOwnerPid(
+  payload: CodexHookPayload,
+  options: { requireCodexAncestor: true },
+): number | null;
+function resolveSessionOwnerPid(
+  payload: CodexHookPayload,
+  options: { requireCodexAncestor?: boolean } = {},
+): number | null {
   const explicitPid = [
     payload.session_pid,
     payload.sessionPid,
@@ -1673,9 +1684,9 @@ function resolveSessionOwnerPid(payload: CodexHookPayload): number {
     .find((value): value is number => value !== null);
   if (explicitPid) return explicitPid;
 
-  const resolved = resolveSessionOwnerPidFromAncestry(process.ppid);
+  const resolved = resolveSessionOwnerPidFromAncestry(process.ppid, options);
   if (resolved) return resolved;
-  return process.pid;
+  return options.requireCodexAncestor ? null : process.pid;
 }
 
 function tryReadGitValue(cwd: string, args: string[]): string | null {
@@ -22994,6 +23005,25 @@ export async function runCodexNativeHookCli(): Promise<void> {
       buildRawInputLogFields(rawInput),
     );
     writeNativeHookJsonStdout(buildMalformedStdinHookOutput(parseError, rawInput, process.cwd()));
+    return;
+  }
+
+  const pluginCachePinOnly = process.argv.includes("--plugin-cache-pin-only");
+  if (readHookEventName(payload) === "SessionStart") {
+    const pluginRoot = safeString(process.env.OMX_PLUGIN_ROOT).trim();
+    const sessionId = readPayloadSessionId(payload);
+    const ownerPid = resolveSessionOwnerPid(payload, { requireCodexAncestor: true });
+    if (pluginRoot && sessionId && ownerPid) {
+      try {
+        await registerOmxPluginCacheLivePin(pluginRoot, sessionId, ownerPid);
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error);
+        console.error(`[oh-my-codex] unable to record live plugin cache pin: ${detail}`);
+      }
+    }
+  }
+  if (pluginCachePinOnly) {
+    writeNativeHookJsonStdout({});
     return;
   }
 

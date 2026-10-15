@@ -144,8 +144,8 @@ import {
 } from "./setup-preferences.js";
 import {
 	OMX_LOCAL_MARKETPLACE_NAME,
-	OMX_LOCAL_PLUGIN_CONFIG_KEY,
 	OMX_PLUGIN_NAME,
+	PLUGIN_LAUNCHER_RECOVERY_HINT,
 	discoverOmxPluginCacheDirs,
 	materializePackagedOmxPluginCache,
 	resolvePackagedOmxMarketplace,
@@ -4777,7 +4777,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 		const pluginCacheMaterialize = await materializePackagedOmxPluginCache(
 			scopeDirs.codexHomeDir,
 			preflightMarketplace,
-			{ dryRun, teamMode: resolvedTeamMode },
+			{ dryRun, repairCache: force, teamMode: resolvedTeamMode },
 		);
 		if (pluginCacheMaterialize.status === "materialized") {
 			console.log(
@@ -4790,7 +4790,7 @@ export async function setup(options: SetupOptions = {}): Promise<void> {
 				`  warning: local Codex plugin cache at ${pluginCacheMaterialize.cacheDir} has incompatible launcher provenance (${pluginCacheMaterialize.reason}); not reporting as current.`,
 			);
 			console.log(
-				`  Run \`codex plugin remove ${OMX_LOCAL_PLUGIN_CONFIG_KEY} --json\` then rerun \`omx setup --plugin\` to rebuild the snapshot for ${preflightMarketplace?.packageRoot ?? pkgRoot}.`,
+				`  Run \`${PLUGIN_LAUNCHER_RECOVERY_HINT}\` to rebuild the snapshot for ${preflightMarketplace?.packageRoot ?? pkgRoot}.`,
 			);
 		}
 		if (
