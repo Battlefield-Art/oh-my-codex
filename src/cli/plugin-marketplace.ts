@@ -926,20 +926,32 @@ export async function registerOmxPluginCacheLivePin(
 		result = true;
 	} finally {
 		if (publicationLockGuard) clearInterval(publicationLockGuard.timer);
-		if (pinDirectoryRef) await pinDirectoryRef.handle.close();
-		if (snapshotRef) await snapshotRef.handle.close();
+		let cleanupError: unknown = null;
+		if (pinDirectoryRef) {
+			try { await pinDirectoryRef.handle.close(); } catch (error) { cleanupError ??= error; }
+		}
+		if (snapshotRef) {
+			try { await snapshotRef.handle.close(); } catch (error) { cleanupError ??= error; }
+		}
 		if (lockHandle) {
-			await lockHandle.close();
+			try { await lockHandle.close(); } catch (error) { cleanupError ??= error; }
 			if (lockIdentity) {
 				const lockPath = join(cacheBaseRef.path, ".omx-publish.lock");
 				const currentLock = await lstat(lockPath).catch(() => null);
 				if (currentLock && sameFileIdentity(currentLock, lockIdentity)) {
-					await reclaimStalePublicationLock(cacheBaseRef, ".omx-publish.lock", lockIdentity, false);
+					try {
+						await reclaimStalePublicationLock(cacheBaseRef, ".omx-publish.lock", lockIdentity, false);
+					} catch (error) {
+						cleanupError ??= error;
+					}
 				}
 			}
 		}
 		emitDegradedDurabilityWarning("plugin cache publication", durability);
-		for (const handle of namespace.handles.reverse()) await handle.close();
+		for (const handle of namespace.handles.reverse()) {
+			try { await handle.close(); } catch (error) { cleanupError ??= error; }
+		}
+		if (cleanupError) throw cleanupError;
 	}
 	return result;
 }
