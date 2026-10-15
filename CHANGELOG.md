@@ -4,6 +4,23 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.21.13] - 2026-10-15
+
+Patch release for the frozen range `v0.21.12..51fa7eed6877b91706629174a2deeff83d1ce08f` (6 commits, 10 files, +576/−52; PRs #3787, #3795, #3796).
+
+### Fixed
+
+- Bound HUD reconciliation processes spawned by hooks with a timeout, so hung children cannot block later reconciliation (#3787, fixes #3785; authored by @Yeachan-Heo).
+
+### Maintenance
+
+- Update `serde_json` from 1.0.151 to 1.0.154 (#3795, @dependabot).
+- Update `@types/node` from 26.6.4 to 26.6.5 (#3796, @dependabot).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.13.md) and [release readiness](docs/qa/release-readiness-0.21.13.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.12...v0.21.13
+
 ## [0.21.12] - 2026-10-15
 
 Patch release for the frozen range `v0.21.11..6937884f4d09a485d5b4f16498517bcd05384e06` (6 commits, 15 files, +998/−19; PRs #3786, #3788, #3789, #3791, #3794, #3797).
