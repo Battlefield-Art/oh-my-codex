@@ -163,11 +163,14 @@ describe("issue 3790 live plugin cache pins", () => {
 		}
 	});
 
-	it("retries pin registration after a concurrent cache publication releases its lock", async () => {
+	it("registers a live pin before concurrent publication retires an older snapshot", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-3790-pin-lock-retry-"));
 		try {
 			await withIsolatedUserHome(wd, async (codexHomeDir) => {
 				const oldSnapshot = await seedManagedSnapshot(codexHomeDir, "0.20.0");
+				const olderSnapshots = await Promise.all(
+					["0.20.1", "0.20.2"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
 				const packaged = await resolvePackagedOmxMarketplace(packageRoot);
 				assert.ok(packaged);
 				let signalPrepared!: () => void;
@@ -182,22 +185,44 @@ describe("issue 3790 live plugin cache pins", () => {
 				});
 				try {
 					await prepared;
-					let pinSettled = false;
-					const pinning = registerOmxPluginCacheLivePin(
+					assert.equal(await registerOmxPluginCacheLivePin(
 						oldSnapshot,
 						"lock-contention-session",
 						process.pid,
-					).finally(() => { pinSettled = true; });
-					await new Promise((resolveDelay) => setTimeout(resolveDelay, 150));
-					assert.equal(pinSettled, false, "pin registration must wait for the publication lock");
+					), true);
 					releasePublication();
 					const published = await publication;
 					assert.equal(published.status, "materialized");
-					assert.equal(await pinning, true);
+					assert.equal(published.retiredDirs?.includes(olderSnapshots[0]!), true);
+					assert.equal(published.retiredDirs?.includes(oldSnapshot), false);
 					await lstat(oldSnapshot);
+					await assert.rejects(lstat(olderSnapshots[0]!), { code: "ENOENT" });
 				} finally {
 					releasePublication();
 				}
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("preserves a snapshot while its live-pin directory is being initialized", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-pin-directory-race-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const snapshots = await Promise.all(
+					["0.20.0", "0.20.1", "0.20.2"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
+				const pinDirectory = join(snapshots[0]!, ".omx-live-pin");
+				await mkdir(pinDirectory);
+
+				const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.3");
+
+				assert.equal(retired.includes(snapshots[0]!), false);
+				assert.equal(retired.includes(snapshots[1]!), true);
+				await lstat(snapshots[0]!);
+				assert.deepEqual(await readdir(pinDirectory), []);
+				await assert.rejects(lstat(snapshots[1]!), { code: "ENOENT" });
 			});
 		} finally {
 			await rm(wd, { recursive: true, force: true });

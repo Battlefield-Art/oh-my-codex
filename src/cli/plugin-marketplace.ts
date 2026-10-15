@@ -47,8 +47,6 @@ const OMX_PLUGIN_HOOK_LAUNCHER_FILE = "omx-command.json";
 const OMX_PLUGIN_MANAGED_MARKER = ".omx-managed";
 const OMX_PLUGIN_LIVE_PIN_MARKER = ".omx-live-pin";
 const OMX_PLUGIN_LIVE_PIN_RECORD_MAX_BYTES = 4096;
-const OMX_PLUGIN_LIVE_PIN_LOCK_WAIT_MS = 10_000;
-const OMX_PLUGIN_LIVE_PIN_LOCK_RETRY_MS = 100;
 const OMX_PLUGIN_CACHE_STAGING_PREFIX = ".omx-plugin-";
 const TEAM_MODE_PLUGIN_SKILL_NAMES = new Set(["team", "worker"]);
 
@@ -612,9 +610,10 @@ async function renameChild(sourceParent: DirectoryRef, sourceName: string, desti
  * so pre/post inode checks around a rename can never be atomic no-replace.
  * Publication therefore never renames onto `<version>`: the destination is
  * claimed with an atomic exclusive mkdir (the one portable no-replace
- * primitive). The claim receives an O_EXCL `.omx-incomplete` ownership record,
- * staged entries are moved into the empty claim, and `.omx-complete` commits
- * last. Repair reclaims only recognized claims whose recorded publisher is
+ * primitive). The claim receives an O_EXCL `.omx-incomplete` ownership record
+ * that remains in place while staged entries are copied. A durable `.omx-managed`
+ * owner record bridges removal of `.omx-incomplete` to the final `.omx-complete`
+ * commit. Repair reclaims recognized claims only after their publisher is
  * proven exited; legacy or malformed markers remain preserved.
  */
 async function claimPublicationDestination(
@@ -626,14 +625,10 @@ async function claimPublicationDestination(
 	const claimRef = await openDirectoryChild(destinationParent, destinationName);
 	try {
 		await assertDirectoryRef(claimRef, "publication claim");
-		const processStartIdentity = await readProcessStartIdentity(process.pid);
-		const incompleteRecord = {
-			version: 1,
-			cacheVersion: destinationName,
-			pid: process.pid,
-			processStartHash: processStartIdentity ? hashProcessStartIdentity(processStartIdentity) : null,
-		};
+		const incompleteRecord = await buildPublicationOwnershipRecord(destinationName);
 		await createExclusiveFileChild(claimRef, ".omx-incomplete", `${JSON.stringify(incompleteRecord)}\n`, tracker);
+		const claimDirectorySyncOutcome = await syncDirectory(claimRef.handle);
+		if (tracker) recordDirectorySyncOutcome(tracker, claimDirectorySyncOutcome);
 		return claimRef;
 	} catch (error) {
 		await claimRef.handle.close();
@@ -803,6 +798,7 @@ async function isLivePinnedSnapshot(snapshotRef: DirectoryRef): Promise<boolean>
 	}
 	try {
 		const entries = await readdir(pinDirectoryRef.scanOperationPath, { withFileTypes: true });
+		if (entries.length === 0) return true;
 		for (const entry of entries) {
 			if (!entry.isFile() || entry.isSymbolicLink()) return true;
 			const pinPath = join(pinDirectoryRef.operationPath, entry.name);
@@ -874,37 +870,10 @@ export async function registerOmxPluginCacheLivePin(
 		mutationPath: namespace.fdPath,
 	};
 	const durability: RegularFileDurabilityTracker = { degraded: false };
-	let lockHandle: FileHandle | undefined;
-	let lockIdentity: Stats | undefined;
-	let publicationLockGuard: PublicationLockGuard | undefined;
 	let snapshotRef: DirectoryRef | undefined;
 	let pinDirectoryRef: DirectoryRef | undefined;
 	let result = false;
 	try {
-		snapshotRef = await openDirectoryChild(cacheBaseRef, version);
-		const preflightManifest = await readRegularOmxPluginCacheManifest(snapshotRef.operationPath, snapshotRef.operationPath);
-		if (
-			preflightManifest?.name !== OMX_PLUGIN_NAME
-			|| preflightManifest.version !== version
-			|| !(await hasManagedCompletionMarker(snapshotRef.operationPath, version))
-			|| await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-incomplete")
-			|| !(await hasRegularPublicationMarker(snapshotRef.operationPath, OMX_PLUGIN_MANAGED_MARKER))
-		) return false;
-		const existingPin = await readOmxPluginCacheFileNoFollow(
-			join(snapshotRef.operationPath, OMX_PLUGIN_LIVE_PIN_MARKER, recordName),
-			{ anchorDir: join(snapshotRef.operationPath, OMX_PLUGIN_LIVE_PIN_MARKER) },
-		);
-		if (existingPin?.toString("utf-8") === recordContent) return true;
-		await snapshotRef.handle.close();
-		snapshotRef = undefined;
-		lockHandle = await claimPublicationLockForLivePin(cacheBaseRef, cacheBase, fsConstants.O_NOFOLLOW, durability);
-		lockIdentity = await lockHandle.stat();
-		const lockPath = join(cacheBaseRef.path, ".omx-publish.lock");
-		if (!await refreshPublicationLockRecord(lockPath, lockHandle, lockIdentity, durability)) {
-			throw new Error(`publication lock ownership lost at ${lockPath}`);
-		}
-		publicationLockGuard = startPublicationLockHeartbeat(lockPath, lockHandle, lockIdentity, durability);
-		await publicationLockGuard.assertOwned();
 		snapshotRef = await openDirectoryChild(cacheBaseRef, version);
 		const snapshotManifest = await readRegularOmxPluginCacheManifest(snapshotRef.operationPath, snapshotRef.operationPath);
 		if (
@@ -923,8 +892,19 @@ export async function registerOmxPluginCacheLivePin(
 		}
 		if (markerStats?.isFile() && !markerStats.isSymbolicLink()) return true;
 		if (markerStats && (markerStats.isSymbolicLink() || !markerStats.isDirectory())) return false;
-		if (!markerStats) await mkdirDirectoryChildExclusive(snapshotRef, OMX_PLUGIN_LIVE_PIN_MARKER);
+		if (!markerStats) {
+			try {
+				await mkdirDirectoryChildExclusive(snapshotRef, OMX_PLUGIN_LIVE_PIN_MARKER);
+			} catch (error) {
+				if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+			}
+		}
 		pinDirectoryRef = await openDirectoryChild(snapshotRef, OMX_PLUGIN_LIVE_PIN_MARKER);
+		const existingPin = await readOmxPluginCacheFileNoFollow(
+			join(pinDirectoryRef.operationPath, recordName),
+			{ anchorDir: pinDirectoryRef.operationPath },
+		);
+		if (existingPin?.toString("utf-8") === recordContent) return true;
 		try {
 			await createExclusiveFileChild(pinDirectoryRef, recordName, recordContent, durability);
 		} catch (error) {
@@ -936,30 +916,14 @@ export async function registerOmxPluginCacheLivePin(
 		recordDirectorySyncOutcome(durability, pinDirectorySyncOutcome);
 		const snapshotSyncOutcome = await syncDirectory(snapshotRef.handle);
 		recordDirectorySyncOutcome(durability, snapshotSyncOutcome);
-		await publicationLockGuard.assertOwned();
 		result = true;
 	} finally {
-		if (publicationLockGuard) clearInterval(publicationLockGuard.timer);
 		let cleanupError: unknown = null;
 		if (pinDirectoryRef) {
 			try { await pinDirectoryRef.handle.close(); } catch (error) { cleanupError ??= error; }
 		}
 		if (snapshotRef) {
 			try { await snapshotRef.handle.close(); } catch (error) { cleanupError ??= error; }
-		}
-		if (lockHandle) {
-			try { await lockHandle.close(); } catch (error) { cleanupError ??= error; }
-			if (lockIdentity) {
-				const lockPath = join(cacheBaseRef.path, ".omx-publish.lock");
-				const currentLock = await lstat(lockPath).catch(() => null);
-				if (currentLock && sameFileIdentity(currentLock, lockIdentity)) {
-					try {
-						await reclaimStalePublicationLock(cacheBaseRef, ".omx-publish.lock", lockIdentity, false);
-					} catch (error) {
-						cleanupError ??= error;
-					}
-				}
-			}
 		}
 		emitDegradedDurabilityWarning("plugin cache publication", durability);
 		for (const handle of namespace.handles.reverse()) {
@@ -1009,7 +973,10 @@ async function hasRegularPublicationMarker(cacheDir: string, name: ".omx-complet
 	}
 }
 
-async function hasPublicationMarkerEntry(cacheDir: string, name: ".omx-incomplete"): Promise<boolean> {
+async function hasPublicationMarkerEntry(
+	cacheDir: string,
+	name: ".omx-incomplete" | ".omx-managed" | ".omx-complete",
+): Promise<boolean> {
 	try {
 		await lstat(join(cacheDir, name));
 		return true;
@@ -1037,6 +1004,16 @@ interface IncompletePublicationRecord {
 	processStartHash: string | null;
 }
 
+async function buildPublicationOwnershipRecord(cacheVersion: string): Promise<IncompletePublicationRecord> {
+	const processStartIdentity = await readProcessStartIdentity(process.pid);
+	return {
+		version: 1,
+		cacheVersion,
+		pid: process.pid,
+		processStartHash: processStartIdentity ? hashProcessStartIdentity(processStartIdentity) : null,
+	};
+}
+
 function parseIncompletePublicationRecord(
 	value: unknown,
 	expectedVersion: string,
@@ -1058,21 +1035,16 @@ async function inspectIncompletePublicationClaim(
 	snapshotRef: DirectoryRef,
 	expectedVersion: string,
 ): Promise<{ reclaimable: boolean; reason: string }> {
-	const markerPath = join(snapshotRef.operationPath, ".omx-incomplete");
-	try {
-		await lstat(join(snapshotRef.operationPath, ".omx-complete"));
+	if (await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-complete")) {
 		return {
 			reclaimable: false,
 			reason: `incomplete cache claim at ${snapshotRef.path} also contains a completion marker; preserving it`,
 		};
-	} catch (error) {
-		if (!isMissingPathError(error)) {
-			return {
-				reclaimable: false,
-				reason: `incomplete cache claim at ${snapshotRef.path} has an unreadable completion marker; preserving it`,
-			};
-		}
 	}
+	const markerName = await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-incomplete")
+		? ".omx-incomplete"
+		: ".omx-managed";
+	const markerPath = join(snapshotRef.operationPath, markerName);
 	let markerStats: Stats;
 	try {
 		markerStats = await lstat(markerPath);
@@ -1111,21 +1083,19 @@ async function inspectIncompletePublicationClaim(
 			reason: `incomplete cache claim at ${snapshotRef.path} has an unrecognized ownership marker; preserving it`,
 		};
 	}
-	const manifest = await readRegularOmxPluginCacheManifest(snapshotRef.operationPath, snapshotRef.operationPath);
-	if (
-		manifest?.name !== OMX_PLUGIN_NAME
-		|| manifest.version !== expectedVersion
-		|| !(await hasRegularPublicationMarker(snapshotRef.operationPath, OMX_PLUGIN_MANAGED_MARKER))
-	) {
-		return {
-			reclaimable: false,
-			reason: `incomplete cache claim at ${snapshotRef.path} lacks a verified managed OMX manifest; preserving it`,
-		};
+	if (markerName === ".omx-managed") {
+		const manifest = await readRegularOmxPluginCacheManifest(snapshotRef.operationPath, snapshotRef.operationPath);
+		if (manifest?.name !== OMX_PLUGIN_NAME || manifest.version !== expectedVersion) {
+			return {
+				reclaimable: false,
+				reason: `incomplete cache claim at ${snapshotRef.path} lacks a verified managed OMX manifest; preserving it`,
+			};
+		}
 	}
 	if (await isProcessOwnerAlive(record.pid, record.processStartHash)) {
 		return {
 			reclaimable: false,
-			reason: `incomplete cache claim at ${snapshotRef.path} is still owned by live publisher PID ${record.pid}; preserving it`,
+			reason: `incomplete cache claim at ${snapshotRef.path} is still owned by live publisher PID ${record.pid}; preserving it because the publication marker is incomplete`,
 		};
 	}
 	return {
@@ -1148,7 +1118,10 @@ async function inspectSnapshotRepairEligibility(
 		return { eligible: false, reason: `cannot safely inspect same-version cache at ${join(cacheBaseRef.path, version)}: ${(error as Error).message}` };
 	}
 	try {
-		if (await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-incomplete")) {
+		const hasIncompleteMarker = await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-incomplete");
+		const hasCompletionMarker = await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-complete");
+		const hasManagedMarker = await hasPublicationMarkerEntry(snapshotRef.operationPath, OMX_PLUGIN_MANAGED_MARKER);
+		if (hasIncompleteMarker || (!hasCompletionMarker && hasManagedMarker)) {
 			const incomplete = await inspectIncompletePublicationClaim(snapshotRef, version);
 			return { eligible: incomplete.reclaimable, reason: incomplete.reason };
 		}
@@ -1605,25 +1578,6 @@ async function claimPublicationLock(
 	throw new Error(`cannot recover stale OMX plugin cache publication lock at ${cacheBase}`);
 }
 
-async function claimPublicationLockForLivePin(
-	cacheBaseRef: DirectoryRef,
-	cacheBase: string,
-	noFollowFlags: number,
-	tracker?: RegularFileDurabilityTracker,
-): Promise<FileHandle> {
-	const deadline = Date.now() + OMX_PLUGIN_LIVE_PIN_LOCK_WAIT_MS;
-	while (true) {
-		try {
-			return await claimPublicationLock(cacheBaseRef, cacheBase, noFollowFlags, tracker);
-		} catch (error) {
-			const activePublication = error instanceof Error
-				&& error.message.startsWith(`another OMX plugin cache publication is active at ${cacheBase}`);
-			if (!activePublication || Date.now() >= deadline) throw error;
-			await new Promise((resolveDelay) => setTimeout(resolveDelay, OMX_PLUGIN_LIVE_PIN_LOCK_RETRY_MS));
-		}
-	}
-}
-
 /**
  * #3552: executed assets Codex loads from the plugin cache must be regular files inside a
  * regular `hooks/` directory inside a regular snapshot root. `readFile`/content equality
@@ -1962,6 +1916,12 @@ async function inspectCacheRoot(cacheDir: string): Promise<"missing" | "director
 				return "untrusted";
 			}
 			if (await hasPublicationMarkerEntry(cacheDir, ".omx-incomplete")) return "incomplete";
+			const hasCompleteEntry = await hasPublicationMarkerEntry(cacheDir, ".omx-complete");
+			if (!hasCompleteEntry) {
+				return await hasPublicationMarkerEntry(cacheDir, OMX_PLUGIN_MANAGED_MARKER)
+					? "incomplete"
+					: "directory";
+			}
 			if (!(await hasRegularPublicationMarker(cacheDir, ".omx-complete"))) return "directory";
 			const manifest = await readRegularOmxPluginCacheManifest(cacheDir);
 			if (!manifest) {
@@ -2886,11 +2846,11 @@ async function materializePackagedOmxPluginCacheImpl(
 				// `<version>` (rename silently replaces an empty destination and
 				// pre/post inode checks cannot make it atomic). The destination is
 				// claimed with an atomic exclusive mkdir self-described by
-				// `.omx-incomplete`; the staged snapshot entries are then renamed
-				// into that empty claim (destination names cannot pre-exist), and
-				// `.omx-complete` is committed last inside the claim. Every trust
-				// path requires `.omx-complete`, so no intermediate state is
-				// trusted, and no pre-existing directory is ever replaced.
+				// `.omx-incomplete`; staged entries are copied with exclusive creates
+				// while that owner record remains. A durable `.omx-managed` record
+				// bridges its removal to the final `.omx-complete` commit. Every trust
+				// path requires `.omx-complete`, so intermediate states are not trusted,
+				// and no pre-existing directory is ever replaced.
 				try {
 					claimRef = await claimPublicationDestination(cacheBaseRef, version, durability);
 				} catch (error) {
@@ -2947,24 +2907,28 @@ async function materializePackagedOmxPluginCacheImpl(
 					}
 				}
 				if (claimRef) {
-					// Drop the snapshot's staging marker and the claim's placeholder;
-					// the claim is then populated only through exclusive creates and
-					// the final marker is the trust switch.
+					// Drop only the private staging marker. Keep the claim's ownership
+					// marker until copied content and a durable managed-owner record exist.
 					await removeChild(snapshotRef, ".omx-incomplete", { force: true });
-					await removeChild(claimRef, ".omx-incomplete", { force: true });
 					await assertDirectoryRef(claimRef, "publication claim");
 					const claimEntries = await readdir(claimRef.scanOperationPath, { withFileTypes: true });
-					if (claimEntries.length > 0) {
-						throw new Error(`publication claim is not empty at ${join(cacheBaseRef.path, version)}`);
+					if (claimEntries.length !== 1 || claimEntries[0]?.name !== ".omx-incomplete") {
+						throw new Error(`publication claim contains unexpected entries at ${join(cacheBaseRef.path, version)}`);
 					}
 					// The portable no-replace primitive is exclusive create, not rename.
-					// Copy the private staged tree into the empty claim with exclusive
+					// Copy the private staged tree into the claim with exclusive
 					// mkdir/O_EXCL file creation so a destination inserted between any
 					// checks is rejected instead of overwritten.
 					await copyStagedTreeNoReplace(snapshotRef, claimRef, durability);
 					await snapshotRef.handle.close();
 					snapshotRef = undefined;
-					await createExclusiveFileChild(claimRef, OMX_PLUGIN_MANAGED_MARKER, `${process.pid}\n`, durability);
+					const managedRecord = await buildPublicationOwnershipRecord(version);
+					await createExclusiveFileChild(claimRef, OMX_PLUGIN_MANAGED_MARKER, `${JSON.stringify(managedRecord)}\n`, durability);
+					const managedMarkerSyncOutcome = await syncDirectory(claimRef.handle);
+					recordDirectorySyncOutcome(durability, managedMarkerSyncOutcome);
+					await removeChild(claimRef, ".omx-incomplete", { force: true });
+					const incompleteMarkerSyncOutcome = await syncDirectory(claimRef.handle);
+					recordDirectorySyncOutcome(durability, incompleteMarkerSyncOutcome);
 					await pluginCacheMutationTestHooks?.beforeFinalClaimValidation?.(claimRef.path);
 					await publicationLockGuard.assertOwned();
 					await validateStagedPluginSnapshot(claimRef, packagedMarketplace, version, options.teamMode);

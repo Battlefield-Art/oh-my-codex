@@ -1049,9 +1049,7 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
         assert.ok(packaged);
         const version = await packagedPluginVersion();
         const cacheDir = join(omxPluginCacheBase(codexHomeDir), version);
-        await mkdir(dirname(cacheDir), { recursive: true });
-        await cp(join(packageRoot, "plugins", "oh-my-codex"), cacheDir, { recursive: true });
-        await writeFile(join(cacheDir, ".omx-managed"), `${process.pid}\n`);
+        await mkdir(cacheDir, { recursive: true });
         await writeFile(join(cacheDir, ".omx-incomplete"), `${JSON.stringify({
           version: 1,
           cacheVersion: version,
@@ -1064,6 +1062,35 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
 
         assert.equal(result.status, "materialized", JSON.stringify(result));
         assert.equal(existsSync(join(cacheDir, ".omx-incomplete")), false);
+        assert.equal(existsSync(join(cacheDir, "partial-publisher-data")), false);
+        assert.equal(await hasExpectedOmxPluginCache(codexHomeDir, packaged), true);
+      });
+    } finally {
+      await rm(wd, { recursive: true, force: true });
+    }
+  });
+
+  it("reclaims an exited publisher claim after the incomplete marker was removed but before completion", async () => {
+    const wd = await mkdtemp(join(tmpdir(), "omx-3552-managed-before-complete-"));
+    try {
+      await withIsolatedUserHome(wd, async (codexHomeDir) => {
+        const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+        assert.ok(packaged);
+        const version = await packagedPluginVersion();
+        const cacheDir = join(omxPluginCacheBase(codexHomeDir), version);
+        await mkdir(dirname(cacheDir), { recursive: true });
+        await cp(join(packageRoot, "plugins", "oh-my-codex"), cacheDir, { recursive: true });
+        await writeFile(join(cacheDir, ".omx-managed"), `${JSON.stringify({
+          version: 1,
+          cacheVersion: version,
+          pid: 99_999_999,
+          processStartHash: null,
+        })}\n`);
+        await writeFile(join(cacheDir, "partial-publisher-data"), "commit not reached\n");
+
+        const result = await materializePackagedOmxPluginCache(codexHomeDir, packaged, { repairCache: true });
+
+        assert.equal(result.status, "materialized", JSON.stringify(result));
         assert.equal(existsSync(join(cacheDir, "partial-publisher-data")), false);
         assert.equal(await hasExpectedOmxPluginCache(codexHomeDir, packaged), true);
       });
