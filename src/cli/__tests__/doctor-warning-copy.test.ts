@@ -975,6 +975,41 @@ command = "node"
 		}
 	});
 
+	it("gives scoped manual recovery for an untrusted plugin cache path", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-plugin-cache-untrusted-"));
+		try {
+			const home = join(wd, "home");
+			const codexDir = join(home, ".codex");
+			await mkdir(codexDir, { recursive: true });
+
+			const setupRes = runOmx(
+				wd,
+				["setup", "--scope", "user", "--plugin", "--force"],
+				{ HOME: home, CODEX_HOME: codexDir },
+			);
+			if (shouldSkipForSpawnPermissions(setupRes.error)) return;
+			assert.equal(setupRes.status, 0, setupRes.stderr || setupRes.stdout);
+
+			const version = await packagedPluginVersion();
+			const cacheRoot = join(codexDir, "plugins", "cache", "oh-my-codex-local", "oh-my-codex", version);
+			const externalCache = join(wd, "external-cache");
+			await rename(cacheRoot, externalCache);
+			await symlink(externalCache, cacheRoot, process.platform === "win32" ? "junction" : "dir");
+
+			const res = runOmx(wd, ["doctor"], { HOME: home, CODEX_HOME: codexDir });
+			if (shouldSkipForSpawnPermissions(res.error)) return;
+			assert.equal(res.status, 0, res.stderr || res.stdout);
+			const nativeHooksWarning = res.stdout.split(/\r?\n/).find((line) => line.includes("Native hooks:"));
+			assert.ok(nativeHooksWarning, res.stdout);
+			assert.match(nativeHooksWarning, /expected plugin cache path .* is a symlink; automatic repair preserves unverified content/);
+			assert.match(nativeHooksWarning, /remove only the cache entry at .* itself without following symlinks, then rerun omx setup --plugin/);
+			assert.doesNotMatch(nativeHooksWarning, /--repair-plugin-cache|codex plugin remove/);
+			assert.equal(existsSync(join(externalCache, "hooks", "codex-native-hook.mjs")), true);
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
 	it("uses project-scoped plugin marketplace registration without legacy omission warnings", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-doctor-project-plugin-mode-"));
 		try {

@@ -92,6 +92,7 @@ import {
 	OMX_LOCAL_MARKETPLACE_NAME,
 	OMX_LOCAL_PLUGIN_CONFIG_KEY,
 	PLUGIN_LAUNCHER_RECOVERY_HINT,
+	getUntrustedOmxPluginCacheRecoveryHint,
 	discoverOmxPluginCacheDirs,
 	expectedPackagedOmxSkillNames,
 	getPinnedLauncherIncompatibilityReason,
@@ -2589,6 +2590,15 @@ async function checkPluginScopedNativeHooks(
 	const expectedHooksPath = join(expectedCacheDir, "hooks", "hooks.json");
 	const expectedHookLauncherPath = join(expectedCacheDir, "hooks", "codex-native-hook.mjs");
 	const expectedPinnedLauncherPath = join(expectedCacheDir, "hooks", "omx-command.json");
+	const expectedCacheStats = await lstat(expectedCacheDir).catch(() => null);
+	if (expectedCacheStats && (expectedCacheStats.isSymbolicLink() || !expectedCacheStats.isDirectory())) {
+		const entryKind = expectedCacheStats.isSymbolicLink() ? "a symlink" : "a non-directory entry";
+		return {
+			name: "Native hooks",
+			status: "warn",
+			message: `plugin-scoped hooks are enabled, but expected plugin cache path ${expectedCacheDir} is ${entryKind}; automatic repair preserves unverified content; ${getUntrustedOmxPluginCacheRecoveryHint(expectedCacheDir)}`,
+		};
+	}
 	const state = await readOmxPluginCacheState(expectedCacheDir);
 
 	if (!state) {

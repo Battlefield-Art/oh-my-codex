@@ -2499,6 +2499,10 @@ export interface OmxPluginCacheMaterializeResult {
 
 export const PLUGIN_LAUNCHER_RECOVERY_HINT = "omx setup --plugin --repair-plugin-cache";
 
+export function getUntrustedOmxPluginCacheRecoveryHint(cacheDir: string): string {
+	return `remove only the cache entry at ${cacheDir} itself without following symlinks, then rerun omx setup --plugin`;
+}
+
 async function canonicalRealpath(path: string): Promise<string | null> {
 	try {
 		return await realpath(path);
@@ -2851,7 +2855,7 @@ async function materializePackagedOmxPluginCacheImpl(
 			status: "stale-launcher",
 			cacheDir,
 			version,
-			reason: `OMX plugin cache root at ${cacheDir} is a symlink or non-directory entry; refusing to replace unverified cache content`,
+			reason: `OMX plugin cache root at ${cacheDir} is a symlink or non-directory entry; refusing to replace unverified cache content; ${getUntrustedOmxPluginCacheRecoveryHint(cacheDir)}`,
 			launcherTarget: undefined,
 			retiredDirs: options.dryRun ? [] : await retireUnpinnedManagedSnapshots(codexHomeDir, version, options.anchoredCacheBaseRef),
 		};

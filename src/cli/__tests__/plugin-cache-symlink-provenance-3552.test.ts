@@ -433,7 +433,7 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
     }
   });
 
-  it("symlinked current-version cache root is rejected without a destructive recovery hint", async () => {
+  it("symlinked current-version cache root is rejected with scoped manual recovery", async () => {
     const wd = await mkdtemp(join(tmpdir(), "omx-3552-root-symlink-"));
     try {
       await withIsolatedUserHome(wd, async (codexHomeDir) => {
@@ -469,10 +469,8 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
         assert.equal(r.status, "stale-launcher", JSON.stringify(r));
         assert.match(r.reason!, /symlink or non-directory/);
         assert.match(r.reason!, /refusing to replace unverified cache content/);
-        assert.doesNotMatch(
-          r.reason!,
-          new RegExp(PLUGIN_LAUNCHER_RECOVERY_HINT.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
-        );
+        assert.match(r.reason!, /remove only the cache entry at .* itself without following symlinks, then rerun omx setup --plugin/);
+        assert.doesNotMatch(r.reason!, /codex plugin remove|--repair-plugin-cache/);
 
         // Non-mutation proof: the external target stays exactly where the attacker
         // put it (setup neither followed nor rewrote it), and the external copy is
