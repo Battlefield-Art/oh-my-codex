@@ -1057,8 +1057,20 @@ async function hasManagedSnapshotOwnershipRecord(cacheDir: string, expectedVersi
 	) return false;
 	const bytes = await readOmxPluginCacheFileNoFollow(markerPath, { anchorDir: cacheDir });
 	if (bytes === null) return false;
+	let markerRecord: unknown;
 	try {
-		return parsePublicationOwnershipRecord(JSON.parse(bytes.toString("utf-8")) as unknown, expectedVersion) !== null;
+		markerRecord = JSON.parse(bytes.toString("utf-8")) as unknown;
+	} catch {}
+	if (parsePublicationOwnershipRecord(markerRecord, expectedVersion)) return true;
+	const legacyPidText = bytes.toString("utf-8").trim();
+	if (!/^[1-9]\d*$/.test(legacyPidText) || !Number.isSafeInteger(Number(legacyPidText))) return false;
+	const completionBytes = await readOmxPluginCacheFileNoFollow(join(cacheDir, ".omx-complete"), { anchorDir: cacheDir });
+	if (completionBytes === null) return false;
+	try {
+		const completion = JSON.parse(completionBytes.toString("utf-8")) as { version?: unknown; claimDigest?: unknown };
+		return completion.version === expectedVersion
+			&& typeof completion.claimDigest === "string"
+			&& /^[0-9a-f]{64}$/.test(completion.claimDigest);
 	} catch {
 		return false;
 	}
@@ -1411,18 +1423,17 @@ export async function removeChildIfIdentity(
 			const completionValid = options.allowInvalidClaimDigest
 				? await hasManagedCompletionMarker(sourceRef.operationPath, options.expectedManagedVersion)
 				: await hasRegularPublicationMarker(sourceRef.operationPath, ".omx-complete");
-			const managedMarkerValid = options.allowInvalidClaimDigest
-				? await hasManagedSnapshotOwnershipRecord(sourceRef.operationPath, options.expectedManagedVersion!)
-				: await hasRegularPublicationMarker(sourceRef.operationPath, OMX_PLUGIN_MANAGED_MARKER);
 			const versionOwnershipValid = options.allowInvalidClaimDigest
-				? managedMarkerValid
+				? manifest?.version === options.expectedManagedVersion
+					|| await hasManagedSnapshotOwnershipRecord(sourceRef.operationPath, options.expectedManagedVersion!)
 				: manifest?.version === options.expectedManagedVersion;
 			const owned = sourceStats.dev === childStats.dev
 				&& sourceStats.ino === childStats.ino
 				&& manifest?.name === OMX_PLUGIN_NAME
 				&& versionOwnershipValid
 				&& completionValid
-				&& !(await hasPublicationMarkerEntry(sourceRef.operationPath, ".omx-incomplete"));
+				&& !(await hasPublicationMarkerEntry(sourceRef.operationPath, ".omx-incomplete"))
+				&& await hasRegularPublicationMarker(sourceRef.operationPath, OMX_PLUGIN_MANAGED_MARKER);
 			if (!owned || await isLivePinnedSnapshot(sourceRef)) {
 				options.preservedPaths?.push(join(cacheBaseRef.path, childName));
 				return false;
@@ -1481,16 +1492,15 @@ export async function removeChildIfIdentity(
 		const completionValid = options.allowInvalidClaimDigest
 			? await hasManagedCompletionMarker(quarantinePath, options.expectedManagedVersion!)
 			: await hasRegularPublicationMarker(quarantinePath, ".omx-complete");
-		const managedMarkerValid = options.allowInvalidClaimDigest
-			? await hasManagedSnapshotOwnershipRecord(quarantinePath, options.expectedManagedVersion!)
-			: await hasRegularPublicationMarker(quarantinePath, OMX_PLUGIN_MANAGED_MARKER);
 		const versionOwnershipValid = options.allowInvalidClaimDigest
-			? managedMarkerValid
+			? manifest?.version === options.expectedManagedVersion
+				|| await hasManagedSnapshotOwnershipRecord(quarantinePath, options.expectedManagedVersion!)
 			: manifest?.version === options.expectedManagedVersion;
 		const owned = manifest?.name === OMX_PLUGIN_NAME
 			&& versionOwnershipValid
 			&& completionValid
-			&& !(await hasPublicationMarkerEntry(quarantinePath, ".omx-incomplete"));
+			&& !(await hasPublicationMarkerEntry(quarantinePath, ".omx-incomplete"))
+			&& await hasRegularPublicationMarker(quarantinePath, OMX_PLUGIN_MANAGED_MARKER);
 		let quarantineRef: DirectoryRef | undefined;
 		let livePin = true;
 		try {
@@ -2625,13 +2635,14 @@ async function inspectManagedSnapshotForRepair(
 ): Promise<{ stats: Stats; reason?: string }> {
 	const stats = await snapshotRef.handle.stat();
 	const manifest = await readRegularOmxPluginCacheManifest(snapshotRef.operationPath, snapshotRef.operationPath);
-	// The manifest version may be the damaged field; verify repair ownership through the publication records.
+	// The manifest version may be damaged; new owner records independently identify its intended cache version.
 	const owned = stats.isDirectory()
 		&& !stats.isSymbolicLink()
 		&& manifest?.name === OMX_PLUGIN_NAME
-		&& await hasManagedSnapshotOwnershipRecord(snapshotRef.operationPath, version)
+		&& (manifest.version === version || await hasManagedSnapshotOwnershipRecord(snapshotRef.operationPath, version))
 		&& await hasManagedCompletionMarker(snapshotRef.operationPath, version)
-		&& !(await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-incomplete"));
+		&& !(await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-incomplete"))
+		&& await hasRegularPublicationMarker(snapshotRef.operationPath, OMX_PLUGIN_MANAGED_MARKER);
 	if (!owned) {
 		return { stats, reason: `same-version cache at ${snapshotRef.path} is not a verified managed OMX snapshot` };
 	}

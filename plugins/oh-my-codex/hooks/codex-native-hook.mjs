@@ -694,13 +694,15 @@ async function main() {
   const isStop = detectStopHookInput(input);
   const isCompact = detectCompactHookInput(input);
   const sessionId = payload?.session_id ?? payload?.sessionId;
+  const sessionStart = (payload?.hook_event_name ?? payload?.hookEventName ?? payload?.event ?? payload?.name) === 'SessionStart';
   let pendingPin = null;
   if (
     !oversized
     && typeof sessionId === 'string'
     && sessionId.trim()
     && sessionId.trim().length <= 256
-    && !hasLiveSessionPin(pluginRoot, sessionId)
+    // SessionStart also refreshes process identity for resumed sessions.
+    && (sessionStart || !hasLiveSessionPin(pluginRoot, sessionId))
   ) {
     pendingPin = startupPendingPin ?? writePendingSessionPin(pluginRoot, sessionId);
   }
