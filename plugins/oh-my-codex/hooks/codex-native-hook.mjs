@@ -450,8 +450,16 @@ function livePinDirectory(pluginRoot) {
 
 function livePinRootMatches(pinState) {
   try {
+    // The open descriptor follows a snapshot into quarantine; the published path must still name it.
+    const namedRootStats = lstatSync(pinState.pluginRoot);
+    if (
+      !namedRootStats.isDirectory()
+      || namedRootStats.isSymbolicLink()
+      || namedRootStats.dev !== pinState.rootDev
+      || namedRootStats.ino !== pinState.rootIno
+    ) return false;
     const currentStats = pinState.rootFd === null
-      ? lstatSync(pinState.pluginRoot)
+      ? namedRootStats
       : fstatSync(pinState.rootFd);
     return currentStats.isDirectory()
       && !currentStats.isSymbolicLink()
@@ -465,6 +473,15 @@ function livePinRootMatches(pinState) {
 function closeLivePinDirectory(pinState) {
   if (!pinState || pinState.rootFd === null) return;
   try { closeSync(pinState.rootFd); } catch {}
+}
+
+function livePinRetirementGateExists(pinDir) {
+  try {
+    lstatSync(join(pinDir, '.omx-retiring'));
+    return true;
+  } catch (error) {
+    return error?.code !== 'ENOENT';
+  }
 }
 
 function isProcessAlive(pid) {
@@ -540,7 +557,8 @@ function writePendingSessionPin(pluginRoot, sessionId) {
       if (error?.code !== 'EEXIST') throw error;
     }
     const pinDirStats = lstatSync(pinDir);
-    if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink() || !livePinRootMatches(pinState)) return null;
+    if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink()) return null;
+    if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState)) return null;
     const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
     const record = {
       version: 1,
@@ -556,12 +574,12 @@ function writePendingSessionPin(pluginRoot, sessionId) {
     const cleanupPath = join(pluginRoot, '.omx-live-pin', pinName);
     try {
       writeFileSync(stagePath, content, { flag: 'wx', mode: 0o600 });
-      if (!livePinRootMatches(pinState)) {
+      if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState)) {
         removePendingSessionPin(stagePath);
         return null;
       }
       renameSync(stagePath, pinPath);
-      if (!livePinRootMatches(pinState)) {
+      if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState)) {
         removePendingSessionPin(pinPath);
         return null;
       }

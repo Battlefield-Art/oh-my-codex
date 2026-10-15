@@ -328,6 +328,204 @@ describe("issue 3790 live plugin cache pins", () => {
 		}
 	});
 
+	it("does not publish a startup pin after the snapshot is quarantined", {
+		skip: process.platform !== "linux",
+	}, async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-quarantine-pin-race-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const pluginRoot = await seedManagedSnapshot(codexHomeDir, "0.20.0");
+				const quarantinePath = join(wd, "quarantined-snapshot");
+				const preloadPath = join(wd, "rename-before-pin-write.mjs");
+				await writeFile(preloadPath, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const originalWriteFileSync = fs.writeFileSync;
+let renamed = false;
+fs.writeFileSync = function (path, ...args) {
+	if (!renamed && typeof path === "string" && path.includes("/.omx-live-pin/.stage-")) {
+		fs.renameSync(process.env.OMX_TEST_PLUGIN_ROOT, process.env.OMX_TEST_QUARANTINE);
+		renamed = true;
+	}
+	return originalWriteFileSync.call(this, path, ...args);
+};
+syncBuiltinESMExports();
+`);
+				const hookResult = spawnSync(
+					process.execPath,
+					[
+						"--import",
+						preloadPath,
+						join(pluginRoot, "hooks", "codex-native-hook.mjs"),
+					],
+					{
+						cwd: wd,
+						input: JSON.stringify({
+							hook_event_name: "SessionStart",
+							session_id: "quarantine-race-session",
+							codex_pid: process.pid,
+							cwd: wd,
+						}),
+						encoding: "utf-8",
+						env: {
+							...process.env,
+							CODEX_HOME: codexHomeDir,
+							OMX_TEST_PLUGIN_ROOT: pluginRoot,
+							OMX_TEST_QUARANTINE: quarantinePath,
+						},
+					},
+				);
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				await assert.rejects(lstat(pluginRoot), { code: "ENOENT" });
+				assert.deepEqual(await readdir(join(quarantinePath, ".omx-live-pin")), []);
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("coordinates startup pin publication with quarantine deletion", {
+		skip: process.platform !== "linux",
+	}, async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-retirement-gate-race-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const snapshots = await Promise.all(
+					["0.20.0", "0.20.1", "0.20.2"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
+				const pluginRoot = snapshots[0]!;
+				const pinDirectory = join(pluginRoot, ".omx-live-pin");
+				await mkdir(pinDirectory);
+				const expiredAt = new Date(Date.now() - 6 * 60 * 1000);
+				await utimes(pinDirectory, expiredAt, expiredAt);
+
+				const readyPath = join(wd, "pin-writer-ready");
+				const releasePath = join(wd, "pin-writer-release");
+				const preloadPath = join(wd, "pause-before-pin-write.mjs");
+				await writeFile(preloadPath, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const originalWriteFileSync = fs.writeFileSync;
+let paused = false;
+fs.writeFileSync = function (path, ...args) {
+	if (!paused && typeof path === "string" && path.includes("/.omx-live-pin/.stage-")) {
+		paused = true;
+		originalWriteFileSync.call(this, process.env.OMX_TEST_PIN_READY, "ready\\n");
+		const wait = new Int32Array(new SharedArrayBuffer(4));
+		while (!fs.existsSync(process.env.OMX_TEST_PIN_RELEASE)) Atomics.wait(wait, 0, 0, 10);
+	}
+	return originalWriteFileSync.call(this, path, ...args);
+};
+syncBuiltinESMExports();
+`);
+
+				let signalRemovalBarrier!: () => void;
+				const removalBarrier = new Promise<void>((resolveBarrier) => { signalRemovalBarrier = resolveBarrier; });
+				let releaseRemoval!: () => void;
+				const removalGate = new Promise<void>((resolveGate) => { releaseRemoval = resolveGate; });
+				let quarantinePath: string | undefined;
+				let pausedRemoval = false;
+				const resetHooks = setPluginCacheMutationHooksForTest({
+					beforeRemoveSyscall: async (path) => {
+						if (pausedRemoval || !path.includes(".0.20.0.reclaim-")) return;
+						pausedRemoval = true;
+						const quarantineName = path.slice(path.lastIndexOf("/") + 1);
+						quarantinePath = join(omxPluginCacheBase(codexHomeDir), quarantineName);
+						signalRemovalBarrier();
+						await removalGate;
+					},
+				});
+				const hook = spawn(
+					process.execPath,
+					["--import", preloadPath, join(pluginRoot, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						stdio: ["pipe", "pipe", "pipe"],
+						env: {
+							...process.env,
+							CODEX_HOME: codexHomeDir,
+							OMX_TEST_PIN_READY: readyPath,
+							OMX_TEST_PIN_RELEASE: releasePath,
+						},
+					},
+				);
+				hook.stdout.resume();
+				let hookStderr = "";
+				hook.stderr.setEncoding("utf-8");
+				hook.stderr.on("data", (chunk: string) => { hookStderr += chunk; });
+				const closed = once(hook, "close");
+				let retirement: Promise<string[]> | undefined;
+				try {
+					hook.stdin.end(JSON.stringify({
+						hook_event_name: "SessionStart",
+						session_id: "retirement-gate-session",
+						codex_pid: process.pid,
+						cwd: wd,
+					}));
+					let writerPaused = false;
+					for (let attempt = 0; attempt < 500; attempt += 1) {
+						try {
+							await lstat(readyPath);
+							writerPaused = true;
+							break;
+						} catch {
+							await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+						}
+					}
+					assert.equal(writerPaused, true, hookStderr || "pin writer did not reach the interposed stage write");
+
+					retirement = retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.3");
+					let barrierTimeout: NodeJS.Timeout | undefined;
+					try {
+						await Promise.race([
+							removalBarrier,
+							new Promise<void>((_resolve, reject) => {
+								barrierTimeout = setTimeout(() => reject(new Error("retirement did not reach the destructive barrier")), 5000);
+							}),
+						]);
+					} finally {
+						if (barrierTimeout) clearTimeout(barrierTimeout);
+					}
+					assert.ok(quarantinePath);
+					const gateRecord = JSON.parse(
+						await readFile(join(quarantinePath, ".omx-live-pin", ".omx-retiring"), "utf-8"),
+					) as { version: number };
+					assert.equal(gateRecord.version, 1);
+					await writeFile(releasePath, "release\n");
+					let closeTimeout: NodeJS.Timeout | undefined;
+					let closeResult: unknown[];
+					try {
+						closeResult = await Promise.race([
+							closed,
+							new Promise<never>((_resolve, reject) => {
+								closeTimeout = setTimeout(() => reject(new Error("startup hook did not finish after releasing the pin writer")), 5000);
+							}),
+						]);
+					} finally {
+						if (closeTimeout) clearTimeout(closeTimeout);
+					}
+					const [hookCode] = closeResult as [number | null];
+					assert.equal(hookCode, 0, hookStderr);
+					assert.deepEqual(await readdir(join(quarantinePath, ".omx-live-pin")), [".omx-retiring"]);
+
+					releaseRemoval();
+					const retired = await retirement;
+					assert.ok(retired.includes(pluginRoot));
+					await assert.rejects(lstat(pluginRoot), { code: "ENOENT" });
+				} finally {
+					await writeFile(releasePath, "release\n").catch(() => undefined);
+					releaseRemoval();
+					resetHooks();
+					if (hook.exitCode === null) hook.kill();
+					await closed.catch(() => undefined);
+					await retirement?.catch(() => undefined);
+				}
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
 	it("registers a live pin before concurrent publication retires an older snapshot", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-3790-pin-lock-retry-"));
 		try {

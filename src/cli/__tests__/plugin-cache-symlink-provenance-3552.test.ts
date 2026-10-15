@@ -1993,7 +1993,12 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
           beforeRemoveSyscall: async (path) => {
             if (interposed || !path.includes(".reclaim-")) return;
             interposed = true;
-            await writeFile(join(path, ".omx-live-pin"), "late pin\n");
+            const pinDirectory = join(path, ".omx-live-pin");
+            await mkdir(pinDirectory, { recursive: true });
+            await writeFile(
+              join(pinDirectory, "late-pin.json"),
+              `${JSON.stringify({ version: 1, pid: process.pid, processStartHash: null, sessionHash: "0".repeat(64) })}\n`,
+            );
           },
         });
         try {
