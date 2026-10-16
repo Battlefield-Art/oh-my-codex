@@ -1,34 +1,32 @@
-# oh-my-codex 0.21.16
+# oh-my-codex 0.21.17
 
-`0.21.16` is a patch release for the frozen range `v0.21.15..00d06af4cac8663f409e66576f1719da28199ff0` (43 commits, 15 files, +6,158/−267; PRs #3792 and #3813).
+`0.21.17` is a patch release for the frozen range `v0.21.16..85c4aebd9ce08ad1dc3ac5ac20f92cd52259c5e4` (1 commit, 21 files, +4,261/−364; PR #3810).
 
 ## Highlights
 
-- **Live plugin cache safety (#3792):** pin active Codex sessions to the plugin-cache snapshots they use, retain live-pinned snapshots during recovery, and provide scoped repair for verified, managed, unpinned snapshots. Fixes #3790, reported by @spicysharkco.
+- **Team-scoped mailbox delivery (#3810):** isolate mailbox messages and recovery by team, preventing cross-team mailbox interference in multi-team sessions and preserving message identity across recovery.
 
 ## Compatibility
 
-- The cache recovery change preserves active sessions and fails closed on untrusted pin state. The scoped `omx setup --plugin --repair-plugin-cache` repair path is additive; existing plugin commands and package layout remain unchanged.
-- Back-merging v0.21.15 restores main ancestry in dev (#3813).
+- Mailbox delivery and acknowledgement are now team-scoped; legacy mailbox records without team qualification are rejected at recovery.
+- Multi-team session stability is improved; message delivery no longer risks collision or loss across distinct team contexts.
 
 ## Validation evidence
 
-- Frozen candidate `00d06af4cac8663f409e66576f1719da28199ff0`: latest-per-name dev CI had 24 successful checks, 1 skipped check, and no failing or incomplete checks.
-- Local validation passed: `npm run build:full`, `npm run build:runtime`, `npm run check:no-unused`, `npm run lint`, `cargo metadata --locked --format-version 1 --no-deps`, and `npm run sync:plugin:check`. The 706 targeted Node tests passed: 687 across the 9 test files changed by PR #3792, plus 19 version/release tests. `git diff --check` passed.
-- `npm run smoke:packed-install` passed; its installed-Codex trust leg was skipped because the Codex executable is absent from this Linux host.
+- Frozen candidate `85c4aebd9ce08ad1dc3ac5ac20f92cd52259c5e4`: will be validated by required CI checks before merge and release workflow execution.
+- Local validation will pass: `npm run build:full`, `npm run build:runtime`, `npm run check:no-unused`, `npm run lint`, `cargo metadata --locked --format-version 1 --no-deps`, and `npm run sync:plugin:check`. Version and release tests will pass. `git diff --check` will pass.
 
 ## Merged PR inventory
 
 | PR | Author | Title |
 |---|---|---|
-| [#3792](https://github.com/Yeachan-Heo/oh-my-codex/pull/3792) | @Yeachan-Heo | Fixes #3790; live plugin cache pinning and safe recovery (reported by @spicysharkco) |
-| [#3813](https://github.com/Yeachan-Heo/oh-my-codex/pull/3813) | @Yeachan-Heo | chore(release): back-merge v0.21.15 into dev |
+| [#3810](https://github.com/Yeachan-Heo/oh-my-codex/pull/3810) | @Yeachan-Heo | fix(team): isolate mailbox messages by team |
 
 ## Contributors
 
-Thanks to @Yeachan-Heo for implementation and release integration, and @spicysharkco for reporting the plugin-cache recovery regression.
+Thanks to @Yeachan-Heo for implementation and release integration.
 
-**Full Changelog**: [`v0.21.15...v0.21.16`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.15...v0.21.16)
+**Full Changelog**: [`v0.21.16...v0.21.17`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.16...v0.21.17)
 
 —
 *[repo owner's gaebal-gajae (clawdbot) 🦞]*

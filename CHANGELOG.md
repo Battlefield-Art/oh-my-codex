@@ -4,6 +4,18 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.21.17] - 2026-10-17
+
+Patch release for the frozen range `v0.21.16..85c4aebd9ce08ad1dc3ac5ac20f92cd52259c5e4` (1 commit, 20 files, +4,261/−364; PR #3810).
+
+### Fixed
+
+- Isolate mailbox delivery messages and recovery by team, preventing cross-team mailbox interference in multi-team sessions (#3810, authored by @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.17.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.16...v0.21.17
+
 ## [0.21.16] - 2026-10-16
 
 Patch release for the frozen range `v0.21.15..00d06af4cac8663f409e66576f1719da28199ff0` (43 commits, 15 files, +6,158/−267; PRs #3792 and #3813).
