@@ -1156,7 +1156,8 @@ async function pinUnroutedSession(input, launcher, pluginRoot, pendingPin) {
 
 async function main() {
   const pluginRoot = resolve(hookDir, '..');
-  const startupPendingPin = writePendingSessionPin(pluginRoot, `wrapper-${process.pid}-${randomUUID()}`);
+  const doctorSmoke = process.env.OMX_NATIVE_HOOK_DOCTOR_SMOKE === '1';
+  const startupPendingPin = doctorSmoke ? null : writePendingSessionPin(pluginRoot, `wrapper-${process.pid}-${randomUUID()}`);
   if (startupPendingPin) {
     process.once('exit', () => removePendingSessionPin(startupPendingPin));
   }
@@ -1190,7 +1191,8 @@ async function main() {
   const isCompact = detectCompactHookInput(input);
   const sessionId = payload?.session_id ?? payload?.sessionId;
   const sessionStart = (payload?.hook_event_name ?? payload?.hookEventName ?? payload?.event ?? payload?.name) === 'SessionStart';
-  const validSessionId = !oversized
+  const validSessionId = !doctorSmoke
+    && !oversized
     && typeof sessionId === 'string'
     && sessionId.trim().length > 0
     && sessionId.trim().length <= 256;

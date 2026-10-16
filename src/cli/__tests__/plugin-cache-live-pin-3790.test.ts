@@ -210,6 +210,27 @@ describe("issue 3790 live plugin cache pins", () => {
 		}
 	});
 
+	it("publishes post-pin hooks under a new cache version and retains the legacy snapshot", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-legacy-snapshot-upgrade-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const legacySnapshot = await seedManagedSnapshot(codexHomeDir, "0.21.14");
+				const packaged = await resolvePackagedOmxMarketplace(packageRoot);
+				assert.ok(packaged);
+				const pluginManifest = JSON.parse(await readFile(packaged.pluginManifestPath, "utf-8")) as { version: string };
+				assert.notEqual(pluginManifest.version, "0.21.14");
+
+				const published = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
+				assert.equal(published.status, "materialized");
+				assert.notEqual(published.cacheDir, legacySnapshot);
+				await lstat(published.cacheDir!);
+				await lstat(legacySnapshot);
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
 	it("uses the configured launcher to pin an unrouted session when the cache launcher is invalid", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-3790-configured-pin-launcher-"));
 		try {
@@ -823,6 +844,34 @@ syncBuiltinESMExports();
 				assert.equal(retired.includes(snapshots[1]!), true);
 				await lstat(pluginRoot);
 				await assert.rejects(lstat(snapshots[1]!), { code: "ENOENT" });
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("does not create live pins for doctor hook smoke runs", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-doctor-smoke-pin-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const pluginRoot = await seedManagedSnapshot(codexHomeDir, "0.20.0");
+				const hookResult = spawnSync(process.execPath, [join(pluginRoot, "hooks", "codex-native-hook.mjs")], {
+					cwd: wd,
+					input: JSON.stringify({
+						hook_event_name: "UserPromptSubmit",
+						session_id: "omx-doctor-plugin-hook-smoke",
+						cwd: wd,
+					}),
+					encoding: "utf-8",
+					env: {
+						...process.env,
+						CODEX_HOME: codexHomeDir,
+						OMX_NATIVE_HOOK_DOCTOR_SMOKE: "1",
+					},
+				});
+
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				await assert.rejects(lstat(join(pluginRoot, ".omx-live-pin")), { code: "ENOENT" });
 			});
 		} finally {
 			await rm(wd, { recursive: true, force: true });
