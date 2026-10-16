@@ -54,6 +54,7 @@ const MANAGED_HOOK_EVENTS = [
 	"UserPromptSubmit",
 	"PreCompact",
 	"PostCompact",
+	"SubagentStop",
 	"Stop",
 ] as const;
 
@@ -2125,7 +2126,7 @@ OMX_LORE_COMMIT_GUARD = "truee"
 			assert.equal(res.status, 0, res.stderr || res.stdout);
 			assert.match(
 				res.stdout,
-				/Native hooks: hooks\.json is missing OMX-managed coverage for PreToolUse, PostToolUse, UserPromptSubmit, PreCompact, PostCompact, Stop; run "omx setup" to restore native hooks/,
+				/Native hooks: hooks\.json is missing OMX-managed coverage for PreToolUse, PostToolUse, UserPromptSubmit, PreCompact, PostCompact, SubagentStop, Stop; run "omx setup" to restore native hooks/,
 			);
 		} finally {
 			await rm(wd, { recursive: true, force: true });
