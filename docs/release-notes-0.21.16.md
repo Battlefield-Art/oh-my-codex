@@ -17,7 +17,7 @@ Versioning continues the 0.21.x patch train. This release protects live Codex pl
 ## Validation evidence
 
 - Frozen candidate `00d06af4cac8663f409e66576f1719da28199ff0` passed latest-per-name dev CI: 24 checks succeeded, 1 was skipped, and none failed or remained incomplete.
-- Local validation passed: `npm run build`, `npm run check:no-unused`, `npm run lint`, `npm run build:runtime`, locked Cargo metadata, plugin synchronization check, and all 687 tests across the 9 test files changed by PR #3792.
+- Local validation passed: `npm run build:full`, `npm run build:runtime`, `npm run check:no-unused`, `npm run lint`, `cargo metadata --locked --format-version 1 --no-deps`, and `npm run sync:plugin:check`. The 706 targeted Node tests passed: 687 across the 9 test files changed by PR #3792, plus 19 version/release tests. `git diff --check` passed.
 
 ## Merged PR inventory
 
