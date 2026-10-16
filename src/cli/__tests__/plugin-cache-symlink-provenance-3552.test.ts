@@ -1738,7 +1738,7 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
         let interposed = false;
         const resetHooks = setPluginCacheMutationHooksForTest({
           beforeRemoveSyscall: async (path) => {
-            if (interposed || !path.includes(".reclaim-")) return;
+            if (interposed || !path.includes(".0.20.0.reclaim-")) return;
             interposed = true;
             await rename(path, preservedPath);
             await mkdir(path, { recursive: true });
@@ -1989,7 +1989,7 @@ describe("issue 3552 P1 symlink trust bypass in unchanged fast paths", () => {
         let interposed = false;
         const resetHooks = setPluginCacheMutationHooksForTest({
           beforeRemoveSyscall: async (path) => {
-            if (interposed || !path.includes(".reclaim-")) return;
+            if (interposed || !path.includes(".0.20.0.reclaim-")) return;
             interposed = true;
             const pinDirectory = join(path, ".omx-live-pin");
             await mkdir(pinDirectory, { recursive: true });

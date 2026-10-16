@@ -1,10 +1,10 @@
 #!/usr/bin/env node
 import { createHash, randomUUID } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { extname } from 'node:path';
-import { closeSync, constants as fsConstants, existsSync, fstatSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { closeSync, constants as fsConstants, existsSync, fstatSync, futimesSync, linkSync, lstatSync, mkdirSync, openSync, readFileSync, readSync, readdirSync, realpathSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join, resolve } from 'node:path';
+import { basename, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const hookDir = dirname(fileURLToPath(import.meta.url));
@@ -17,6 +17,7 @@ const MAX_STOP_STDOUT_BYTES = 1024 * 1024;
 const MAX_ROUTING_RECORD_BYTES = 4 * 1024;
 const LIVE_PIN_HELPER_TIMEOUT_MS = 5_000;
 const LIVE_PIN_HELPER_KILL_GRACE_MS = 250;
+const LIVE_PIN_PENDING_PREFIX = '.pending-';
 const CODEX_HOOK_EVENT_NAMES = new Set([
   'SessionStart',
   'PreToolUse',
@@ -388,27 +389,23 @@ function readJsonFile(path) {
   }
 }
 
+function livePinTarget(pluginRoot) {
+  const absoluteRoot = resolve(pluginRoot);
+  const version = basename(absoluteRoot);
+  if (!version || version === '.' || version === '..' || version.includes('/') || version.includes('\\') || version.includes('\0')) return null;
+  const codexHome = resolve(process.env.CODEX_HOME || join(homedir(), '.codex'));
+  const cacheBase = join(codexHome, 'plugins', 'cache', 'oh-my-codex-local', 'oh-my-codex');
+  const expectedRoot = join(cacheBase, version);
+  if (!sameLexicalFilePath(absoluteRoot, expectedRoot)) return null;
+  const cacheBaseStats = lstatSync(cacheBase);
+  if (!cacheBaseStats.isDirectory() || cacheBaseStats.isSymbolicLink()) return null;
+  return { pluginRoot: absoluteRoot, version, cacheBase, expectedRoot };
+}
+
 function livePinDirectory(pluginRoot) {
-  const rootStats = lstatSync(pluginRoot);
-  if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) return null;
-  const manifest = readJsonFile(join(pluginRoot, '.codex-plugin', 'plugin.json'));
-  if (
-    manifest?.name !== 'oh-my-codex'
-    || typeof manifest.version !== 'string'
-    || !manifest.version
-    || manifest.version === '.'
-    || manifest.version === '..'
-    || manifest.version.includes('/')
-    || manifest.version.includes('\\')
-    || manifest.version.includes('\0')
-  ) return null;
-  for (const marker of ['.omx-managed', '.omx-complete']) {
-    const stats = lstatSync(join(pluginRoot, marker));
-    if (!stats.isFile() || stats.isSymbolicLink()) return null;
-  }
-  const codexHome = process.env.CODEX_HOME || join(homedir(), '.codex');
-  const expectedRoot = join(codexHome, 'plugins', 'cache', 'oh-my-codex-local', 'oh-my-codex', manifest.version);
-  if (!sameFilePath(pluginRoot, expectedRoot)) return null;
+  const target = livePinTarget(pluginRoot);
+  if (!target) return null;
+  const { pluginRoot: absoluteRoot, version, cacheBase, expectedRoot } = target;
   let rootFd = null;
   const closeRoot = () => {
     if (rootFd === null) return;
@@ -416,8 +413,10 @@ function livePinDirectory(pluginRoot) {
     rootFd = null;
   };
   try {
+    const rootStats = lstatSync(absoluteRoot);
+    if (!rootStats.isDirectory() || rootStats.isSymbolicLink()) return null;
     if (process.platform === 'linux') {
-      rootFd = openSync(pluginRoot, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      rootFd = openSync(absoluteRoot, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
       const openedRootStats = fstatSync(rootFd);
       if (
         !openedRootStats.isDirectory()
@@ -429,7 +428,27 @@ function livePinDirectory(pluginRoot) {
         return null;
       }
     }
-    const operationRoot = rootFd === null ? pluginRoot : `/proc/self/fd/${rootFd}`;
+    const operationRoot = rootFd === null ? absoluteRoot : `/proc/self/fd/${rootFd}`;
+    const metadataDir = join(operationRoot, '.codex-plugin');
+    const metadataStats = lstatSync(metadataDir);
+    if (!metadataStats.isDirectory() || metadataStats.isSymbolicLink()) {
+      closeRoot();
+      return null;
+    }
+    const manifestText = readNoFollowText(join(metadataDir, 'plugin.json'), 16 * 1024)?.content;
+    let manifest;
+    try { manifest = manifestText ? JSON.parse(manifestText) : null; } catch { manifest = null; }
+    if (manifest?.name !== 'oh-my-codex' || manifest.version !== version || !sameFilePath(absoluteRoot, expectedRoot)) {
+      closeRoot();
+      return null;
+    }
+    for (const marker of ['.omx-managed', '.omx-complete']) {
+      const stats = lstatSync(join(operationRoot, marker));
+      if (!stats.isFile() || stats.isSymbolicLink()) {
+        closeRoot();
+        return null;
+      }
+    }
     const pinDir = join(operationRoot, '.omx-live-pin');
     try {
       const pinDirStats = lstatSync(pinDir);
@@ -443,7 +462,7 @@ function livePinDirectory(pluginRoot) {
         return null;
       }
     }
-    return { path: pinDir, pluginRoot, rootDev: rootStats.dev, rootIno: rootStats.ino, rootFd };
+    return { path: pinDir, pluginRoot: absoluteRoot, version, cacheBase, rootDev: rootStats.dev, rootIno: rootStats.ino, rootFd };
   } catch (error) {
     closeRoot();
     throw error;
@@ -495,36 +514,333 @@ function isProcessAlive(pid) {
   }
 }
 
-function readProcessStartHash(pid) {
-  if (!Number.isSafeInteger(pid) || pid <= 0) return null;
+function sameFileIdentity(left, right) {
+  return Number.isInteger(left?.dev) && Number.isInteger(left?.ino)
+    && Number.isInteger(right?.dev) && Number.isInteger(right?.ino)
+    && left.dev === right.dev && left.ino === right.ino;
+}
+
+function readNoFollowText(path, maxBytes, { allowHardLinks = false } = {}) {
+  let fd = null;
   try {
-    let identity;
-    if (process.platform === 'linux') {
-      const stat = readFileSync(`/proc/${pid}/stat`, 'utf8');
-      const close = stat.lastIndexOf(')');
-      if (close < 0) return null;
-      const fields = stat.slice(close + 2).trim().split(/\s+/);
-      const startTicks = fields[19];
-      const bootId = readFileSync('/proc/sys/kernel/random/boot_id', 'utf8').trim();
-      if (!startTicks || !/^\d+$/.test(startTicks) || !bootId) return null;
-      identity = `linux:${bootId}:${startTicks}`;
-    } else if (process.platform === 'darwin') {
-      const result = spawnSync('ps', ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 2_000 });
-      const value = result.stdout?.trim();
-      if (result.error || result.status !== 0 || !value) return null;
-      identity = `darwin:${value}`;
-    } else if (process.platform === 'win32') {
-      const script = `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().Ticks`;
-      const result = spawnSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', script], { encoding: 'utf8', timeout: 3_000 });
-      const value = result.stdout?.trim();
-      if (result.error || result.status !== 0 || !value || !/^\d+$/.test(value)) return null;
-      identity = `win32:${value}`;
-    } else {
-      return null;
-    }
-    return createHash('sha256').update(identity).digest('hex').slice(0, 24);
+    const pathStats = lstatSync(path);
+    const validLinkCount = pathStats.nlink === 1 || (allowHardLinks && pathStats.nlink === 2);
+    if (!pathStats.isFile() || pathStats.isSymbolicLink() || !validLinkCount || pathStats.size <= 0 || pathStats.size > maxBytes) return null;
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const openedStats = fstatSync(fd);
+    if (!openedStats.isFile() || openedStats.isSymbolicLink() || !sameFileIdentity(openedStats, pathStats) || openedStats.nlink !== pathStats.nlink) return null;
+    const content = readFileSync(fd, 'utf8');
+    if (Buffer.byteLength(content) > maxBytes) return null;
+    const afterStats = lstatSync(path);
+    if (!sameFileIdentity(afterStats, pathStats) || afterStats.nlink !== pathStats.nlink) return null;
+    return { stats: openedStats, content };
   } catch {
     return null;
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch {}
+    }
+  }
+}
+
+function livePinMutationLockName(version) {
+  const versionHash = createHash('sha256').update(version).digest('hex').slice(0, 24);
+  return `.omx-live-pin-${versionHash}.lock`;
+}
+
+function readLivePinMutationLock(path) {
+  let stats;
+  try {
+    stats = lstatSync(path);
+  } catch (error) {
+    if (error?.code === 'ENOENT') return null;
+    return { stats: null, content: null, record: null, regular: false };
+  }
+  if (!stats.isFile() || stats.isSymbolicLink() || (stats.nlink !== 1 && stats.nlink !== 2) || stats.size <= 0 || stats.size > 256) {
+    return { stats, content: null, record: null, regular: false };
+  }
+  const file = readNoFollowText(path, 256, { allowHardLinks: true });
+  if (!file || !sameFileIdentity(file.stats, stats) || file.stats.nlink !== stats.nlink) {
+    return { stats, content: null, record: null, regular: false };
+  }
+  let record;
+  try {
+    record = JSON.parse(file.content);
+  } catch {
+    return { stats, content: file.content, record: null, regular: true };
+  }
+  if (
+    record?.version !== 1
+    || !Number.isSafeInteger(record.pid)
+    || record.pid <= 0
+    || (record.operation !== 'pin' && record.operation !== 'retire')
+    || typeof record.token !== 'string'
+    || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(record.token)
+  ) return { stats, content: file.content, record: null, regular: true };
+  if (stats.nlink === 2) {
+    const stagePath = `${path}.stage-${record.pid}-${record.token}`;
+    const stage = readNoFollowText(stagePath, 256, { allowHardLinks: true });
+    if (!stage || !sameFileIdentity(stage.stats, stats) || stage.content !== file.content) {
+      return { stats, content: file.content, record: null, regular: false };
+    }
+  }
+  return { stats, content: file.content, record, regular: true };
+}
+
+function removeVerifiedLockEntry(path, expectedStats, expectedContent, canRemove = () => true) {
+  try {
+    const current = readNoFollowText(path, 256, { allowHardLinks: true });
+    if (!current || !sameFileIdentity(current.stats, expectedStats) || current.content !== expectedContent) return false;
+    const quarantinePath = `${path}.reclaim-${process.pid}-${randomUUID()}`;
+    renameSync(path, quarantinePath);
+    const restore = () => {
+      try {
+        const quarantined = lstatSync(quarantinePath);
+        if (!quarantined.isFile() || quarantined.isSymbolicLink() || !sameFileIdentity(quarantined, expectedStats)) return;
+        linkSync(quarantinePath, path);
+        const restored = lstatSync(path);
+        if (sameFileIdentity(restored, expectedStats)) unlinkSync(quarantinePath);
+      } catch {}
+    };
+    const quarantined = readNoFollowText(quarantinePath, 256, { allowHardLinks: true });
+    if (!quarantined || !sameFileIdentity(quarantined.stats, expectedStats) || quarantined.content !== expectedContent || !canRemove()) {
+      restore();
+      return false;
+    }
+    const final = readNoFollowText(quarantinePath, 256, { allowHardLinks: true });
+    if (!final || !sameFileIdentity(final.stats, expectedStats) || final.content !== expectedContent || !canRemove()) {
+      restore();
+      return false;
+    }
+    unlinkSync(quarantinePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function removeLockStageLink(path, state) {
+  if (state?.stats?.nlink === 1) return true;
+  if (state?.stats?.nlink !== 2 || !state.record || !state.content) return false;
+  const stagePath = `${path}.stage-${state.record.pid}-${state.record.token}`;
+  if (!removeVerifiedLockEntry(stagePath, state.stats, state.content)) return false;
+  const refreshed = readLivePinMutationLock(path);
+  return refreshed?.content === state.content
+    && refreshed.record?.pid === state.record.pid
+    && sameFileIdentity(refreshed.stats, state.stats)
+    && refreshed.stats.nlink === 1;
+}
+
+function removeDeadLivePinMutationLock(path, state) {
+  // A live PID is never stolen by age. If PID reuse makes a dead owner look
+  // live, preserving the lock is safer than racing a paused pin/removal.
+  if (!state?.stats || !state.regular || !state.record || isProcessAlive(state.record.pid)) return false;
+  if (!removeLockStageLink(path, state)) return false;
+  const refreshed = readLivePinMutationLock(path);
+  if (
+    refreshed?.content !== state.content
+    || !refreshed.record
+    || refreshed.record.pid !== state.record.pid
+    || !sameFileIdentity(refreshed.stats, state.stats)
+    || refreshed.stats.nlink !== 1
+    || isProcessAlive(refreshed.record.pid)
+  ) return false;
+  return removeVerifiedLockEntry(path, refreshed.stats, refreshed.content, () => !isProcessAlive(refreshed.record.pid));
+}
+
+function acquireLivePinMutationLock(target, operation) {
+  const path = join(target.cacheBase, livePinMutationLockName(target.version));
+  const token = randomUUID();
+  const content = `${JSON.stringify({ version: 1, pid: process.pid, operation, token })}\n`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    const existing = readLivePinMutationLock(path);
+    if (existing) {
+      if (removeDeadLivePinMutationLock(path, existing)) continue;
+      return null;
+    }
+    const stagePath = `${path}.stage-${process.pid}-${token}`;
+    let stageStats = null;
+    let linked = false;
+    try {
+      // Link a complete staged record into place so readers cannot observe a
+      // partially written lock; the record identifies the recoverable stage.
+      writeFileSync(stagePath, content, { flag: 'wx', mode: 0o600 });
+      stageStats = lstatSync(stagePath);
+      try {
+        linkSync(stagePath, path);
+        linked = true;
+      } catch (error) {
+        if (error?.code !== 'EEXIST') throw error;
+      }
+      if (stageStats) removeVerifiedLockEntry(stagePath, stageStats, content);
+      if (!linked) continue;
+      const acquired = readLivePinMutationLock(path);
+      if (acquired?.content === content && acquired.record?.pid === process.pid) {
+        return { path, content, dev: acquired.stats.dev, ino: acquired.stats.ino };
+      }
+      if (acquired?.content === content && acquired.stats) {
+        removeVerifiedLockEntry(path, acquired.stats, content, () => isProcessAlive(process.pid));
+      }
+      return null;
+    } catch (error) {
+      if (stageStats) removeVerifiedLockEntry(stagePath, stageStats, content);
+      if (error?.code !== 'EEXIST') return null;
+    }
+  }
+  return null;
+}
+
+function livePinMutationLockMatches(lock) {
+  if (!lock) return false;
+  const state = readLivePinMutationLock(lock.path);
+  return state?.regular
+    && state.content === lock.content
+    && state.record?.pid === process.pid
+    && state.stats.dev === lock.dev
+    && state.stats.ino === lock.ino;
+}
+
+function releaseLivePinMutationLock(lock) {
+  if (!livePinMutationLockMatches(lock)) return;
+  const state = readLivePinMutationLock(lock.path);
+  if (!state || !removeLockStageLink(lock.path, state)) return;
+  const refreshed = readLivePinMutationLock(lock.path);
+  if (refreshed?.content === lock.content && refreshed.record?.pid === process.pid && refreshed.stats.nlink === 1) {
+    removeVerifiedLockEntry(lock.path, refreshed.stats, lock.content, () => isProcessAlive(process.pid));
+  }
+}
+
+function pendingSessionRegistrationName(sessionHash) {
+  return `${LIVE_PIN_PENDING_PREFIX}${sessionHash}.json`;
+}
+
+function readPendingSessionRegistration(pinPath, sessionHash) {
+  const file = readNoFollowText(pinPath, 256, { allowHardLinks: true });
+  if (!file) return null;
+  let record;
+  try { record = JSON.parse(file.content); } catch { return null; }
+  if (
+    record?.version !== 1
+    || record.sessionHash !== sessionHash
+    || Object.keys(record).some((key) => key !== 'version' && key !== 'sessionHash')
+  ) return null;
+  return { ...file, record };
+}
+
+function hasPendingSessionRegistration(pluginRoot, sessionId) {
+  let pinState;
+  try {
+    pinState = livePinDirectory(pluginRoot);
+  } catch {
+    return false;
+  }
+  if (!pinState) return false;
+  try {
+    const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
+    const path = join(pinState.path, pendingSessionRegistrationName(sessionHash));
+    let stats;
+    try {
+      stats = lstatSync(path);
+    } catch (error) {
+      return error?.code !== 'ENOENT';
+    }
+    if (!stats.isFile() || stats.isSymbolicLink() || (stats.nlink !== 1 && stats.nlink !== 2) || stats.size <= 0 || stats.size > 256) return true;
+    const file = readPendingSessionRegistration(path, sessionHash);
+    if (!file || file.stats.dev !== stats.dev || file.stats.ino !== stats.ino) return true;
+    // A valid marker remains retryable regardless of age; only retirement applies
+    // the bounded mtime lease while holding the per-version mutation lock.
+    return true;
+  } finally {
+    closeLivePinDirectory(pinState);
+  }
+}
+
+function renewPendingSessionRegistration(path, expectedStats) {
+  let fd = null;
+  try {
+    const before = lstatSync(path);
+    if (!before.isFile() || before.isSymbolicLink() || (before.nlink !== 1 && before.nlink !== 2) || !sameFileIdentity(before, expectedStats)) return false;
+    fd = openSync(path, fsConstants.O_RDONLY | (fsConstants.O_NOFOLLOW ?? 0));
+    const opened = fstatSync(fd);
+    if (!opened.isFile() || !sameFileIdentity(opened, expectedStats) || opened.nlink !== before.nlink) return false;
+    const now = new Date();
+    futimesSync(fd, now, now);
+    const after = fstatSync(fd);
+    const namedAfter = lstatSync(path);
+    return sameFileIdentity(after, expectedStats)
+      && sameFileIdentity(namedAfter, expectedStats)
+      && namedAfter.nlink === after.nlink;
+  } catch {
+    return false;
+  } finally {
+    if (fd !== null) {
+      try { closeSync(fd); } catch {}
+    }
+  }
+}
+
+function writePendingSessionRegistration(pluginRoot, sessionId) {
+  let pinState;
+  let mutationLock;
+  try {
+    const target = livePinTarget(pluginRoot);
+    if (!target) return false;
+    mutationLock = acquireLivePinMutationLock(target, 'pin');
+    if (!mutationLock) return false;
+    pinState = livePinDirectory(pluginRoot);
+    if (!pinState || pinState.version !== target.version || pinState.cacheBase !== target.cacheBase) return false;
+    const pinDir = pinState.path;
+    try {
+      mkdirSync(pinDir, { mode: 0o700 });
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    }
+    const pinDirStats = lstatSync(pinDir);
+    if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink()) return false;
+    if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState) || !livePinMutationLockMatches(mutationLock)) return false;
+
+    const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
+    const name = pendingSessionRegistrationName(sessionHash);
+    const pendingPath = join(pinDir, name);
+    const content = `${JSON.stringify({ version: 1, sessionHash })}\n`;
+    try {
+      const existingStats = lstatSync(pendingPath);
+      if (!existingStats.isFile() || existingStats.isSymbolicLink() || (existingStats.nlink !== 1 && existingStats.nlink !== 2)) return false;
+      const existing = readPendingSessionRegistration(pendingPath, sessionHash);
+      if (!existing || existing.stats.dev !== existingStats.dev || existing.stats.ino !== existingStats.ino) return false;
+      return renewPendingSessionRegistration(pendingPath, existingStats);
+    } catch (error) {
+      if (error?.code !== 'ENOENT') throw error;
+    }
+
+    const stagePath = join(pinDir, `.stage-${process.pid}-${randomUUID()}`);
+    writeFileSync(stagePath, content, { flag: 'wx', mode: 0o600 });
+    const stageStats = lstatSync(stagePath);
+    if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState) || !livePinMutationLockMatches(mutationLock)) {
+      removeVerifiedLockEntry(stagePath, stageStats, content);
+      return false;
+    }
+    let published = false;
+    try {
+      linkSync(stagePath, pendingPath);
+      published = true;
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error;
+    } finally {
+      removeVerifiedLockEntry(stagePath, stageStats, content);
+    }
+    if (!published) {
+      const existing = readPendingSessionRegistration(pendingPath, sessionHash);
+      if (!existing || !sameFileIdentity(existing.stats, lstatSync(pendingPath))) return false;
+      if (!renewPendingSessionRegistration(pendingPath, existing.stats)) return false;
+    }
+    if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState) || !livePinMutationLockMatches(mutationLock)) return false;
+    return true;
+  } catch {
+    return false;
+  } finally {
+    releaseLivePinMutationLock(mutationLock);
+    closeLivePinDirectory(pinState);
   }
 }
 
@@ -538,6 +854,9 @@ function hasLiveSessionPin(pluginRoot, sessionId) {
   }
   if (!pinState) return true;
   try {
+    const lockPath = join(pinState.cacheBase, livePinMutationLockName(pinState.version));
+    const mutationLock = readLivePinMutationLock(lockPath);
+    if (mutationLock && !removeDeadLivePinMutationLock(lockPath, mutationLock)) return true;
     const entries = readdirSync(pinState.path, { withFileTypes: true });
     for (const entry of entries) {
       const pinPath = join(pinState.path, entry.name);
@@ -552,8 +871,16 @@ function hasLiveSessionPin(pluginRoot, sessionId) {
         if (!stats.isFile() || stats.isSymbolicLink() || !Number.isFinite(ageMs) || ageMs < 0 || ageMs <= 5 * 60 * 1000) return true;
         continue;
       }
+      if (entry.name.startsWith(LIVE_PIN_PENDING_PREFIX)) {
+        const file = readPendingSessionRegistration(pinPath, entry.name.slice(LIVE_PIN_PENDING_PREFIX.length, -'.json'.length));
+        if (!file || file.stats.dev !== stats.dev || file.stats.ino !== stats.ino) return true;
+        continue;
+      }
       if (!entry.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || stats.size <= 0 || stats.size > 4096) return true;
-      const record = readJsonFile(pinPath);
+      const file = readNoFollowText(pinPath, 4096);
+      if (!file || file.stats.dev !== stats.dev || file.stats.ino !== stats.ino) return true;
+      let record;
+      try { record = JSON.parse(file.content); } catch { return true; }
       if (
         record?.version !== 1
         || !Number.isSafeInteger(record.pid)
@@ -563,10 +890,7 @@ function hasLiveSessionPin(pluginRoot, sessionId) {
         || !/^[0-9a-f]{64}$/.test(record.sessionHash)
       ) return true;
       if (isProcessAlive(record.pid)) {
-        if (record.sessionHash === sessionHash && record.processStartHash) {
-          const currentProcessStartHash = readProcessStartHash(record.pid);
-          if (currentProcessStartHash === record.processStartHash) return true;
-        }
+        if (record.sessionHash === sessionHash) return true;
         continue;
       }
       try {
@@ -585,9 +909,14 @@ function hasLiveSessionPin(pluginRoot, sessionId) {
 
 function writePendingSessionPin(pluginRoot, sessionId) {
   let pinState;
+  let mutationLock;
   try {
+    const target = livePinTarget(pluginRoot);
+    if (!target) return null;
+    mutationLock = acquireLivePinMutationLock(target, 'pin');
+    if (!mutationLock) return null;
     pinState = livePinDirectory(pluginRoot);
-    if (!pinState || !livePinRootMatches(pinState)) return null;
+    if (!pinState || pinState.version !== target.version || pinState.cacheBase !== target.cacheBase || !livePinRootMatches(pinState)) return null;
     const pinDir = pinState.path;
     try {
       mkdirSync(pinDir, { mode: 0o700 });
@@ -596,7 +925,7 @@ function writePendingSessionPin(pluginRoot, sessionId) {
     }
     const pinDirStats = lstatSync(pinDir);
     if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink()) return null;
-    if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState)) return null;
+    if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState) || !livePinMutationLockMatches(mutationLock)) return null;
     const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
     const record = {
       version: 1,
@@ -612,12 +941,12 @@ function writePendingSessionPin(pluginRoot, sessionId) {
     const cleanupPath = join(pluginRoot, '.omx-live-pin', pinName);
     try {
       writeFileSync(stagePath, content, { flag: 'wx', mode: 0o600 });
-      if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState)) {
+      if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState) || !livePinMutationLockMatches(mutationLock)) {
         removePendingSessionPin(stagePath);
         return null;
       }
       renameSync(stagePath, pinPath);
-      if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState)) {
+      if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState) || !livePinMutationLockMatches(mutationLock)) {
         removePendingSessionPin(pinPath);
         return null;
       }
@@ -629,6 +958,7 @@ function writePendingSessionPin(pluginRoot, sessionId) {
   } catch {
     return null;
   } finally {
+    releaseLivePinMutationLock(mutationLock);
     closeLivePinDirectory(pinState);
   }
 }
@@ -653,6 +983,14 @@ function isTerminalRunStateForMode(state, mode) {
     || isTerminalOutcome(state.run_outcome)
     || isTerminalOutcome(state.lifecycle_outcome)
     || isTerminalOutcome(state.terminal_outcome);
+}
+
+function sameLexicalFilePath(leftPath, rightPath) {
+  const left = resolve(leftPath);
+  const right = resolve(rightPath);
+  return process.platform === 'win32'
+    ? left.toLowerCase() === right.toLowerCase()
+    : left === right;
 }
 
 function canonicalPath(path) {
@@ -812,10 +1150,12 @@ async function main() {
 
   let pinnedLauncherAtStart = null;
   let pinnedLauncherReadError = null;
-  try {
-    pinnedLauncherAtStart = readPinnedLauncher();
-  } catch (error) {
-    pinnedLauncherReadError = error;
+  if (startupPendingPin) {
+    try {
+      pinnedLauncherAtStart = readPinnedLauncher();
+    } catch (error) {
+      pinnedLauncherReadError = error;
+    }
   }
   let configuredLauncherAtStart = null;
   let configuredLauncherError = null;
@@ -837,21 +1177,22 @@ async function main() {
   const isCompact = detectCompactHookInput(input);
   const sessionId = payload?.session_id ?? payload?.sessionId;
   const sessionStart = (payload?.hook_event_name ?? payload?.hookEventName ?? payload?.event ?? payload?.name) === 'SessionStart';
-  let pendingPin = null;
-  if (
-    !oversized
+  const validSessionId = !oversized
     && typeof sessionId === 'string'
-    && sessionId.trim()
-    && sessionId.trim().length <= 256
-    // SessionStart also refreshes process identity for resumed sessions.
-    && (sessionStart || !hasLiveSessionPin(pluginRoot, sessionId))
-  ) {
+    && sessionId.trim().length > 0
+    && sessionId.trim().length <= 256;
+  const pendingRegistration = validSessionId && Boolean(startupPendingPin) && hasPendingSessionRegistration(pluginRoot, sessionId);
+  let pinRegistrationPending = false;
+  let pendingPin = null;
+  if (validSessionId && startupPendingPin && (sessionStart || pendingRegistration || !hasLiveSessionPin(pluginRoot, sessionId))) {
+    pinRegistrationPending = true;
+    writePendingSessionRegistration(pluginRoot, sessionId);
     pendingPin = startupPendingPin ?? writePendingSessionPin(pluginRoot, sessionId);
   }
 
   if (!routedByLaunchCorrelation) {
-    const pinLauncher = process.env.OMX_NATIVE_HOOK_COMMAND ? configuredLauncherAtStart : pinnedLauncherAtStart;
-    if (pendingPin) await pinUnroutedSession(input, pinLauncher, pluginRoot, pendingPin);
+    const pinLauncher = configuredLauncherAtStart;
+    if (pinRegistrationPending) await pinUnroutedSession(input, pinLauncher, pluginRoot, pendingPin);
     writePlainCodexNoop(isStop);
     return;
   }
@@ -885,7 +1226,7 @@ async function main() {
 
   const { command, argsPrefix } = configuredLauncherAtStart;
   const extraEnv = { OMX_PLUGIN_ROOT: pluginRoot };
-  if (pendingPin) extraEnv.OMX_PLUGIN_CACHE_PIN_PENDING = '1';
+  if (pinRegistrationPending) extraEnv.OMX_PLUGIN_CACHE_PIN_PENDING = '1';
   const child = spawn(
     command,
     [...argsPrefix, 'codex-native-hook'],
