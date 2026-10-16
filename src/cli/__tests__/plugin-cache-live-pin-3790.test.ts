@@ -366,7 +366,7 @@ describe("issue 3790 live plugin cache pins", () => {
 				const packaged = await resolvePackagedOmxMarketplace(packageRoot);
 				assert.ok(packaged);
 				const pluginManifest = JSON.parse(await readFile(packaged.pluginManifestPath, "utf-8")) as { version: string };
-				assert.equal(pluginManifest.version, "0.21.15");
+				assert.equal(pluginManifest.version, "0.21.16");
 
 				const published = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
 				assert.equal(published.status, "materialized");
@@ -1150,14 +1150,45 @@ syncBuiltinESMExports();
 					process.pid,
 					"pin",
 				);
-				const registration = registerOmxPluginCacheLivePin(
-					pluginRoot,
-					"pin-lock-identity-wait-session",
-					process.pid,
-				);
-				await new Promise((resolveWait) => setTimeout(resolveWait, 1_250));
-				await rm(lock.path);
-				assert.equal(await registration, true);
+				const originalSetTimeout = globalThis.setTimeout;
+				let observeContention!: () => void;
+				let contentionObserved = false;
+				const pinLockContention = new Promise<void>((resolveContention) => {
+					observeContention = resolveContention;
+				});
+				globalThis.setTimeout = ((...args: Parameters<typeof globalThis.setTimeout>) => {
+					if (args[1] === 20 && !contentionObserved) {
+						contentionObserved = true;
+						observeContention();
+					}
+					return originalSetTimeout(...args);
+				}) as typeof globalThis.setTimeout;
+				let contentionTimeout: ReturnType<typeof setTimeout> | undefined;
+				try {
+					const registration = registerOmxPluginCacheLivePin(
+						pluginRoot,
+						"pin-lock-identity-wait-session",
+						process.pid,
+					);
+					await Promise.race([
+						pinLockContention,
+						registration.then(() => {
+							throw new Error("pin registration completed before the competing lock was released");
+						}),
+						new Promise<never>((_, reject) => {
+							contentionTimeout = originalSetTimeout(
+								() => reject(new Error("pin registration did not observe mutation-lock contention")),
+								5_000,
+							);
+						}),
+					]);
+					if (contentionTimeout) clearTimeout(contentionTimeout);
+					await rm(lock.path);
+					assert.equal(await registration, true);
+				} finally {
+					if (contentionTimeout) clearTimeout(contentionTimeout);
+					globalThis.setTimeout = originalSetTimeout;
+				}
 				const competingRetirement = await writeLivePinMutationLock(
 					codexHomeDir,
 					"0.20.0",
