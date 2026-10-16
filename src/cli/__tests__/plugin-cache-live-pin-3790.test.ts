@@ -406,7 +406,7 @@ setInterval(() => {}, 60_000);
 					let pendingEntries: string[] = [];
 					for (let attempt = 0; attempt < 100; attempt += 1) {
 						try {
-							pendingEntries = await readdir(pinDirectory);
+							pendingEntries = (await readdir(pinDirectory)).filter((name) => name.startsWith(".pending-"));
 							if (pendingEntries.length > 0) break;
 						} catch {
 						// The launcher may not have created its startup guard yet.
@@ -1023,7 +1023,7 @@ syncBuiltinESMExports();
 		}
 	});
 
-	it("leaves an expired pending marker intact until lock-owning retirement", async () => {
+	it("reclaims expired pending markers while preserving live snapshots", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-3790-expired-pending-marker-"));
 		try {
 			await withIsolatedUserHome(wd, async (codexHomeDir) => {
@@ -1033,26 +1033,15 @@ syncBuiltinESMExports();
 				const sessionHash = createHash("sha256").update("expired-pending-session").digest("hex");
 				const pinDirectory = join(snapshots[0]!, ".omx-live-pin");
 				await mkdir(pinDirectory);
+				assert.equal(await registerOmxPluginCacheLivePin(snapshots[0]!, "pending-marker-live-session", process.pid), true);
 				const pendingPath = join(pinDirectory, `.pending-${sessionHash}.json`);
 				await writeFile(pendingPath, `${JSON.stringify({ version: 1, sessionHash })}\n`);
 				const expiredAt = new Date(Date.now() - 6 * 60 * 1000);
 				await utimes(pendingPath, expiredAt, expiredAt);
-				let observedBeforeDestruction = false;
-				const resetHooks = setPluginCacheMutationHooksForTest({
-					beforeRemove: async (quarantinePath) => {
-						if (!quarantinePath.includes(".0.20.0.reclaim-")) return;
-						await lstat(join(quarantinePath, ".omx-live-pin", `.pending-${sessionHash}.json`));
-						observedBeforeDestruction = true;
-					},
-				});
-				try {
-					const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.3");
-					assert.equal(observedBeforeDestruction, true);
-					assert.equal(retired.includes(snapshots[0]!), true);
-					await assert.rejects(lstat(snapshots[0]!), { code: "ENOENT" });
-				} finally {
-					resetHooks();
-				}
+				const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.3");
+				assert.equal(retired.includes(snapshots[0]!), false);
+				await lstat(snapshots[0]!);
+				await assert.rejects(lstat(pendingPath), { code: "ENOENT" });
 			});
 		} finally {
 			await rm(wd, { recursive: true, force: true });
@@ -1111,10 +1100,21 @@ syncBuiltinESMExports();
 						`.stage-omx-live-pin-intent-${versionHash}-${sessionHash}-99999-abandoned`,
 					);
 					const content = `${JSON.stringify({ version: 1, cacheVersion: version, sessionHash })}\n`;
+					const snapshot = snapshots[version === "0.20.1" ? 1 : 2]!;
+					const pinDirectory = join(snapshot, ".omx-live-pin");
+					const pendingPinPath = join(pinDirectory, `.pending-${sessionHash}.json`);
+					const pinStagePath = join(pinDirectory, `.stage-pending-${sessionHash}-99999-abandoned`);
+					const pinContent = `${JSON.stringify({ version: 1, sessionHash })}\n`;
+					await mkdir(pinDirectory);
 					await writeFile(intentPath, content);
 					await writeFile(stagePath, content);
+					await writeFile(pendingPinPath, pinContent);
+					await writeFile(pinStagePath, pinContent);
 					await utimes(intentPath, expiredAt, expiredAt);
 					await utimes(stagePath, expiredAt, expiredAt);
+					await utimes(pendingPinPath, expiredAt, expiredAt);
+					await utimes(pinStagePath, expiredAt, expiredAt);
+					await utimes(pinDirectory, expiredAt, expiredAt);
 				}
 
 				const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.2");
@@ -1129,6 +1129,9 @@ syncBuiltinESMExports();
 						lstat(join(cacheBase, `.stage-omx-live-pin-intent-${versionHash}-${sessionHash}-99999-abandoned`)),
 						{ code: "ENOENT" },
 					);
+					const pinDirectory = join(snapshots[version === "0.20.1" ? 1 : 2]!, ".omx-live-pin");
+					await assert.rejects(lstat(join(pinDirectory, `.pending-${sessionHash}.json`)), { code: "ENOENT" });
+					await assert.rejects(lstat(join(pinDirectory, `.stage-pending-${sessionHash}-99999-abandoned`)), { code: "ENOENT" });
 					await lstat(snapshots[version === "0.20.1" ? 1 : 2]!);
 				}
 			});
@@ -1237,6 +1240,313 @@ syncBuiltinESMExports();
 				assert.equal(retired.includes(snapshots[1]!), true);
 				await lstat(pluginRoot);
 				await assert.rejects(lstat(snapshots[1]!), { code: "ENOENT" });
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("rejects a stale session pin when startup pin publication is blocked", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-stale-pin-fallback-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const pluginRoot = await seedManagedSnapshot(codexHomeDir, "0.20.0");
+				const cacheBase = omxPluginCacheBase(codexHomeDir);
+				const sessionId = "reused-pid-fallback-session";
+				const sessionHash = createHash("sha256").update(sessionId).digest("hex");
+				const staleProcessStartHash = "0".repeat(24);
+				const pinDirectory = join(pluginRoot, ".omx-live-pin");
+				await mkdir(pinDirectory);
+				await writeFile(
+					join(pinDirectory, `pin-${process.pid}-${sessionHash.slice(0, 24)}-${staleProcessStartHash}.json`),
+					`${JSON.stringify({ version: 1, pid: process.pid, processStartHash: staleProcessStartHash, sessionHash })}\n`,
+				);
+				const mutationLock = await writeLivePinMutationLock(codexHomeDir, "0.20.0", process.pid, "pin");
+				const versionHash = createHash("sha256").update("0.20.0").digest("hex").slice(0, 24);
+				const intentLockPath = join(cacheBase, `.omx-live-pin-intent-${versionHash}.lock`);
+				const lockContent = `${JSON.stringify({
+					version: 1,
+					pid: process.pid,
+					operation: "pin",
+					token: "22222222-2222-4222-8222-222222222222",
+				})}\n`;
+				await writeFile(intentLockPath, lockContent);
+				const launcherInvokedPath = join(wd, "launcher-invoked-with-stale-pin");
+				await writeFile(
+					join(wd, "codex-native-hook"),
+					"require('node:fs').writeFileSync(process.env.OMX_TEST_LAUNCHER_INVOKED, 'invoked');\nprocess.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n",
+				);
+
+				const hookResult = spawnSync(process.execPath, [join(pluginRoot, "hooks", "codex-native-hook.mjs")], {
+					cwd: wd,
+					input: JSON.stringify({ hook_event_name: "SessionStart", session_id: sessionId, codex_pid: process.pid, cwd: wd }),
+					encoding: "utf-8",
+					env: { ...process.env, CODEX_HOME: codexHomeDir, OMX_NATIVE_HOOK_COMMAND: process.execPath, OMX_TEST_LAUNCHER_INVOKED: launcherInvokedPath },
+				});
+
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				await assert.rejects(lstat(launcherInvokedPath), { code: "ENOENT" });
+				assert.equal(await readFile(mutationLock.path, "utf-8"), mutationLock.content);
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("re-registers an aged same-session pin before non-start hooks", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-aged-session-pin-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const pluginRoot = await seedManagedSnapshot(codexHomeDir, "0.20.0");
+				const sessionId = "aged-same-session-pin";
+				const sessionHash = createHash("sha256").update(sessionId).digest("hex");
+				const staleProcessStartHash = "a".repeat(24);
+				const pinDirectory = join(pluginRoot, ".omx-live-pin");
+				await mkdir(pinDirectory);
+				const stalePinPath = join(pinDirectory, `pin-${process.pid}-${sessionHash.slice(0, 24)}-${staleProcessStartHash}.json`);
+				await writeFile(
+					stalePinPath,
+					`${JSON.stringify({ version: 1, pid: process.pid, processStartHash: staleProcessStartHash, sessionHash })}\n`,
+				);
+				const expiredAt = new Date(Date.now() - 6 * 60 * 1000);
+				await utimes(stalePinPath, expiredAt, expiredAt);
+
+				const hookResult = spawnSync(process.execPath, [join(pluginRoot, "hooks", "codex-native-hook.mjs")], {
+					cwd: wd,
+					input: JSON.stringify({ hook_event_name: "UserPromptSubmit", session_id: sessionId, codex_pid: process.pid, cwd: wd }),
+					encoding: "utf-8",
+					env: { ...process.env, CODEX_HOME: codexHomeDir },
+				});
+
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				const pinRecords = await Promise.all(
+					(await readdir(pinDirectory))
+						.filter((name) => name.startsWith("pin-"))
+						.map(async (name) => JSON.parse(await readFile(join(pinDirectory, name), "utf-8")) as { processStartHash: string | null; sessionHash: string }),
+				);
+				assert.ok(pinRecords.some((record) => record.sessionHash === sessionHash && record.processStartHash !== staleProcessStartHash));
+				const currentPinName = (await readdir(pinDirectory)).find((name) => {
+					if (!name.startsWith("pin-")) return false;
+					return name.includes(`-${sessionHash.slice(0, 24)}-`) && !name.endsWith(`-${staleProcessStartHash}.json`);
+				});
+				assert.ok(currentPinName);
+				const currentPinPath = join(pinDirectory, currentPinName);
+				await utimes(currentPinPath, expiredAt, expiredAt);
+				assert.equal(await registerOmxPluginCacheLivePin(pluginRoot, sessionId, process.pid), true);
+				assert.ok((await lstat(currentPinPath)).mtimeMs > expiredAt.getTime());
+				await assert.rejects(lstat(livePinIntentPath(codexHomeDir, "0.20.0", sessionId)), { code: "ENOENT" });
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when startup pin leases are expired", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-expired-startup-lease-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const pluginRoot = await seedManagedSnapshot(codexHomeDir, "0.20.0");
+				const preloadPath = join(wd, "expire-startup-leases.mjs");
+				await writeFile(preloadPath, `
+const realNow = Date.now;
+Date.now = () => realNow() + 6 * 60 * 1000;
+`);
+				const launcherInvokedPath = join(wd, "launcher-invoked-with-expired-lease");
+				await writeFile(
+					join(wd, "codex-native-hook"),
+					"require('node:fs').writeFileSync(process.env.OMX_TEST_LAUNCHER_INVOKED, 'invoked');\nprocess.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n",
+				);
+
+				const hookResult = spawnSync(
+					process.execPath,
+					["--import", preloadPath, join(pluginRoot, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						input: JSON.stringify({ hook_event_name: "SessionStart", session_id: "expired-startup-session", cwd: wd }),
+						encoding: "utf-8",
+						env: { ...process.env, CODEX_HOME: codexHomeDir, OMX_NATIVE_HOOK_COMMAND: process.execPath, OMX_TEST_LAUNCHER_INVOKED: launcherInvokedPath },
+					},
+				);
+
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				await assert.rejects(lstat(launcherInvokedPath), { code: "ENOENT" });
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("renews the temporary pin when startup intent renewal fails", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-startup-pin-renewal-fallback-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const pluginRoot = await seedManagedSnapshot(codexHomeDir, "0.20.0");
+				const versionHash = createHash("sha256").update("0.20.0").digest("hex").slice(0, 24);
+				const intentLockPath = join(omxPluginCacheBase(codexHomeDir), `.omx-live-pin-intent-${versionHash}.lock`);
+				const preloadPath = join(wd, "renew-startup-pin-after-intent-failure.mjs");
+				await writeFile(preloadPath, `
+import fs from "node:fs";
+const RealDate = Date;
+let virtualNow = RealDate.now();
+globalThis.Date = class extends RealDate {
+	constructor(...args) { super(...(args.length ? args : [virtualNow])); }
+	static now() { return virtualNow; }
+};
+const originalSetInterval = globalThis.setInterval;
+let intervalCount = 0;
+globalThis.setInterval = function (callback, delay, ...args) {
+	if (delay === 60_000) {
+		intervalCount += 1;
+		if (intervalCount === 1) {
+			virtualNow = RealDate.now() + 6 * 60 * 1000;
+			const content = JSON.stringify({ version: 1, pid: process.pid, operation: "pin", token: "44444444-4444-4444-8444-444444444444" }) + "\\n";
+			fs.writeFileSync(process.env.OMX_TEST_INTENT_LOCK, content, { flag: "wx", mode: 0o600 });
+		}
+		callback();
+		return { unref() {} };
+	}
+	return originalSetInterval(callback, delay, ...args);
+};
+globalThis.clearInterval = () => {};
+`);
+				const launcherInvokedPath = join(wd, "launcher-invoked-after-pin-renewal");
+				await writeFile(
+					join(wd, "codex-native-hook"),
+					"require('node:fs').writeFileSync(process.env.OMX_TEST_LAUNCHER_INVOKED, 'invoked');\nprocess.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n",
+				);
+
+				const hookResult = spawnSync(
+					process.execPath,
+					["--import", preloadPath, join(pluginRoot, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						input: JSON.stringify({ hook_event_name: "SessionStart", session_id: "renewed-startup-pin-session", cwd: wd }),
+						encoding: "utf-8",
+						env: {
+							...process.env,
+							CODEX_HOME: codexHomeDir,
+							OMX_NATIVE_HOOK_COMMAND: process.execPath,
+							OMX_TEST_INTENT_LOCK: intentLockPath,
+							OMX_TEST_LAUNCHER_INVOKED: launcherInvokedPath,
+						},
+					},
+				);
+
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				await lstat(intentLockPath);
+				await lstat(launcherInvokedPath);
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when startup intent renewal loses its lock", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-startup-intent-renewal-failure-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const pluginRoot = await seedManagedSnapshot(codexHomeDir, "0.20.0");
+				const versionHash = createHash("sha256").update("0.20.0").digest("hex").slice(0, 24);
+				const cacheBase = omxPluginCacheBase(codexHomeDir);
+				const intentLockPath = join(cacheBase, `.omx-live-pin-intent-${versionHash}.lock`);
+				const mutationLockPath = livePinMutationLockPath(codexHomeDir, "0.20.0");
+				const preloadPath = join(wd, "block-startup-lease-renewal.mjs");
+				await writeFile(preloadPath, `
+import fs from "node:fs";
+const originalSetInterval = globalThis.setInterval;
+let blocked = false;
+globalThis.setInterval = function (callback, delay, ...args) {
+	if (!blocked && delay === 60_000) {
+		blocked = true;
+		const content = JSON.stringify({ version: 1, pid: process.pid, operation: "pin", token: "33333333-3333-4333-8333-333333333333" }) + "\\n";
+		fs.writeFileSync(process.env.OMX_TEST_INTENT_LOCK, content, { flag: "wx", mode: 0o600 });
+		fs.writeFileSync(process.env.OMX_TEST_MUTATION_LOCK, content, { flag: "wx", mode: 0o600 });
+		callback();
+		return { unref() {} };
+	}
+	return originalSetInterval(callback, delay, ...args);
+};
+globalThis.clearInterval = () => {};
+`);
+				const launcherInvokedPath = join(wd, "launcher-invoked-with-unrenewed-intent");
+				await writeFile(
+					join(wd, "codex-native-hook"),
+					"require('node:fs').writeFileSync(process.env.OMX_TEST_LAUNCHER_INVOKED, 'invoked');\nprocess.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n",
+				);
+
+				const hookResult = spawnSync(
+					process.execPath,
+					["--import", preloadPath, join(pluginRoot, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						input: JSON.stringify({ hook_event_name: "SessionStart", session_id: "unrenewed-startup-session", cwd: wd }),
+						encoding: "utf-8",
+						env: {
+							...process.env,
+							CODEX_HOME: codexHomeDir,
+							OMX_NATIVE_HOOK_COMMAND: process.execPath,
+							OMX_TEST_INTENT_LOCK: intentLockPath,
+							OMX_TEST_MUTATION_LOCK: mutationLockPath,
+							OMX_TEST_LAUNCHER_INVOKED: launcherInvokedPath,
+						},
+					},
+				);
+
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				await lstat(intentLockPath);
+				await lstat(mutationLockPath);
+				await assert.rejects(lstat(launcherInvokedPath), { code: "ENOENT" });
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("fails closed when managed-cache identity probing fails", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-managed-cache-probe-failure-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const pluginRoot = await seedManagedSnapshot(codexHomeDir, "0.20.0");
+				const preloadPath = join(wd, "fail-managed-cache-probe.mjs");
+				await writeFile(preloadPath, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const originalLstatSync = fs.lstatSync;
+fs.lstatSync = function (path, ...args) {
+	if (typeof path === "string" && path === process.env.OMX_TEST_CACHE_BASE) {
+		const error = new Error("injected cache-base access failure");
+		error.code = "EACCES";
+		throw error;
+	}
+	return originalLstatSync.call(this, path, ...args);
+};
+syncBuiltinESMExports();
+`);
+				const launcherInvokedPath = join(wd, "launcher-invoked-after-probe-failure");
+				await writeFile(
+					join(wd, "codex-native-hook"),
+					"require('node:fs').writeFileSync(process.env.OMX_TEST_LAUNCHER_INVOKED, 'invoked');\nprocess.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n",
+				);
+
+				const hookResult = spawnSync(
+					process.execPath,
+					["--import", preloadPath, join(pluginRoot, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						input: JSON.stringify({ hook_event_name: "SessionStart", session_id: "cache-probe-failure-session", cwd: wd }),
+						encoding: "utf-8",
+						env: {
+							...process.env,
+							CODEX_HOME: codexHomeDir,
+							OMX_NATIVE_HOOK_COMMAND: process.execPath,
+							OMX_TEST_CACHE_BASE: omxPluginCacheBase(codexHomeDir),
+							OMX_TEST_LAUNCHER_INVOKED: launcherInvokedPath,
+						},
+					},
+				);
+
+				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
+				await assert.rejects(lstat(launcherInvokedPath), { code: "ENOENT" });
 			});
 		} finally {
 			await rm(wd, { recursive: true, force: true });
