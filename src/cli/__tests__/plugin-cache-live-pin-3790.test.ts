@@ -414,8 +414,13 @@ setInterval(() => {}, 60_000);
 						await new Promise((resolveWait) => setTimeout(resolveWait, 10));
 					}
 					assert.equal(pendingEntries.length, 1, "startup pin must exist while the wrapper waits for stdin");
-					const pending = JSON.parse(await readFile(join(pinDirectory, pendingEntries[0]!), "utf-8")) as { pid: number };
-					assert.equal(pending.pid, hook.pid);
+					const pending = JSON.parse(await readFile(join(pinDirectory, pendingEntries[0]!), "utf-8")) as {
+						version: number;
+						sessionHash: string;
+					};
+					assert.equal(pending.version, 1);
+					assert.match(pending.sessionHash, /^[0-9a-f]{64}$/);
+					assert.equal(pendingEntries[0], `.pending-${pending.sessionHash}.json`);
 
 					const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.2");
 					assert.equal(retired.includes(pluginRoot), false);
@@ -812,8 +817,12 @@ syncBuiltinESMExports();
 				const versionHash = createHash("sha256").update("0.20.0").digest("hex").slice(0, 24);
 				const readyPath = join(wd, "intent-writer-ready");
 				const releasePath = join(wd, "intent-writer-release");
+				const launcherInvokedPath = join(wd, "launcher-invoked-without-pin");
 				const preloadPath = join(wd, "pause-before-intent-lock.mjs");
-				await writeFile(join(wd, "codex-native-hook"), "process.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n");
+				await writeFile(
+					join(wd, "codex-native-hook"),
+					"process.env.OMX_TEST_LAUNCHER_INVOKED && require('node:fs').writeFileSync(process.env.OMX_TEST_LAUNCHER_INVOKED, 'invoked');\nprocess.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n",
+				);
 				await writeFile(preloadPath, `
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
@@ -842,6 +851,7 @@ syncBuiltinESMExports();
 							OMX_NATIVE_HOOK_COMMAND: process.execPath,
 							OMX_TEST_INTENT_READY: readyPath,
 							OMX_TEST_INTENT_RELEASE: releasePath,
+							OMX_TEST_LAUNCHER_INVOKED: launcherInvokedPath,
 						},
 					},
 				);
@@ -886,6 +896,7 @@ syncBuiltinESMExports();
 					assert.equal(retired.includes(pluginRoot), true);
 					assert.equal(retired.includes(snapshots[1]!), true);
 					await assert.rejects(lstat(pluginRoot), { code: "ENOENT" });
+					await assert.rejects(lstat(launcherInvokedPath), { code: "ENOENT" });
 					const intentPrefix = `.omx-live-pin-intent-${versionHash}-`;
 					assert.equal((await readdir(omxPluginCacheBase(codexHomeDir))).some((name) => name.startsWith(intentPrefix)), false);
 				} finally {
