@@ -700,6 +700,21 @@ function livePinMutationLockMatches(lock) {
     && state.stats.ino === lock.ino;
 }
 
+function hasLivePinMutationLock(pluginRoot) {
+  let target;
+  try {
+    target = livePinTarget(pluginRoot);
+  } catch {
+    return true;
+  }
+  if (!target) return false;
+  try {
+    return readLivePinMutationLock(join(target.cacheBase, livePinMutationLockName(target.version))) !== null;
+  } catch {
+    return true;
+  }
+}
+
 function releaseLivePinMutationLock(lock) {
   if (!livePinMutationLockMatches(lock)) return;
   const state = readLivePinMutationLock(lock.path);
@@ -781,12 +796,9 @@ function renewPendingSessionRegistration(path, expectedStats) {
 
 function writePendingSessionRegistration(pluginRoot, sessionId) {
   let pinState;
-  let mutationLock;
   try {
     const target = livePinTarget(pluginRoot);
     if (!target) return false;
-    mutationLock = acquireLivePinMutationLock(target, 'pin');
-    if (!mutationLock) return false;
     pinState = livePinDirectory(pluginRoot);
     if (!pinState || pinState.version !== target.version || pinState.cacheBase !== target.cacheBase) return false;
     const pinDir = pinState.path;
@@ -797,7 +809,7 @@ function writePendingSessionRegistration(pluginRoot, sessionId) {
     }
     const pinDirStats = lstatSync(pinDir);
     if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink()) return false;
-    if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState) || !livePinMutationLockMatches(mutationLock)) return false;
+    if (process.platform !== 'linux' && !livePinRootMatches(pinState)) return false;
 
     const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
     const name = pendingSessionRegistrationName(sessionHash);
@@ -816,7 +828,7 @@ function writePendingSessionRegistration(pluginRoot, sessionId) {
     const stagePath = join(pinDir, `.stage-${process.pid}-${randomUUID()}`);
     writeFileSync(stagePath, content, { flag: 'wx', mode: 0o600 });
     const stageStats = lstatSync(stagePath);
-    if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState) || !livePinMutationLockMatches(mutationLock)) {
+    if (process.platform !== 'linux' && !livePinRootMatches(pinState)) {
       removeVerifiedLockEntry(stagePath, stageStats, content);
       return false;
     }
@@ -834,12 +846,13 @@ function writePendingSessionRegistration(pluginRoot, sessionId) {
       if (!existing || !sameFileIdentity(existing.stats, lstatSync(pendingPath))) return false;
       if (!renewPendingSessionRegistration(pendingPath, existing.stats)) return false;
     }
-    if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState) || !livePinMutationLockMatches(mutationLock)) return false;
+    // A pending marker is an intent, not a committed pin. Publish it even while
+    // retirement owns the sidecar lock so the retiree's final pin check can
+    // preserve this snapshot; the lock-owning CLI writer commits the durable pin.
     return true;
   } catch {
     return false;
   } finally {
-    releaseLivePinMutationLock(mutationLock);
     closeLivePinDirectory(pinState);
   }
 }
@@ -1150,7 +1163,7 @@ async function main() {
 
   let pinnedLauncherAtStart = null;
   let pinnedLauncherReadError = null;
-  if (startupPendingPin) {
+  if (startupPendingPin || !hasLivePinMutationLock(pluginRoot)) {
     try {
       pinnedLauncherAtStart = readPinnedLauncher();
     } catch (error) {
@@ -1181,10 +1194,10 @@ async function main() {
     && typeof sessionId === 'string'
     && sessionId.trim().length > 0
     && sessionId.trim().length <= 256;
-  const pendingRegistration = validSessionId && Boolean(startupPendingPin) && hasPendingSessionRegistration(pluginRoot, sessionId);
+  const pendingRegistration = validSessionId && hasPendingSessionRegistration(pluginRoot, sessionId);
   let pinRegistrationPending = false;
   let pendingPin = null;
-  if (validSessionId && startupPendingPin && (sessionStart || pendingRegistration || !hasLiveSessionPin(pluginRoot, sessionId))) {
+  if (validSessionId && (sessionStart || pendingRegistration || !hasLiveSessionPin(pluginRoot, sessionId))) {
     pinRegistrationPending = true;
     writePendingSessionRegistration(pluginRoot, sessionId);
     pendingPin = startupPendingPin ?? writePendingSessionPin(pluginRoot, sessionId);

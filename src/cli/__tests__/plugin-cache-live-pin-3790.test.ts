@@ -759,7 +759,7 @@ syncBuiltinESMExports();
 		}
 	});
 
-	it("does not read a snapshot while an aged retirement lock has a live owner", async () => {
+	it("keeps a session pending pin when a live retirement lock blocks startup pinning", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-3790-retirement-lock-wins-"));
 		try {
 			await withIsolatedUserHome(wd, async (codexHomeDir) => {
@@ -771,23 +771,19 @@ syncBuiltinESMExports();
 				const expiredAt = new Date(Date.now() - 6 * 60 * 1000);
 				await utimes(lock.path, expiredAt, expiredAt);
 				const preloadPath = join(wd, "assert-no-unlocked-snapshot-read.mjs");
-				const violationPath = join(wd, "snapshot-read-while-retiring");
+				const violationPath = join(wd, "launcher-read-while-retiring");
 				await writeFile(
 					preloadPath,
 					`
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
 const root = process.env.OMX_TEST_SNAPSHOT_ROOT;
-const lockPath = process.env.OMX_TEST_LOCK_PATH;
 const originalLstatSync = fs.lstatSync;
 const originalReadFileSync = fs.readFileSync;
 const originalWriteFileSync = fs.writeFileSync;
 function checkSnapshotPath(path) {
-	if (typeof path !== "string" || !path.startsWith(root)) return;
-	try {
-		const lock = JSON.parse(originalReadFileSync.call(fs, lockPath, "utf8"));
-		if (lock.operation === "retire") originalWriteFileSync.call(fs, process.env.OMX_TEST_VIOLATION_PATH, path);
-	} catch {}
+	if (typeof path !== "string" || !path.startsWith(root) || !path.endsWith("/hooks/omx-command.json")) return;
+	try { originalWriteFileSync.call(fs, process.env.OMX_TEST_VIOLATION_PATH, path); } catch {}
 }
 fs.lstatSync = function (path, ...args) { checkSnapshotPath(path); return originalLstatSync.call(this, path, ...args); };
 fs.readFileSync = function (path, ...args) { checkSnapshotPath(path); return originalReadFileSync.call(this, path, ...args); };
@@ -810,7 +806,6 @@ syncBuiltinESMExports();
 							...process.env,
 							CODEX_HOME: codexHomeDir,
 							OMX_TEST_SNAPSHOT_ROOT: pluginRoot,
-							OMX_TEST_LOCK_PATH: lock.path,
 							OMX_TEST_VIOLATION_PATH: violationPath,
 						},
 					},
@@ -819,7 +814,15 @@ syncBuiltinESMExports();
 				assert.equal(hookResult.status, 0, hookResult.stderr || hookResult.stdout);
 				await assert.rejects(lstat(violationPath), { code: "ENOENT" });
 				assert.equal(await readFile(lock.path, "utf-8"), lock.content);
+				const sessionHash = createHash("sha256").update("retirement-lock-session").digest("hex");
+				const pendingPath = join(pluginRoot, ".omx-live-pin", `.pending-${sessionHash}.json`);
+				assert.equal(JSON.parse(await readFile(pendingPath, "utf-8")).sessionHash, sessionHash);
+				await rm(lock.path);
+				const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.3");
+				assert.equal(retired.includes(pluginRoot), false);
+				assert.equal(retired.includes(snapshots[1]!), true);
 				await lstat(pluginRoot);
+				await assert.rejects(lstat(snapshots[1]!), { code: "ENOENT" });
 			});
 		} finally {
 			await rm(wd, { recursive: true, force: true });
