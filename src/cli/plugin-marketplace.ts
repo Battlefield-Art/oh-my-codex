@@ -1176,7 +1176,11 @@ async function isLivePinOwnerAlive(record: OmxPluginCacheLivePinRecord): Promise
 	return isProcessOwnerAlive(record.pid, record.processStartHash);
 }
 
-async function hasLivePinIntent(cacheBaseRef: DirectoryRef, version: string): Promise<boolean> {
+async function hasLivePinIntent(
+	cacheBaseRef: DirectoryRef,
+	version: string,
+	mutationLockContent?: string,
+): Promise<boolean> {
 	const versionHash = omxPluginCacheLivePinVersionHash(version);
 	const intentPrefix = `${OMX_PLUGIN_LIVE_PIN_INTENT_PREFIX}${versionHash}-`;
 	const stagePrefix = `${OMX_PLUGIN_LIVE_PIN_INTENT_STAGE_PREFIX}${versionHash}-`;
@@ -1200,7 +1204,28 @@ async function hasLivePinIntent(cacheBaseRef: DirectoryRef, version: string): Pr
 		if (!stats.isFile() || stats.isSymbolicLink() || (stats.nlink !== 1 && stats.nlink !== 2)) return true;
 		const ageMs = Date.now() - stats.mtimeMs;
 		if (!Number.isFinite(ageMs) || ageMs < 0) return true;
-		if (ageMs > OMX_PLUGIN_LIVE_PIN_INITIALIZATION_LEASE_MS) continue;
+		if (ageMs > OMX_PLUGIN_LIVE_PIN_INITIALIZATION_LEASE_MS) {
+			if (!mutationLockContent) continue;
+			if (!(await omxPluginCacheLivePinMutationLockIsOwned(cacheBaseRef, version, mutationLockContent))) return true;
+			let currentStats: Stats;
+			try {
+				currentStats = await lstat(path);
+			} catch (error) {
+				if (isMissingPathError(error)) continue;
+				return true;
+			}
+			if (!sameFileIdentity(currentStats, stats)) return true;
+			const currentAgeMs = Date.now() - currentStats.mtimeMs;
+			if (!Number.isFinite(currentAgeMs) || currentAgeMs < 0) return true;
+			if (currentAgeMs <= OMX_PLUGIN_LIVE_PIN_INITIALIZATION_LEASE_MS) return true;
+			if (!(await omxPluginCacheLivePinMutationLockIsOwned(cacheBaseRef, version, mutationLockContent))) return true;
+			try {
+				if (!(await removeChildIfIdentity(cacheBaseRef, entry.name, currentStats, { force: true }))) return true;
+			} catch {
+				return true;
+			}
+			continue;
+		}
 		if (isStage) return true;
 		if (stats.size <= 0 || stats.size > 256) return true;
 		const bytes = await readOmxPluginCacheFileNoFollow(path, {
@@ -1251,8 +1276,9 @@ async function isLivePinnedSnapshot(
 	cacheBaseRef: DirectoryRef,
 	version: string,
 	retirementGateContent?: string,
+	mutationLockContent?: string,
 ): Promise<boolean> {
-	if (await hasLivePinIntent(cacheBaseRef, version)) return true;
+	if (await hasLivePinIntent(cacheBaseRef, version, mutationLockContent)) return true;
 	if (await isPrePinManagedSnapshot(snapshotRef, version)) return true;
 	const markerPath = join(snapshotRef.operationPath, OMX_PLUGIN_LIVE_PIN_MARKER);
 	let markerStats: Stats;
@@ -2139,7 +2165,13 @@ export async function removeChildIfIdentity(
 					!(await hasPublicationMarkerEntry(sourceRef.operationPath, ".omx-incomplete"));
 				if (
 					!owned ||
-					(await isLivePinnedSnapshot(sourceRef, cacheBaseRef, options.expectedManagedVersion!))
+					(await isLivePinnedSnapshot(
+						sourceRef,
+						cacheBaseRef,
+						options.expectedManagedVersion!,
+						undefined,
+						mutationLockContent,
+					))
 				) {
 					options.preservedPaths?.push(join(cacheBaseRef.path, childName));
 					return false;
@@ -2243,6 +2275,7 @@ export async function removeChildIfIdentity(
 							cacheBaseRef,
 							options.expectedManagedVersion!,
 							retirementGateContent,
+							mutationLockContent,
 						);
 					} catch {
 						livePin = true;

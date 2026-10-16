@@ -948,6 +948,40 @@ syncBuiltinESMExports();
 		}
 	});
 
+	it("reclaims expired sidecar intents and stages while holding the retirement lock", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-expired-sidecar-intents-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const snapshots = await Promise.all(
+					["0.20.0", "0.20.1", "0.20.2"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
+				const cacheBase = omxPluginCacheBase(codexHomeDir);
+				const versionHash = createHash("sha256").update("0.20.0").digest("hex").slice(0, 24);
+				const sessionId = "abandoned-startup-intent";
+				const sessionHash = createHash("sha256").update(sessionId).digest("hex");
+				const intentPath = livePinIntentPath(codexHomeDir, "0.20.0", sessionId);
+				const stagePath = join(
+					cacheBase,
+					`.stage-omx-live-pin-intent-${versionHash}-${sessionHash}-99999-abandoned`,
+				);
+				const content = `${JSON.stringify({ version: 1, cacheVersion: "0.20.0", sessionHash })}\n`;
+				await writeFile(intentPath, content);
+				await writeFile(stagePath, content);
+				const expiredAt = new Date(Date.now() - 6 * 60 * 1000);
+				await utimes(intentPath, expiredAt, expiredAt);
+				await utimes(stagePath, expiredAt, expiredAt);
+
+				const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.3");
+
+				assert.equal(retired.includes(snapshots[0]!), true);
+				await assert.rejects(lstat(intentPath), { code: "ENOENT" });
+				await assert.rejects(lstat(stagePath), { code: "ENOENT" });
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
 	it("recovers a dead-owner lock left between publication and stage cleanup", {
 		skip: process.platform !== "linux",
 	}, async () => {
