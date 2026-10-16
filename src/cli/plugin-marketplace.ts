@@ -50,6 +50,7 @@ const OMX_PLUGIN_LIVE_PIN_RETIRING_MARKER = ".omx-retiring";
 const OMX_PLUGIN_LIVE_PIN_PENDING_PREFIX = ".pending-";
 const OMX_PLUGIN_LIVE_PIN_INTENT_PREFIX = ".omx-live-pin-intent-";
 const OMX_PLUGIN_LIVE_PIN_INTENT_STAGE_PREFIX = ".stage-omx-live-pin-intent-";
+const OMX_PLUGIN_LIVE_PIN_INTENT_LOCK_PREFIX = ".omx-live-pin-intent-";
 const OMX_PLUGIN_LIVE_PIN_RECORD_MAX_BYTES = 4096;
 // Empty pin directories can be initialization races, but abandoned ones must not pin forever.
 const OMX_PLUGIN_LIVE_PIN_INITIALIZATION_LEASE_MS = 5 * 60 * 1000;
@@ -159,6 +160,7 @@ interface PluginCacheMutationTestHooks {
 	beforeStaleLockReclaim?: (lockPath: string, stats: Stats) => void | Promise<void>;
 	beforeRemove?: (path: string, stats: Stats) => void | Promise<void>;
 	beforeRemoveSyscall?: (path: string, stats: Stats) => void | Promise<void>;
+	afterDestructiveCheck?: (path: string, stats: Stats) => void | Promise<void>;
 }
 
 let pluginCacheMutationTestHooks: PluginCacheMutationTestHooks | undefined;
@@ -555,6 +557,7 @@ async function removeChild(parent: DirectoryRef, name: string, options: RemoveCh
 			throw new Error(`identity-bound removal target changed before removal syscall: ${mutationPath}`);
 		}
 		if (options.beforeDestructiveRemove && !await options.beforeDestructiveRemove()) return false;
+		await pluginCacheMutationTestHooks?.afterDestructiveCheck?.(mutationPath, final);
 	}
 	await rm(mutationPath, options);
 	if (before) {
@@ -845,6 +848,10 @@ function omxPluginCacheLivePinMutationLockName(version: string): string {
 	return `.omx-live-pin-${versionHash}.lock`;
 }
 
+function omxPluginCacheLivePinIntentLockName(version: string): string {
+	return `${OMX_PLUGIN_LIVE_PIN_INTENT_LOCK_PREFIX}${omxPluginCacheLivePinVersionHash(version)}.lock`;
+}
+
 interface OmxPluginCacheLivePinMutationLockState {
 	name: string;
 	version: string;
@@ -857,8 +864,8 @@ interface OmxPluginCacheLivePinMutationLockState {
 async function readOmxPluginCacheLivePinMutationLock(
 	cacheBaseRef: DirectoryRef,
 	version: string,
+	name = omxPluginCacheLivePinMutationLockName(version),
 ): Promise<OmxPluginCacheLivePinMutationLockState | null> {
-	const name = omxPluginCacheLivePinMutationLockName(version);
 	const lockPath = childOperationPath(cacheBaseRef, name);
 	let stats: Stats;
 	try {
@@ -934,7 +941,7 @@ async function removeOmxPluginCacheLivePinMutationLockStageLink(
 		}))
 	)
 		return false;
-	const refreshed = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, state.version);
+	const refreshed = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, state.version, state.name);
 	return (
 		refreshed?.content === state.content &&
 		sameFileIdentity(refreshed.stats, state.stats) &&
@@ -951,7 +958,7 @@ async function removeStaleOmxPluginCacheLivePinMutationLock(
 	// lock. If PID reuse makes an abandoned owner look live, fail closed.
 	if (!state.regular || !state.record || isProcessAlive(state.record.pid)) return false;
 	if (!(await removeOmxPluginCacheLivePinMutationLockStageLink(cacheBaseRef, state))) return false;
-	const refreshed = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, state.version);
+	const refreshed = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, state.version, state.name);
 	if (
 		refreshed?.content !== state.content ||
 		!sameFileIdentity(refreshed.stats, state.stats) ||
@@ -970,13 +977,13 @@ async function acquireOmxPluginCacheLivePinMutationLock(
 	version: string,
 	operation: "pin" | "retire",
 	waitForPinContention = false,
+	name = omxPluginCacheLivePinMutationLockName(version),
 ): Promise<string | null> {
-	const name = omxPluginCacheLivePinMutationLockName(version);
 	const token = randomUUID();
 	const content = `${JSON.stringify({ version: 1, pid: process.pid, operation, token })}\n`;
 	const retryUntil = waitForPinContention ? Date.now() + 500 : 0;
 	for (;;) {
-		const existing = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version);
+		const existing = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version, name);
 		if (existing) {
 			if (await removeStaleOmxPluginCacheLivePinMutationLock(cacheBaseRef, existing)) continue;
 			if (waitForPinContention && existing.record?.operation === "pin" && Date.now() < retryUntil) {
@@ -1002,7 +1009,7 @@ async function acquireOmxPluginCacheLivePinMutationLock(
 			}).catch(() => false);
 		}
 		if (!linked) continue;
-		const acquired = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version);
+		const acquired = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version, name);
 		if (acquired?.content === content && acquired.record?.pid === process.pid) return content;
 		if (acquired?.content === content) {
 			await removeChildIfIdentity(cacheBaseRef, name, acquired.stats, {
@@ -1017,8 +1024,9 @@ async function omxPluginCacheLivePinMutationLockIsOwned(
 	cacheBaseRef: DirectoryRef,
 	version: string,
 	content: string,
+	name = omxPluginCacheLivePinMutationLockName(version),
 ): Promise<boolean> {
-	const state = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version);
+	const state = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version, name);
 	return state?.content === content && state.record?.pid === process.pid;
 }
 
@@ -1026,11 +1034,12 @@ async function releaseOmxPluginCacheLivePinMutationLock(
 	cacheBaseRef: DirectoryRef,
 	version: string,
 	content: string,
+	name = omxPluginCacheLivePinMutationLockName(version),
 ): Promise<void> {
-	const state = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version);
+	const state = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version, name);
 	if (state?.content !== content || state.record?.pid !== process.pid) return;
 	if (!(await removeOmxPluginCacheLivePinMutationLockStageLink(cacheBaseRef, state))) return;
-	const refreshed = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version);
+	const refreshed = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version, name);
 	if (refreshed?.content !== content || refreshed.record?.pid !== process.pid || refreshed.stats.nlink !== 1) return;
 	await removeChildIfIdentity(cacheBaseRef, refreshed.name, refreshed.stats, {
 		force: true,
@@ -1243,6 +1252,39 @@ async function hasLivePinIntent(
 		return true;
 	}
 	return false;
+}
+
+async function sweepExpiredOmxPluginCacheLivePinIntents(
+	cacheBaseRef: DirectoryRef,
+	version: string,
+): Promise<void> {
+	let mutationLockContent: string | null = null;
+	let intentLockContent: string | null = null;
+	try {
+		mutationLockContent = await acquireOmxPluginCacheLivePinMutationLock(cacheBaseRef, version, "retire");
+		if (!mutationLockContent) return;
+		intentLockContent = await acquireOmxPluginCacheLivePinMutationLock(
+			cacheBaseRef,
+			version,
+			"retire",
+			false,
+			omxPluginCacheLivePinIntentLockName(version),
+		);
+		if (!intentLockContent) return;
+		await hasLivePinIntent(cacheBaseRef, version, mutationLockContent);
+	} finally {
+		if (intentLockContent) {
+			await releaseOmxPluginCacheLivePinMutationLock(
+				cacheBaseRef,
+				version,
+				intentLockContent,
+				omxPluginCacheLivePinIntentLockName(version),
+			);
+		}
+		if (mutationLockContent) {
+			await releaseOmxPluginCacheLivePinMutationLock(cacheBaseRef, version, mutationLockContent);
+		}
+	}
 }
 
 async function isPrePinManagedSnapshot(snapshotRef: DirectoryRef, version: string): Promise<boolean> {
@@ -2125,6 +2167,7 @@ export async function removeChildIfIdentity(
 	}
 	if (options.expectedManagedVersion) {
 		let mutationLockContent: string | null = null;
+		let intentLockContent: string | null = null;
 		try {
 			mutationLockContent = await acquireOmxPluginCacheLivePinMutationLock(
 				cacheBaseRef,
@@ -2285,6 +2328,22 @@ export async function removeChildIfIdentity(
 					return { owned, livePin };
 				};
 				await pluginCacheMutationTestHooks?.beforeRemove?.(quarantinePath, quarantineStats);
+				try {
+					intentLockContent = await acquireOmxPluginCacheLivePinMutationLock(
+						cacheBaseRef,
+						options.expectedManagedVersion!,
+						"retire",
+						false,
+						omxPluginCacheLivePinIntentLockName(options.expectedManagedVersion!),
+					);
+				} catch {
+					intentLockContent = null;
+				}
+				if (!intentLockContent) {
+					const restored = await restoreQuarantinedSnapshot();
+					options.preservedPaths?.push(join(cacheBaseRef.path, restored ? childName : quarantineName));
+					return false;
+				}
 				const initialQuarantineState = await verifyQuarantineOwnership();
 				if (!initialQuarantineState.owned || initialQuarantineState.livePin) {
 					const restored = initialQuarantineState.livePin && (await restoreQuarantinedSnapshot());
@@ -2316,6 +2375,12 @@ export async function removeChildIfIdentity(
 								cacheBaseRef,
 								options.expectedManagedVersion!,
 								mutationLockContent!,
+							)) ||
+							!(await omxPluginCacheLivePinMutationLockIsOwned(
+								cacheBaseRef,
+								options.expectedManagedVersion!,
+								intentLockContent!,
+								omxPluginCacheLivePinIntentLockName(options.expectedManagedVersion!),
 							))
 						) {
 							preservationNeeded = true;
@@ -2340,6 +2405,14 @@ export async function removeChildIfIdentity(
 				return removed;
 			}
 		} finally {
+			if (intentLockContent) {
+				await releaseOmxPluginCacheLivePinMutationLock(
+					cacheBaseRef,
+					options.expectedManagedVersion,
+					intentLockContent,
+					omxPluginCacheLivePinIntentLockName(options.expectedManagedVersion),
+				);
+			}
 			await releaseOmxPluginCacheLivePinMutationLock(cacheBaseRef, options.expectedManagedVersion, mutationLockContent);
 		}
 	}
@@ -3362,7 +3435,7 @@ export async function retireUnpinnedManagedSnapshots(
 		const entries = await readdir(baseRef.operationPath, { withFileTypes: true });
 		const managed: Array<{ path: string; version: string; mtimeMs: number; ref: DirectoryRef; stats: Stats }> = [];
 		for (const entry of entries) {
-			if (!entry.isDirectory() || entry.name === currentVersion) continue;
+			if (!entry.isDirectory()) continue;
 			let candidateRef: DirectoryRef;
 			try {
 				candidateRef = await openDirectoryChild(baseRef, entry.name);
@@ -3379,6 +3452,8 @@ export async function retireUnpinnedManagedSnapshots(
 			if (manifest?.name !== OMX_PLUGIN_NAME || manifest.version !== entry.name) continue;
 			if (!(await hasRegularPublicationMarker(candidateRef.operationPath, ".omx-complete")) || await hasPublicationMarkerEntry(candidateRef.operationPath, ".omx-incomplete")) continue;
 			if (!(await hasRegularPublicationMarker(candidateRef.operationPath, OMX_PLUGIN_MANAGED_MARKER))) continue;
+			await sweepExpiredOmxPluginCacheLivePinIntents(baseRef, entry.name);
+			if (entry.name === currentVersion) continue;
 			if (await isLivePinnedSnapshot(candidateRef, baseRef, entry.name)) continue;
 			managed.push({ path: join(cacheBase, entry.name), version: entry.name, mtimeMs: candidateStats.mtimeMs, ref: candidateRef, stats: candidateStats });
 		}

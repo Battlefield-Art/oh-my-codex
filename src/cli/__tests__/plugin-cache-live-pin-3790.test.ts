@@ -801,6 +801,106 @@ syncBuiltinESMExports();
 		}
 	});
 
+	it("blocks startup intent publication after the final retirement check", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-final-intent-fence-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const snapshots = await Promise.all(
+					["0.20.0", "0.20.1", "0.20.2"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
+				const pluginRoot = snapshots[0]!;
+				const versionHash = createHash("sha256").update("0.20.0").digest("hex").slice(0, 24);
+				const readyPath = join(wd, "intent-writer-ready");
+				const releasePath = join(wd, "intent-writer-release");
+				const preloadPath = join(wd, "pause-before-intent-lock.mjs");
+				await writeFile(join(wd, "codex-native-hook"), "process.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n");
+				await writeFile(preloadPath, `
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
+const originalWriteFileSync = fs.writeFileSync;
+let paused = false;
+fs.writeFileSync = function (path, ...args) {
+	if (!paused && typeof path === "string" && path.includes(".omx-live-pin-intent-${versionHash}.lock.stage-")) {
+		paused = true;
+		originalWriteFileSync.call(this, process.env.OMX_TEST_INTENT_READY, "ready\\n");
+		const wait = new Int32Array(new SharedArrayBuffer(4));
+		while (!fs.existsSync(process.env.OMX_TEST_INTENT_RELEASE)) Atomics.wait(wait, 0, 0, 10);
+	}
+	return originalWriteFileSync.call(this, path, ...args);
+};
+syncBuiltinESMExports();
+`);
+				const hook = spawn(
+					process.execPath,
+					["--import", preloadPath, join(pluginRoot, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						stdio: ["pipe", "pipe", "pipe"],
+						env: {
+							...process.env,
+							CODEX_HOME: codexHomeDir,
+							OMX_NATIVE_HOOK_COMMAND: process.execPath,
+							OMX_TEST_INTENT_READY: readyPath,
+							OMX_TEST_INTENT_RELEASE: releasePath,
+						},
+					},
+				);
+				hook.stdout.resume();
+				let hookStderr = "";
+				hook.stderr.setEncoding("utf-8");
+				hook.stderr.on("data", (chunk: string) => { hookStderr += chunk; });
+				const closed = once(hook, "close");
+				let retirement: Promise<string[]> | undefined;
+				let interposed = false;
+				const resetHooks = setPluginCacheMutationHooksForTest({
+					afterDestructiveCheck: async (path) => {
+						if (interposed || !path.includes(".0.20.0.reclaim-")) return;
+						interposed = true;
+						await writeFile(releasePath, "release\\n");
+						const [code] = await closed as [number | null];
+						assert.equal(code, 0, hookStderr);
+					},
+				});
+				try {
+					hook.stdin.end(JSON.stringify({
+						hook_event_name: "SessionStart",
+						session_id: "late-intent-session",
+						codex_pid: process.pid,
+						cwd: wd,
+					}));
+					let writerPaused = false;
+					for (let attempt = 0; attempt < 500; attempt += 1) {
+						try {
+							await lstat(readyPath);
+							writerPaused = true;
+							break;
+						} catch {
+							await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+						}
+					}
+					assert.equal(writerPaused, true, hookStderr || "startup wrapper did not reach intent-fence acquisition");
+
+					retirement = retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.3");
+					const retired = await retirement;
+					assert.equal(interposed, true, "retirement must interpose after its final intent scan");
+					assert.equal(retired.includes(pluginRoot), true);
+					assert.equal(retired.includes(snapshots[1]!), true);
+					await assert.rejects(lstat(pluginRoot), { code: "ENOENT" });
+					const intentPrefix = `.omx-live-pin-intent-${versionHash}-`;
+					assert.equal((await readdir(omxPluginCacheBase(codexHomeDir))).some((name) => name.startsWith(intentPrefix)), false);
+				} finally {
+					resetHooks();
+					await writeFile(releasePath, "release\\n").catch(() => undefined);
+					if (hook.exitCode === null) hook.kill();
+					await closed.catch(() => undefined);
+					await retirement?.catch(() => undefined);
+				}
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
 	it("registers a live pin before concurrent publication retires an older snapshot", async () => {
 		const wd = await mkdtemp(join(tmpdir(), "omx-3790-pin-lock-retry-"));
 		try {
@@ -976,6 +1076,50 @@ syncBuiltinESMExports();
 				assert.equal(retired.includes(snapshots[0]!), true);
 				await assert.rejects(lstat(intentPath), { code: "ENOENT" });
 				await assert.rejects(lstat(stagePath), { code: "ENOENT" });
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
+	it("sweeps expired sidecar intents from current and retained snapshots", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-retained-sidecar-intents-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const snapshots = await Promise.all(
+					["0.20.0", "0.20.1", "0.20.2"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
+				const cacheBase = omxPluginCacheBase(codexHomeDir);
+				const expiredAt = new Date(Date.now() - 6 * 60 * 1000);
+				for (const version of ["0.20.1", "0.20.2"]) {
+					const versionHash = createHash("sha256").update(version).digest("hex").slice(0, 24);
+					const sessionHash = createHash("sha256").update(`expired-${version}`).digest("hex");
+					const intentPath = livePinIntentPath(codexHomeDir, version, `expired-${version}`);
+					const stagePath = join(
+						cacheBase,
+						`.stage-omx-live-pin-intent-${versionHash}-${sessionHash}-99999-abandoned`,
+					);
+					const content = `${JSON.stringify({ version: 1, cacheVersion: version, sessionHash })}\n`;
+					await writeFile(intentPath, content);
+					await writeFile(stagePath, content);
+					await utimes(intentPath, expiredAt, expiredAt);
+					await utimes(stagePath, expiredAt, expiredAt);
+				}
+
+				const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.2");
+
+				assert.equal(retired.includes(snapshots[0]!), true);
+				await assert.rejects(lstat(snapshots[0]!), { code: "ENOENT" });
+				for (const version of ["0.20.1", "0.20.2"]) {
+					await assert.rejects(lstat(livePinIntentPath(codexHomeDir, version, `expired-${version}`)), { code: "ENOENT" });
+					const versionHash = createHash("sha256").update(version).digest("hex").slice(0, 24);
+					const sessionHash = createHash("sha256").update(`expired-${version}`).digest("hex");
+					await assert.rejects(
+						lstat(join(cacheBase, `.stage-omx-live-pin-intent-${versionHash}-${sessionHash}-99999-abandoned`)),
+						{ code: "ENOENT" },
+					);
+					await lstat(snapshots[version === "0.20.1" ? 1 : 2]!);
+				}
 			});
 		} finally {
 			await rm(wd, { recursive: true, force: true });

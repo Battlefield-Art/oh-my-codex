@@ -603,6 +603,11 @@ function livePinMutationLockName(version) {
   return `.omx-live-pin-${versionHash}.lock`;
 }
 
+function livePinIntentLockName(version) {
+  const versionHash = livePinVersionHash(version);
+  return `.omx-live-pin-intent-${versionHash}.lock`;
+}
+
 function readLivePinMutationLock(path) {
   let stats;
   try {
@@ -703,8 +708,8 @@ function removeDeadLivePinMutationLock(path, state) {
   return removeVerifiedLockEntry(path, refreshed.stats, refreshed.content, () => !isProcessAlive(refreshed.record.pid));
 }
 
-function acquireLivePinMutationLock(target, operation) {
-  const path = join(target.cacheBase, livePinMutationLockName(target.version));
+function acquireLivePinMutationLock(target, operation, lockName = livePinMutationLockName(target.version)) {
+  const path = join(target.cacheBase, lockName);
   const token = randomUUID();
   const content = `${JSON.stringify({ version: 1, pid: process.pid, operation, token })}\n`;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -859,14 +864,20 @@ function renewPendingSessionRegistration(path, expectedStats) {
   }
 }
 
-function writePendingSessionRegistration(pluginRoot, sessionId) {
+function writePendingSessionRegistration(pluginRoot, sessionId, expectedIntentStats = null) {
   let cacheBaseFd = null;
+  let pinState = null;
   let stagePath = null;
   let stageStats = null;
   let stageContent = null;
+  let intentLock = null;
   try {
     const target = livePinTarget(pluginRoot);
     if (!target) return false;
+    intentLock = acquireLivePinMutationLock(target, 'pin', livePinIntentLockName(target.version));
+    if (!intentLock) return false;
+    pinState = livePinDirectory(pluginRoot);
+    if (!pinState || pinState.version !== target.version || pinState.cacheBase !== target.cacheBase || !livePinRootMatches(pinState)) return false;
     const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
     const versionHash = livePinVersionHash(target.version);
     const baseStats = lstatSync(target.cacheBase);
@@ -890,22 +901,27 @@ function writePendingSessionRegistration(pluginRoot, sessionId) {
         return false;
       }
     };
+    const rootStillNamed = () => livePinRootMatches(pinState) && livePinMutationLockMatches(intentLock);
     try {
       const existingStats = lstatSync(pendingPath);
       if (!existingStats.isFile() || existingStats.isSymbolicLink() || (existingStats.nlink !== 1 && existingStats.nlink !== 2)) return false;
       const existing = readPendingSessionIntent(pendingPath, target.version, sessionHash);
       if (!existing || existing.stats.dev !== existingStats.dev || existing.stats.ino !== existingStats.ino) return false;
-      if (!cacheBaseStillNamed()) return false;
-      return renewPendingSessionRegistration(pendingPath, existingStats);
+      if (expectedIntentStats && !sameFileIdentity(existing.stats, expectedIntentStats)) return false;
+      if (!cacheBaseStillNamed() || !rootStillNamed()) return false;
+      return renewPendingSessionRegistration(pendingPath, existingStats)
+        && cacheBaseStillNamed()
+        && rootStillNamed();
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
+      if (expectedIntentStats) return false;
     }
 
     stagePath = join(cacheBasePath, `${LIVE_PIN_INTENT_STAGE_PREFIX}${versionHash}-${sessionHash}-${process.pid}-${randomUUID()}`);
     writeFileSync(stagePath, content, { flag: 'wx', mode: 0o600 });
     stageStats = lstatSync(stagePath);
     stageContent = content;
-    if (!cacheBaseStillNamed()) {
+    if (!cacheBaseStillNamed() || !rootStillNamed()) {
       removeVerifiedLockEntry(stagePath, stageStats, content);
       return false;
     }
@@ -926,7 +942,7 @@ function writePendingSessionRegistration(pluginRoot, sessionId) {
       if (!existing || !sameFileIdentity(existing.stats, lstatSync(pendingPath))) return false;
       if (!renewPendingSessionRegistration(pendingPath, existing.stats)) return false;
     }
-    if (!cacheBaseStillNamed()) return false;
+    if (!cacheBaseStillNamed() || !rootStillNamed()) return false;
     // This sidecar intent survives snapshot quarantine on every platform. The
     // lock-owning CLI writer commits the durable pin and then removes the intent.
     return true;
@@ -934,6 +950,8 @@ function writePendingSessionRegistration(pluginRoot, sessionId) {
     return false;
   } finally {
     if (stagePath && stageStats && stageContent !== null) removeVerifiedLockEntry(stagePath, stageStats, stageContent);
+    releaseLivePinMutationLock(intentLock);
+    closeLivePinDirectory(pinState);
     if (cacheBaseFd !== null) {
       try { closeSync(cacheBaseFd); } catch {}
     }
@@ -964,7 +982,7 @@ function startPendingSessionIntentLease(pluginRoot, sessionId) {
     try {
       const current = lstatSync(path);
       if (!sameFileIdentity(current, stats)) return;
-      renewPendingSessionRegistration(path, stats);
+      writePendingSessionRegistration(pluginRoot, sessionId, stats);
     } catch {}
   };
   const timer = setInterval(renew, LIVE_PIN_INTENT_RENEW_INTERVAL_MS);
