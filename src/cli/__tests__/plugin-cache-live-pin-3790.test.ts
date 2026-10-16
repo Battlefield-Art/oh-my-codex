@@ -445,6 +445,87 @@ setInterval(() => {}, 60_000);
 		}
 	});
 
+	it("publishes a renewable startup intent before waiting for hook input", async () => {
+		const wd = await mkdtemp(join(tmpdir(), "omx-3790-startup-intent-"));
+		try {
+			await withIsolatedUserHome(wd, async (codexHomeDir) => {
+				const snapshots = await Promise.all(
+					["0.20.0", "0.20.1", "0.20.2"].map((version) => seedManagedSnapshot(codexHomeDir, version)),
+				);
+				const pluginRoot = snapshots[0]!;
+				const cacheBase = omxPluginCacheBase(codexHomeDir);
+				const versionHash = createHash("sha256").update("0.20.0").digest("hex").slice(0, 24);
+				const intentPrefix = `.omx-live-pin-intent-${versionHash}-`;
+				const mutationLock = await writeLivePinMutationLock(codexHomeDir, "0.20.0", process.pid, "retire");
+				const helperPath = join(wd, "codex-native-hook");
+				await writeFile(helperPath, "process.stdin.resume();\nprocess.stdin.on('end', () => process.exit(0));\n");
+				const hook = spawn(
+					process.execPath,
+					[join(pluginRoot, "hooks", "codex-native-hook.mjs")],
+					{
+						cwd: wd,
+						stdio: ["pipe", "pipe", "pipe"],
+						env: {
+							...process.env,
+							CODEX_HOME: codexHomeDir,
+							OMX_NATIVE_HOOK_COMMAND: process.execPath,
+						},
+					},
+				);
+				hook.stdout.resume();
+				let hookStderr = "";
+				hook.stderr.setEncoding("utf-8");
+				hook.stderr.on("data", (chunk: string) => { hookStderr += chunk; });
+				const closed = once(hook, "close");
+				try {
+					let startupIntents: string[] = [];
+					for (let attempt = 0; attempt < 100; attempt += 1) {
+						startupIntents = (await readdir(cacheBase)).filter((name) => name.startsWith(intentPrefix));
+						if (startupIntents.length > 0) break;
+						await new Promise((resolveWait) => setTimeout(resolveWait, 10));
+					}
+					assert.equal(startupIntents.length, 1, "startup intent must exist before the wrapper reads stdin");
+					const startupIntentPath = join(cacheBase, startupIntents[0]!);
+					const startupIntent = JSON.parse(await readFile(startupIntentPath, "utf-8")) as {
+						version: number;
+						cacheVersion: string;
+						sessionHash: string;
+					};
+					assert.deepEqual(
+						{ version: startupIntent.version, cacheVersion: startupIntent.cacheVersion },
+						{ version: 1, cacheVersion: "0.20.0" },
+					);
+					assert.match(startupIntent.sessionHash, /^[0-9a-f]{64}$/);
+
+					await rm(mutationLock.path);
+					const retired = await retireUnpinnedManagedSnapshots(codexHomeDir, "0.20.3");
+					assert.equal(retired.includes(pluginRoot), false);
+					assert.equal(retired.includes(snapshots[1]!), true);
+					await lstat(pluginRoot);
+					await assert.rejects(lstat(snapshots[1]!), { code: "ENOENT" });
+
+					hook.stdin.end(JSON.stringify({
+						hook_event_name: "SessionStart",
+						session_id: "startup-intent-session",
+						codex_pid: process.pid,
+						cwd: wd,
+					}));
+					const [code] = await closed as [number | null];
+					assert.equal(code, 0, hookStderr);
+					await assert.rejects(lstat(startupIntentPath), { code: "ENOENT" });
+				} finally {
+					await rm(mutationLock.path, { force: true });
+					if (hook.exitCode === null) {
+						hook.kill();
+						await closed;
+					}
+				}
+			});
+		} finally {
+			await rm(wd, { recursive: true, force: true });
+		}
+	});
+
 	it("does not publish a startup pin after the snapshot is quarantined", {
 		skip: process.platform !== "linux",
 	}, async () => {

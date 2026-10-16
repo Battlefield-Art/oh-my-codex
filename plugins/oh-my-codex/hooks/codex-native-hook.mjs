@@ -20,6 +20,7 @@ const LIVE_PIN_HELPER_KILL_GRACE_MS = 250;
 const LIVE_PIN_PENDING_PREFIX = '.pending-';
 const LIVE_PIN_INTENT_PREFIX = '.omx-live-pin-intent-';
 const LIVE_PIN_INTENT_STAGE_PREFIX = '.stage-omx-live-pin-intent-';
+const LIVE_PIN_INTENT_RENEW_INTERVAL_MS = 60_000;
 const CODEX_HOOK_EVENT_NAMES = new Set([
   'SessionStart',
   'PreToolUse',
@@ -929,6 +930,41 @@ function writePendingSessionRegistration(pluginRoot, sessionId) {
   }
 }
 
+function startPendingSessionIntentLease(pluginRoot, sessionId) {
+  let target;
+  try {
+    target = livePinTarget(pluginRoot);
+  } catch {
+    return null;
+  }
+  if (!target || !writePendingSessionRegistration(pluginRoot, sessionId)) return null;
+  const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
+  const path = join(target.cacheBase, pendingSessionIntentName(target.version, sessionHash));
+  const content = `${JSON.stringify({ version: 1, cacheVersion: target.version, sessionHash })}\n`;
+  let stats;
+  try {
+    stats = lstatSync(path);
+  } catch {
+    return null;
+  }
+  const intent = readPendingSessionIntent(path, target.version, sessionHash);
+  if (!intent || !sameFileIdentity(intent.stats, stats)) return null;
+
+  const renew = () => {
+    try {
+      const current = lstatSync(path);
+      if (!sameFileIdentity(current, stats)) return;
+      renewPendingSessionRegistration(path, stats);
+    } catch {}
+  };
+  const timer = setInterval(renew, LIVE_PIN_INTENT_RENEW_INTERVAL_MS);
+  timer.unref();
+  return () => {
+    clearInterval(timer);
+    removeVerifiedLockEntry(path, stats, content);
+  };
+}
+
 function hasLiveSessionPin(pluginRoot, sessionId) {
   const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
   let pinState;
@@ -1229,7 +1265,10 @@ async function pinUnroutedSession(input, launcher, pluginRoot, pendingPin) {
 async function main() {
   const pluginRoot = resolve(hookDir, '..');
   const doctorSmoke = process.env.OMX_NATIVE_HOOK_DOCTOR_SMOKE === '1';
-  const startupPendingPin = doctorSmoke ? null : writePendingSessionPin(pluginRoot, `wrapper-${process.pid}-${randomUUID()}`);
+  const startupSessionId = `wrapper-${process.pid}-${randomUUID()}`;
+  const startupIntentCleanup = doctorSmoke ? null : startPendingSessionIntentLease(pluginRoot, startupSessionId);
+  if (startupIntentCleanup) process.once('exit', startupIntentCleanup);
+  const startupPendingPin = doctorSmoke ? null : writePendingSessionPin(pluginRoot, startupSessionId);
   if (startupPendingPin) {
     process.once('exit', () => removePendingSessionPin(startupPendingPin));
   }
