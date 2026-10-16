@@ -15,6 +15,7 @@
 
 - Frozen candidate `00d06af4cac8663f409e66576f1719da28199ff0`: latest-per-name dev CI had 24 successful checks, 1 skipped check, and no failing or incomplete checks.
 - Local validation passed: `npm run build:full`, `npm run build:runtime`, `npm run check:no-unused`, `npm run lint`, `cargo metadata --locked --format-version 1 --no-deps`, and `npm run sync:plugin:check`. The 706 targeted Node tests passed: 687 across the 9 test files changed by PR #3792, plus 19 version/release tests. `git diff --check` passed.
+- `npm run smoke:packed-install` passed; its installed-Codex trust leg was skipped because the Codex executable is absent from this Linux host.
 
 ## Merged PR inventory
 
