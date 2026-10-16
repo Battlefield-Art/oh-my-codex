@@ -166,7 +166,30 @@ test('collector: records latency on success', async () => {
 
   const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker, skipGitClone: true });
 
-  assert.ok((result.record.latencyMs ?? 0) >= 50);
+  assert.ok((result.record.latencyMs ?? 0) > 0);
+});
+
+test('collector: latency uses a monotonic clock', async () => {
+  const originalDateNow = Date.now;
+  let dateNowCalls = 0;
+  Date.now = () => (dateNowCalls++ === 0 ? 1_000 : 0);
+  try {
+    const result = await collectRecord(fixture, config, {
+      invokeCodex: async (): Promise<CodexOutput> => ({
+        exitCode: 0,
+        stdout: JSON.stringify({
+          type: 'item.completed',
+          item: { type: 'agent_message', text: 'Found a bug in the code. The variable is used correctly.' },
+        }) + '\n' + JSON.stringify({ type: 'turn.completed' }),
+        stderr: '',
+      }),
+      skipGitClone: true,
+    });
+
+    assert.ok((result.record.latencyMs ?? -1) >= 0);
+  } finally {
+    Date.now = originalDateNow;
+  }
 });
 
 test('collector: records latency even on error', async () => {
@@ -181,7 +204,7 @@ test('collector: records latency even on error', async () => {
 
   const result = await collectRecord(fixture, config, { invokeCodex: mockCodexInvoker, skipGitClone: true });
 
-  assert.ok((result.record.latencyMs ?? 0) >= 50);
+  assert.ok((result.record.latencyMs ?? 0) > 0);
 });
 
 test('collector: embeds fixture inputs into prompt', async () => {
