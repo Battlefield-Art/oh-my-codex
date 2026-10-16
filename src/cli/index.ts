@@ -5552,6 +5552,7 @@ export async function launchWithAuthHotswap(args: string[]): Promise<void> {
       cleanupRuntimeCodexHome,
       normalizeCodexLaunchArgs,
       injectModelInstructionsBypassArgs,
+      buildStartupModelInstructionsEnv,
       sessionModelInstructionsPath,
       resolveOmxRootForLaunch,
       resolveNotifyTempContract,
@@ -5907,6 +5908,7 @@ export async function execWithOverlay(args: string[]): Promise<void> {
       ...codexEnvBase,
       OMX_CODEX_LAUNCH_ID: pluginHookRoutingLaunchId,
       ...buildHudRuntimeEnv({ sessionId, ...hudRuntimeRoot }).env,
+      ...buildStartupModelInstructionsEnv(cwd, ["exec", ...normalizedArgs], sessionId),
       ...(notifyTempContractRaw ? { [OMX_NOTIFY_TEMP_CONTRACT_ENV]: notifyTempContractRaw } : {}),
     };
     runCodexBlocking(cwd, codexArgs, codexEnv);
@@ -6162,6 +6164,21 @@ function buildNativeHookBaseContext(
     ...(branch ? { branch } : {}),
     ...(issueNumber !== undefined ? { issue_number: issueNumber } : {}),
     ...extra,
+  };
+}
+
+export function buildStartupModelInstructionsEnv(
+  cwd: string,
+  args: string[],
+  sessionId: string,
+  env: NodeJS.ProcessEnv = process.env,
+): Record<string, string> {
+  const { omxArgs } = splitOmxArgsAtEndOfOptions(args);
+  return {
+    OMX_STARTUP_MODEL_INSTRUCTIONS_FILE:
+      shouldBypassDefaultSystemPrompt(env) && !env[OMX_MODEL_INSTRUCTIONS_FILE_ENV] && !hasModelInstructionsOverride(omxArgs)
+        ? sessionModelInstructionsPath(cwd, sessionId)
+        : "",
   };
 }
 
@@ -8151,6 +8168,7 @@ async function runCodex(
     OMX_CODEX_LAUNCH_ID: pluginHookRoutingLaunchId,
     ...buildHudRuntimeEnv({ sessionId }).env,
     ...launchOwnedControlPlaneEnv,
+    ...buildStartupModelInstructionsEnv(cwd, args, sessionId),
   };
   const codexEnv = workerLaunchArgs
     ? {
