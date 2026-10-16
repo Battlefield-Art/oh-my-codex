@@ -48,6 +48,8 @@ const OMX_PLUGIN_MANAGED_MARKER = ".omx-managed";
 const OMX_PLUGIN_LIVE_PIN_MARKER = ".omx-live-pin";
 const OMX_PLUGIN_LIVE_PIN_RETIRING_MARKER = ".omx-retiring";
 const OMX_PLUGIN_LIVE_PIN_PENDING_PREFIX = ".pending-";
+const OMX_PLUGIN_LIVE_PIN_INTENT_PREFIX = ".omx-live-pin-intent-";
+const OMX_PLUGIN_LIVE_PIN_INTENT_STAGE_PREFIX = ".stage-omx-live-pin-intent-";
 const OMX_PLUGIN_LIVE_PIN_RECORD_MAX_BYTES = 4096;
 // Empty pin directories can be initialization races, but abandoned ones must not pin forever.
 const OMX_PLUGIN_LIVE_PIN_INITIALIZATION_LEASE_MS = 5 * 60 * 1000;
@@ -816,8 +818,30 @@ function parseOmxPluginCachePendingPinRecord(value: unknown): OmxPluginCachePend
 	return record as unknown as OmxPluginCachePendingPinRecord;
 }
 
+function parseOmxPluginCacheLivePinIntentRecord(value: unknown, expectedVersion: string): OmxPluginCachePendingPinRecord | null {
+	if (value === null || typeof value !== "object" || Array.isArray(value)) return null;
+	const record = value as Record<string, unknown>;
+	if (
+		record.version !== 1 ||
+		record.cacheVersion !== expectedVersion ||
+		typeof record.sessionHash !== "string" ||
+		!/^[0-9a-f]{64}$/.test(record.sessionHash)
+	)
+		return null;
+	if (Object.keys(record).some((key) => key !== "version" && key !== "cacheVersion" && key !== "sessionHash")) return null;
+	return { version: 1, sessionHash: record.sessionHash };
+}
+
+function omxPluginCacheLivePinVersionHash(version: string): string {
+	return createHash("sha256").update(version).digest("hex").slice(0, 24);
+}
+
+function omxPluginCacheLivePinIntentName(version: string, sessionHash: string): string {
+	return `${OMX_PLUGIN_LIVE_PIN_INTENT_PREFIX}${omxPluginCacheLivePinVersionHash(version)}-${sessionHash}.json`;
+}
+
 function omxPluginCacheLivePinMutationLockName(version: string): string {
-	const versionHash = createHash("sha256").update(version).digest("hex").slice(0, 24);
+	const versionHash = omxPluginCacheLivePinVersionHash(version);
 	return `.omx-live-pin-${versionHash}.lock`;
 }
 
@@ -1117,11 +1141,119 @@ async function removePendingOmxPluginCacheLivePinRegistration(
 	await removeChildIfIdentity(pinDirectoryRef, name, stats, { force: true });
 }
 
+async function removePendingOmxPluginCacheLivePinIntent(
+	cacheBaseRef: DirectoryRef,
+	version: string,
+	sessionHash: string,
+): Promise<void> {
+	const name = omxPluginCacheLivePinIntentName(version, sessionHash);
+	const path = childOperationPath(cacheBaseRef, name);
+	let stats: Stats;
+	try {
+		stats = await lstat(path);
+	} catch (error) {
+		if (isMissingPathError(error)) return;
+		throw error;
+	}
+	if (!stats.isFile() || stats.isSymbolicLink() || (stats.nlink !== 1 && stats.nlink !== 2) || stats.size <= 0 || stats.size > 256)
+		return;
+	const bytes = await readOmxPluginCacheFileNoFollow(path, {
+		requireSingleLink: false,
+		anchorDir: cacheBaseRef.operationPath,
+	});
+	let parsed: unknown;
+	try {
+		parsed = bytes ? (JSON.parse(bytes.toString("utf-8")) as unknown) : null;
+	} catch {
+		return;
+	}
+	const intent = parseOmxPluginCacheLivePinIntentRecord(parsed, version);
+	if (intent?.sessionHash !== sessionHash) return;
+	await removeChildIfIdentity(cacheBaseRef, name, stats, { force: true });
+}
+
 async function isLivePinOwnerAlive(record: OmxPluginCacheLivePinRecord): Promise<boolean> {
 	return isProcessOwnerAlive(record.pid, record.processStartHash);
 }
 
-async function isLivePinnedSnapshot(snapshotRef: DirectoryRef, retirementGateContent?: string): Promise<boolean> {
+async function hasLivePinIntent(cacheBaseRef: DirectoryRef, version: string): Promise<boolean> {
+	const versionHash = omxPluginCacheLivePinVersionHash(version);
+	const intentPrefix = `${OMX_PLUGIN_LIVE_PIN_INTENT_PREFIX}${versionHash}-`;
+	const stagePrefix = `${OMX_PLUGIN_LIVE_PIN_INTENT_STAGE_PREFIX}${versionHash}-`;
+	let entries;
+	try {
+		entries = await readdir(cacheBaseRef.scanOperationPath, { withFileTypes: true });
+	} catch {
+		return true;
+	}
+	for (const entry of entries) {
+		const isStage = entry.name.startsWith(stagePrefix);
+		if (!isStage && !entry.name.startsWith(intentPrefix)) continue;
+		const path = childOperationPath(cacheBaseRef, entry.name);
+		let stats: Stats;
+		try {
+			stats = await lstat(path);
+		} catch (error) {
+			if (isMissingPathError(error)) continue;
+			return true;
+		}
+		if (!stats.isFile() || stats.isSymbolicLink() || (stats.nlink !== 1 && stats.nlink !== 2)) return true;
+		const ageMs = Date.now() - stats.mtimeMs;
+		if (!Number.isFinite(ageMs) || ageMs < 0) return true;
+		if (ageMs > OMX_PLUGIN_LIVE_PIN_INITIALIZATION_LEASE_MS) continue;
+		if (isStage) return true;
+		if (stats.size <= 0 || stats.size > 256) return true;
+		const bytes = await readOmxPluginCacheFileNoFollow(path, {
+			requireSingleLink: false,
+			anchorDir: cacheBaseRef.operationPath,
+		});
+		let parsed: unknown;
+		try {
+			parsed = bytes ? (JSON.parse(bytes.toString("utf-8")) as unknown) : null;
+		} catch {
+			return true;
+		}
+		const intent = parseOmxPluginCacheLivePinIntentRecord(parsed, version);
+		if (!intent || entry.name !== `${intentPrefix}${intent.sessionHash}.json`) return true;
+		return true;
+	}
+	return false;
+}
+
+async function isPrePinManagedSnapshot(snapshotRef: DirectoryRef, version: string): Promise<boolean> {
+	if (!(await hasRegularPublicationMarker(snapshotRef.operationPath, ".omx-complete"))) return false;
+	const markerPath = join(snapshotRef.operationPath, OMX_PLUGIN_MANAGED_MARKER);
+	let markerStats: Stats;
+	try {
+		markerStats = await lstat(markerPath);
+	} catch (error) {
+		if (isMissingPathError(error)) return false;
+		return true;
+	}
+	if (!markerStats.isFile() || markerStats.isSymbolicLink() || markerStats.nlink !== 1 || markerStats.size <= 0 || markerStats.size > 256)
+		return false;
+	const bytes = await readOmxPluginCacheFileNoFollow(markerPath, { anchorDir: snapshotRef.operationPath });
+	if (bytes === null) return false;
+	let parsed: unknown;
+	try {
+		parsed = JSON.parse(bytes.toString("utf-8")) as unknown;
+	} catch {}
+	const ownershipRecord = parsePublicationOwnershipRecord(parsed, version);
+	// Pre-pin publishers have no capability marker, so active and abandoned snapshots are indistinguishable.
+	if (ownershipRecord) return ownershipRecord.livePinSupportVersion !== 1;
+	const legacyOwnerPid = bytes.toString("utf-8").trim();
+	if (!/^[1-9]\d*$/.test(legacyOwnerPid) || !Number.isSafeInteger(Number(legacyOwnerPid))) return false;
+	return hasManagedSnapshotOwnershipRecord(snapshotRef.operationPath, version);
+}
+
+async function isLivePinnedSnapshot(
+	snapshotRef: DirectoryRef,
+	cacheBaseRef: DirectoryRef,
+	version: string,
+	retirementGateContent?: string,
+): Promise<boolean> {
+	if (await hasLivePinIntent(cacheBaseRef, version)) return true;
+	if (await isPrePinManagedSnapshot(snapshotRef, version)) return true;
 	const markerPath = join(snapshotRef.operationPath, OMX_PLUGIN_LIVE_PIN_MARKER);
 	let markerStats: Stats;
 	try {
@@ -1357,7 +1489,10 @@ export async function registerOmxPluginCacheLivePin(
 		} catch (error) {
 			if (!isMissingPathError(error)) throw error;
 		}
-		if (markerStats?.isFile() && !markerStats.isSymbolicLink()) return true;
+		if (markerStats?.isFile() && !markerStats.isSymbolicLink()) {
+			await removePendingOmxPluginCacheLivePinIntent(cacheBaseRef, version, sessionHash);
+			return true;
+		}
 		if (markerStats && (markerStats.isSymbolicLink() || !markerStats.isDirectory())) return false;
 		if (!markerStats) {
 			try {
@@ -1388,6 +1523,7 @@ export async function registerOmxPluginCacheLivePin(
 		});
 		if (existingPin?.toString("utf-8") === recordContent) {
 			await removePendingOmxPluginCacheLivePinRegistration(pinDirectoryRef, sessionHash);
+			await removePendingOmxPluginCacheLivePinIntent(cacheBaseRef, version, sessionHash);
 			return true;
 		}
 		stageName = `.stage-${ownerPid}-${randomUUID()}`;
@@ -1412,6 +1548,7 @@ export async function registerOmxPluginCacheLivePin(
 		const snapshotSyncOutcome = await syncDirectory(snapshotRef.handle);
 		recordDirectorySyncOutcome(durability, snapshotSyncOutcome);
 		await removePendingOmxPluginCacheLivePinRegistration(pinDirectoryRef, sessionHash);
+		await removePendingOmxPluginCacheLivePinIntent(cacheBaseRef, version, sessionHash);
 		result = true;
 	} finally {
 		let cleanupError: unknown = null;
@@ -1524,6 +1661,7 @@ interface PublicationOwnershipRecord {
 	cacheVersion: string;
 	pid: number;
 	processStartHash: string | null;
+	livePinSupportVersion?: 1;
 }
 
 async function buildPublicationOwnershipRecord(cacheVersion: string): Promise<PublicationOwnershipRecord> {
@@ -1533,6 +1671,7 @@ async function buildPublicationOwnershipRecord(cacheVersion: string): Promise<Pu
 		cacheVersion,
 		pid: process.pid,
 		processStartHash: processStartIdentity ? hashProcessStartIdentity(processStartIdentity) : null,
+		livePinSupportVersion: 1,
 	};
 }
 
@@ -1549,6 +1688,7 @@ function parsePublicationOwnershipRecord(
 		|| !Number.isSafeInteger(record.pid)
 		|| record.pid <= 0
 		|| (record.processStartHash !== null && (typeof record.processStartHash !== "string" || !/^[0-9a-f]{24}$/.test(record.processStartHash)))
+		|| (record.livePinSupportVersion !== undefined && record.livePinSupportVersion !== 1)
 	) return null;
 	return record as unknown as PublicationOwnershipRecord;
 }
@@ -1679,7 +1819,7 @@ async function inspectSnapshotRepairEligibility(
 			const incomplete = await inspectIncompletePublicationClaim(snapshotRef, version);
 			return { eligible: incomplete.reclaimable, reason: incomplete.reason };
 		}
-		const managed = await inspectManagedSnapshotForRepair(snapshotRef, version);
+		const managed = await inspectManagedSnapshotForRepair(snapshotRef, version, cacheBaseRef);
 		return {
 			eligible: managed.reason === undefined,
 			reason: managed.reason ?? `same-version cache at ${snapshotRef.path} is a verified, unpinned managed OMX snapshot`,
@@ -1997,7 +2137,10 @@ export async function removeChildIfIdentity(
 					versionOwnershipValid &&
 					completionValid &&
 					!(await hasPublicationMarkerEntry(sourceRef.operationPath, ".omx-incomplete"));
-				if (!owned || (await isLivePinnedSnapshot(sourceRef))) {
+				if (
+					!owned ||
+					(await isLivePinnedSnapshot(sourceRef, cacheBaseRef, options.expectedManagedVersion!))
+				) {
 					options.preservedPaths?.push(join(cacheBaseRef.path, childName));
 					return false;
 				}
@@ -2095,7 +2238,12 @@ export async function removeChildIfIdentity(
 					let livePin = true;
 					try {
 						quarantineRef = await openDirectoryRef(quarantinePath);
-						livePin = await isLivePinnedSnapshot(quarantineRef, retirementGateContent);
+						livePin = await isLivePinnedSnapshot(
+							quarantineRef,
+							cacheBaseRef,
+							options.expectedManagedVersion!,
+							retirementGateContent,
+						);
 					} catch {
 						livePin = true;
 					} finally {
@@ -3198,7 +3346,7 @@ export async function retireUnpinnedManagedSnapshots(
 			if (manifest?.name !== OMX_PLUGIN_NAME || manifest.version !== entry.name) continue;
 			if (!(await hasRegularPublicationMarker(candidateRef.operationPath, ".omx-complete")) || await hasPublicationMarkerEntry(candidateRef.operationPath, ".omx-incomplete")) continue;
 			if (!(await hasRegularPublicationMarker(candidateRef.operationPath, OMX_PLUGIN_MANAGED_MARKER))) continue;
-			if (await isLivePinnedSnapshot(candidateRef)) continue;
+			if (await isLivePinnedSnapshot(candidateRef, baseRef, entry.name)) continue;
 			managed.push({ path: join(cacheBase, entry.name), version: entry.name, mtimeMs: candidateStats.mtimeMs, ref: candidateRef, stats: candidateStats });
 		}
 		managed.sort((left, right) =>
@@ -3213,7 +3361,7 @@ export async function retireUnpinnedManagedSnapshots(
 			if (!currentStats.isDirectory() || currentStats.isSymbolicLink() || currentStats.dev !== candidate.stats.dev || currentStats.ino !== candidate.stats.ino) {
 				throw new Error(`managed cache retirement target changed before removal: ${candidate.path}`);
 			}
-			if (await isLivePinnedSnapshot(candidate.ref)) {
+			if (await isLivePinnedSnapshot(candidate.ref, baseRef, candidate.version)) {
 				continue;
 			}
 			if (await removeChildIfIdentity(baseRef, candidate.version, currentStats, { recursive: true, force: true, expectedManagedVersion: candidate.version, preservedPaths: preservedDirs })) {
@@ -3255,6 +3403,7 @@ export async function retireUnpinnedManagedSnapshots(
 async function inspectManagedSnapshotForRepair(
 	snapshotRef: DirectoryRef,
 	version: string,
+	cacheBaseRef: DirectoryRef,
 ): Promise<{ stats: Stats; reason?: string }> {
 	const stats = await snapshotRef.handle.stat();
 	const owned = stats.isDirectory()
@@ -3265,7 +3414,7 @@ async function inspectManagedSnapshotForRepair(
 	if (!owned) {
 		return { stats, reason: `same-version cache at ${snapshotRef.path} is not a verified managed OMX snapshot` };
 	}
-	if (await isLivePinnedSnapshot(snapshotRef)) {
+	if (await isLivePinnedSnapshot(snapshotRef, cacheBaseRef, version)) {
 		return { stats, reason: `same-version cache at ${snapshotRef.path} is pinned by a live Codex session; close that session before repairing it` };
 	}
 	return { stats };
@@ -3285,7 +3434,7 @@ async function removeManagedSnapshotForRepair(
 		throw error;
 	}
 	try {
-		const eligibility = await inspectManagedSnapshotForRepair(snapshotRef, version);
+		const eligibility = await inspectManagedSnapshotForRepair(snapshotRef, version, cacheBaseRef);
 		if (eligibility.reason) return { removed: false, reason: eligibility.reason };
 		await publicationLockGuard.assertOwned();
 		const removed = await removeChildIfIdentity(cacheBaseRef, version, eligibility.stats, {

@@ -18,6 +18,8 @@ const MAX_ROUTING_RECORD_BYTES = 4 * 1024;
 const LIVE_PIN_HELPER_TIMEOUT_MS = 5_000;
 const LIVE_PIN_HELPER_KILL_GRACE_MS = 250;
 const LIVE_PIN_PENDING_PREFIX = '.pending-';
+const LIVE_PIN_INTENT_PREFIX = '.omx-live-pin-intent-';
+const LIVE_PIN_INTENT_STAGE_PREFIX = '.stage-omx-live-pin-intent-';
 const CODEX_HOOK_EVENT_NAMES = new Set([
   'SessionStart',
   'PreToolUse',
@@ -543,8 +545,12 @@ function readNoFollowText(path, maxBytes, { allowHardLinks = false } = {}) {
   }
 }
 
+function livePinVersionHash(version) {
+  return createHash('sha256').update(version).digest('hex').slice(0, 24);
+}
+
 function livePinMutationLockName(version) {
-  const versionHash = createHash('sha256').update(version).digest('hex').slice(0, 24);
+  const versionHash = livePinVersionHash(version);
   return `.omx-live-pin-${versionHash}.lock`;
 }
 
@@ -725,8 +731,8 @@ function releaseLivePinMutationLock(lock) {
   }
 }
 
-function pendingSessionRegistrationName(sessionHash) {
-  return `${LIVE_PIN_PENDING_PREFIX}${sessionHash}.json`;
+function pendingSessionIntentName(version, sessionHash) {
+  return `${LIVE_PIN_INTENT_PREFIX}${livePinVersionHash(version)}-${sessionHash}.json`;
 }
 
 function readPendingSessionRegistration(pinPath, sessionHash) {
@@ -742,32 +748,42 @@ function readPendingSessionRegistration(pinPath, sessionHash) {
   return { ...file, record };
 }
 
+function readPendingSessionIntent(path, version, sessionHash) {
+  const file = readNoFollowText(path, 256, { allowHardLinks: true });
+  if (!file) return null;
+  let record;
+  try { record = JSON.parse(file.content); } catch { return null; }
+  if (
+    record?.version !== 1
+    || record.cacheVersion !== version
+    || record.sessionHash !== sessionHash
+    || Object.keys(record).some((key) => key !== 'version' && key !== 'cacheVersion' && key !== 'sessionHash')
+  ) return null;
+  return { ...file, record };
+}
+
 function hasPendingSessionRegistration(pluginRoot, sessionId) {
-  let pinState;
+  let target;
   try {
-    pinState = livePinDirectory(pluginRoot);
+    target = livePinTarget(pluginRoot);
   } catch {
     return false;
   }
-  if (!pinState) return false;
+  if (!target) return false;
+  const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
+  const path = join(target.cacheBase, pendingSessionIntentName(target.version, sessionHash));
+  let stats;
   try {
-    const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
-    const path = join(pinState.path, pendingSessionRegistrationName(sessionHash));
-    let stats;
-    try {
-      stats = lstatSync(path);
-    } catch (error) {
-      return error?.code !== 'ENOENT';
-    }
-    if (!stats.isFile() || stats.isSymbolicLink() || (stats.nlink !== 1 && stats.nlink !== 2) || stats.size <= 0 || stats.size > 256) return true;
-    const file = readPendingSessionRegistration(path, sessionHash);
-    if (!file || file.stats.dev !== stats.dev || file.stats.ino !== stats.ino) return true;
-    // A valid marker remains retryable regardless of age; only retirement applies
-    // the bounded mtime lease while holding the per-version mutation lock.
-    return true;
-  } finally {
-    closeLivePinDirectory(pinState);
+    stats = lstatSync(path);
+  } catch (error) {
+    return error?.code !== 'ENOENT';
   }
+  if (!stats.isFile() || stats.isSymbolicLink() || (stats.nlink !== 1 && stats.nlink !== 2) || stats.size <= 0 || stats.size > 256) return true;
+  const intent = readPendingSessionIntent(path, target.version, sessionHash);
+  if (!intent || intent.stats.dev !== stats.dev || intent.stats.ino !== stats.ino) return true;
+  // A valid intent remains retryable regardless of age; retirement applies the
+  // bounded mtime lease while holding the per-version mutation lock.
+  return true;
 }
 
 function renewPendingSessionRegistration(path, expectedStats) {
@@ -795,40 +811,52 @@ function renewPendingSessionRegistration(path, expectedStats) {
 }
 
 function writePendingSessionRegistration(pluginRoot, sessionId) {
-  let pinState;
+  let cacheBaseFd = null;
+  let stagePath = null;
+  let stageStats = null;
+  let stageContent = null;
   try {
     const target = livePinTarget(pluginRoot);
     if (!target) return false;
-    pinState = livePinDirectory(pluginRoot);
-    if (!pinState || pinState.version !== target.version || pinState.cacheBase !== target.cacheBase) return false;
-    const pinDir = pinState.path;
-    try {
-      mkdirSync(pinDir, { mode: 0o700 });
-    } catch (error) {
-      if (error?.code !== 'EEXIST') throw error;
-    }
-    const pinDirStats = lstatSync(pinDir);
-    if (!pinDirStats.isDirectory() || pinDirStats.isSymbolicLink()) return false;
-    if (process.platform !== 'linux' && !livePinRootMatches(pinState)) return false;
-
     const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
-    const name = pendingSessionRegistrationName(sessionHash);
-    const pendingPath = join(pinDir, name);
-    const content = `${JSON.stringify({ version: 1, sessionHash })}\n`;
+    const versionHash = livePinVersionHash(target.version);
+    const baseStats = lstatSync(target.cacheBase);
+    if (!baseStats.isDirectory() || baseStats.isSymbolicLink()) return false;
+    let cacheBasePath = target.cacheBase;
+    if (process.platform === 'linux') {
+      cacheBaseFd = openSync(target.cacheBase, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      const openedBaseStats = fstatSync(cacheBaseFd);
+      if (!openedBaseStats.isDirectory() || !sameFileIdentity(openedBaseStats, baseStats)) return false;
+      cacheBasePath = `/proc/self/fd/${cacheBaseFd}`;
+    }
+    const name = pendingSessionIntentName(target.version, sessionHash);
+    const pendingPath = join(cacheBasePath, name);
+    const content = `${JSON.stringify({ version: 1, cacheVersion: target.version, sessionHash })}\n`;
+    const cacheBaseStillNamed = () => {
+      if (process.platform === 'linux') return true;
+      try {
+        const current = lstatSync(target.cacheBase);
+        return current.isDirectory() && !current.isSymbolicLink() && sameFileIdentity(current, baseStats);
+      } catch {
+        return false;
+      }
+    };
     try {
       const existingStats = lstatSync(pendingPath);
       if (!existingStats.isFile() || existingStats.isSymbolicLink() || (existingStats.nlink !== 1 && existingStats.nlink !== 2)) return false;
-      const existing = readPendingSessionRegistration(pendingPath, sessionHash);
+      const existing = readPendingSessionIntent(pendingPath, target.version, sessionHash);
       if (!existing || existing.stats.dev !== existingStats.dev || existing.stats.ino !== existingStats.ino) return false;
+      if (!cacheBaseStillNamed()) return false;
       return renewPendingSessionRegistration(pendingPath, existingStats);
     } catch (error) {
       if (error?.code !== 'ENOENT') throw error;
     }
 
-    const stagePath = join(pinDir, `.stage-${process.pid}-${randomUUID()}`);
+    stagePath = join(cacheBasePath, `${LIVE_PIN_INTENT_STAGE_PREFIX}${versionHash}-${sessionHash}-${process.pid}-${randomUUID()}`);
     writeFileSync(stagePath, content, { flag: 'wx', mode: 0o600 });
-    const stageStats = lstatSync(stagePath);
-    if (process.platform !== 'linux' && !livePinRootMatches(pinState)) {
+    stageStats = lstatSync(stagePath);
+    stageContent = content;
+    if (!cacheBaseStillNamed()) {
       removeVerifiedLockEntry(stagePath, stageStats, content);
       return false;
     }
@@ -840,20 +868,26 @@ function writePendingSessionRegistration(pluginRoot, sessionId) {
       if (error?.code !== 'EEXIST') throw error;
     } finally {
       removeVerifiedLockEntry(stagePath, stageStats, content);
+      stagePath = null;
+      stageStats = null;
+      stageContent = null;
     }
     if (!published) {
-      const existing = readPendingSessionRegistration(pendingPath, sessionHash);
+      const existing = readPendingSessionIntent(pendingPath, target.version, sessionHash);
       if (!existing || !sameFileIdentity(existing.stats, lstatSync(pendingPath))) return false;
       if (!renewPendingSessionRegistration(pendingPath, existing.stats)) return false;
     }
-    // A pending marker is an intent, not a committed pin. Publish it even while
-    // retirement owns the sidecar lock so the retiree's final pin check can
-    // preserve this snapshot; the lock-owning CLI writer commits the durable pin.
+    if (!cacheBaseStillNamed()) return false;
+    // This sidecar intent survives snapshot quarantine on every platform. The
+    // lock-owning CLI writer commits the durable pin and then removes the intent.
     return true;
   } catch {
     return false;
   } finally {
-    closeLivePinDirectory(pinState);
+    if (stagePath && stageStats && stageContent !== null) removeVerifiedLockEntry(stagePath, stageStats, stageContent);
+    if (cacheBaseFd !== null) {
+      try { closeSync(cacheBaseFd); } catch {}
+    }
   }
 }
 
