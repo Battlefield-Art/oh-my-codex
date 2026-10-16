@@ -4,6 +4,22 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.21.16] - 2026-10-16
+
+Patch release for the frozen range `v0.21.15..00d06af4cac8663f409e66576f1719da28199ff0` (43 commits, 15 files, +6,158/−267; PRs #3792 and #3813).
+
+### Fixed
+
+- Pin live Codex sessions to the plugin-cache snapshots they use and preserve live-pinned snapshots during cache recovery; provide scoped repair for verified, managed, unpinned snapshots (#3792, fixing #3790; implemented by @Yeachan-Heo and reported by @spicysharkco).
+
+### Integration
+
+- Back-merge v0.21.15 from main into dev to preserve main ancestry (#3813, authored by @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.16.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.15...v0.21.16
+
 ## [0.21.15] - 2026-10-16
 
 Patch release for the frozen range `v0.21.14..38bbaab4c818cadcfe2b69de22c52cf56e670ca0` (6 commits, 39 files, +2,199/−152; PRs #3798, #3806, #3807, #3808, #3809, and #3811).
