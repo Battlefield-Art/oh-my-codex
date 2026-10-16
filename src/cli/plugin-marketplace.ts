@@ -54,6 +54,8 @@ const OMX_PLUGIN_LIVE_PIN_INTENT_LOCK_PREFIX = ".omx-live-pin-intent-";
 const OMX_PLUGIN_LIVE_PIN_RECORD_MAX_BYTES = 4096;
 // Empty pin directories can be initialization races, but abandoned ones must not pin forever.
 const OMX_PLUGIN_LIVE_PIN_INITIALIZATION_LEASE_MS = 5 * 60 * 1000;
+// A pin owner holds this lock while reading the owner's process-start identity (up to 3s on Windows).
+const OMX_PLUGIN_LIVE_PIN_MUTATION_LOCK_PIN_WAIT_MS = 5_000;
 const OMX_PLUGIN_CACHE_STAGING_PREFIX = ".omx-plugin-";
 const TEAM_MODE_PLUGIN_SKILL_NAMES = new Set(["team", "worker"]);
 
@@ -989,7 +991,9 @@ async function acquireOmxPluginCacheLivePinMutationLock(
 ): Promise<string | null> {
 	const token = randomUUID();
 	const content = `${JSON.stringify({ version: 1, pid: process.pid, operation, token })}\n`;
-	const retryUntil = waitForPinContention ? Date.now() + 500 : 0;
+	const retryUntil = waitForPinContention
+		? Date.now() + OMX_PLUGIN_LIVE_PIN_MUTATION_LOCK_PIN_WAIT_MS
+		: 0;
 	for (;;) {
 		const existing = await readOmxPluginCacheLivePinMutationLock(cacheBaseRef, version, name);
 		if (existing) {
@@ -1238,6 +1242,52 @@ async function removePendingOmxPluginCacheLivePinIntent(
 
 async function isLivePinOwnerAlive(record: OmxPluginCacheLivePinRecord): Promise<boolean> {
 	return isProcessOwnerAlive(record.pid, record.processStartHash);
+}
+
+async function hasLiveSessionPinRecord(
+	snapshotRef: DirectoryRef,
+	ownerPid: number,
+	sessionHash: string,
+): Promise<boolean> {
+	let pinDirectoryRef: DirectoryRef | undefined;
+	try {
+		pinDirectoryRef = await openDirectoryChild(snapshotRef, OMX_PLUGIN_LIVE_PIN_MARKER);
+		if (await livePinRetirementGateExists(pinDirectoryRef)) return false;
+		for (const entry of await readdir(pinDirectoryRef.scanOperationPath, { withFileTypes: true })) {
+			if (!entry.isFile() || entry.isSymbolicLink() || !entry.name.startsWith("pin-")) continue;
+			const path = join(pinDirectoryRef.operationPath, entry.name);
+			const stats = await lstat(path);
+			if (
+				!stats.isFile() ||
+				stats.isSymbolicLink() ||
+				stats.nlink !== 1 ||
+				stats.size <= 0 ||
+				stats.size > OMX_PLUGIN_LIVE_PIN_RECORD_MAX_BYTES
+			)
+				continue;
+			const bytes = await readOmxPluginCacheFileNoFollow(path, { anchorDir: pinDirectoryRef.operationPath });
+			if (bytes === null) continue;
+			let parsed: unknown;
+			try {
+				parsed = JSON.parse(bytes.toString("utf-8")) as unknown;
+			} catch {
+				continue;
+			}
+			const record = parseOmxPluginCacheLivePinRecord(parsed);
+			if (
+				record?.pid === ownerPid &&
+				record.sessionHash === sessionHash &&
+				entry.name === `pin-${record.pid}-${sessionHash.slice(0, 24)}-${record.processStartHash ?? "unknown"}.json` &&
+				(await isLivePinOwnerAlive(record))
+			)
+				return true;
+		}
+		return false;
+	} catch {
+		return false;
+	} finally {
+		if (pinDirectoryRef) await pinDirectoryRef.handle.close().catch(() => undefined);
+	}
 }
 
 async function hasLivePinIntent(
@@ -1662,7 +1712,33 @@ export async function registerOmxPluginCacheLivePin(
 	let result = false;
 	try {
 		mutationLockContent = await acquireOmxPluginCacheLivePinMutationLock(cacheBaseRef, version, "pin", true);
-		if (!mutationLockContent) return false;
+		if (!mutationLockContent) {
+			const [canonicalRoot, canonicalExpected] = await Promise.all([
+				canonicalRealpath(rootPath),
+				canonicalRealpath(expectedCacheDir),
+			]);
+			const sameRoot =
+				canonicalRoot !== null &&
+				canonicalExpected !== null &&
+				(process.platform === "win32"
+					? canonicalRoot.toLowerCase() === canonicalExpected.toLowerCase()
+					: canonicalRoot === canonicalExpected);
+			if (!sameRoot) return false;
+			snapshotRef = await openDirectoryChild(cacheBaseRef, version);
+			const snapshotManifest = await readRegularOmxPluginCacheManifest(
+				snapshotRef.operationPath,
+				snapshotRef.operationPath,
+			);
+			if (
+				snapshotManifest?.name !== OMX_PLUGIN_NAME ||
+				snapshotManifest.version !== version ||
+				!(await hasManagedCompletionMarker(snapshotRef.operationPath, version)) ||
+				(await hasPublicationMarkerEntry(snapshotRef.operationPath, ".omx-incomplete")) ||
+				!(await hasRegularPublicationMarker(snapshotRef.operationPath, OMX_PLUGIN_MANAGED_MARKER))
+			)
+				return false;
+			return await hasLiveSessionPinRecord(snapshotRef, ownerPid, sessionHash);
+		}
 		const [canonicalRoot, canonicalExpected] = await Promise.all([
 			canonicalRealpath(rootPath),
 			canonicalRealpath(expectedCacheDir),

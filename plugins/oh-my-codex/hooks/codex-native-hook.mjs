@@ -22,7 +22,6 @@ const LIVE_PIN_INTENT_PREFIX = '.omx-live-pin-intent-';
 const LIVE_PIN_INTENT_STAGE_PREFIX = '.stage-omx-live-pin-intent-';
 const LIVE_PIN_INTENT_RENEW_INTERVAL_MS = 60_000;
 const LIVE_PIN_INITIALIZATION_LEASE_MS = 5 * 60 * 1000;
-const LIVE_PIN_OWNER_IDENTITY_RECHECK_MS = 5 * 60 * 1000;
 const CODEX_HOOK_EVENT_NAMES = new Set([
   'SessionStart',
   'PreToolUse',
@@ -434,6 +433,28 @@ function buildSpawnOptions(command, extraEnv = {}) {
   return { ...options, shell: true, windowsHide: true };
 }
 
+function terminateHookDelegate(child, signal) {
+  if (process.platform !== 'win32' || !Number.isInteger(child.pid)) {
+    child.kill(signal);
+    return;
+  }
+  let killer;
+  try {
+    killer = spawn('taskkill.exe', ['/PID', String(child.pid), '/T', '/F'], {
+      stdio: 'ignore',
+      windowsHide: true,
+    });
+  } catch {
+    child.kill(signal);
+    return;
+  }
+  killer.once('error', () => child.kill(signal));
+  killer.once('close', (code) => {
+    if (code !== 0) child.kill(signal);
+  });
+  killer.unref();
+}
+
 function readJsonFile(path) {
   try {
     return JSON.parse(readFileSync(path, 'utf8'));
@@ -834,6 +855,27 @@ function pendingSessionIntentName(version, sessionHash) {
   return `${LIVE_PIN_INTENT_PREFIX}${livePinVersionHash(version)}-${sessionHash}.json`;
 }
 
+function leaseInvalidationObserver() {
+  const listeners = new Set();
+  let invalidated = false;
+  return {
+    invalidate() {
+      if (invalidated) return;
+      invalidated = true;
+      for (const listener of listeners) listener();
+      listeners.clear();
+    },
+    onInvalidated(listener) {
+      if (invalidated) {
+        listener();
+        return () => {};
+      }
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+}
+
 function readPendingSessionRegistration(pinPath, sessionHash) {
   const file = readNoFollowText(pinPath, 256, { allowHardLinks: true });
   if (!file) return null;
@@ -875,14 +917,32 @@ function hasPendingSessionRegistration(pluginRoot, sessionId) {
   try {
     stats = lstatSync(path);
   } catch (error) {
-    return error?.code !== 'ENOENT';
+    if (error?.code !== 'ENOENT') return true;
   }
-  if (!stats.isFile() || stats.isSymbolicLink() || (stats.nlink !== 1 && stats.nlink !== 2) || stats.size <= 0 || stats.size > 256) return true;
-  const intent = readPendingSessionIntent(path, target.version, sessionHash);
-  if (!intent || intent.stats.dev !== stats.dev || intent.stats.ino !== stats.ino) return true;
-  // A valid intent remains retryable regardless of age; retirement applies the
-  // bounded mtime lease while holding the per-version mutation lock.
-  return true;
+  if (stats) {
+    if (!stats.isFile() || stats.isSymbolicLink() || (stats.nlink !== 1 && stats.nlink !== 2) || stats.size <= 0 || stats.size > 256) return true;
+    const intent = readPendingSessionIntent(path, target.version, sessionHash);
+    if (!intent || !sameFileIdentity(intent.stats, stats)) return true;
+    return true;
+  }
+
+  let pinState;
+  try {
+    pinState = livePinDirectory(pluginRoot);
+  } catch {
+    return false;
+  }
+  if (!pinState) return false;
+  try {
+    const pendingPath = join(pinState.path, `${LIVE_PIN_PENDING_PREFIX}${sessionHash}.json`);
+    const pending = readPendingSessionRegistration(pendingPath, sessionHash);
+    // This pin-directory marker is also written by the CLI registration path.
+    // Retain it after a failed SessionStart so a recent stale durable pin cannot
+    // suppress the next registration attempt.
+    return pending !== null;
+  } finally {
+    closeLivePinDirectory(pinState);
+  }
 }
 
 function renewPendingFileLease(path, expectedStats) {
@@ -1065,16 +1125,22 @@ function startPendingSessionIntentLease(pluginRoot, sessionId) {
   const intent = readPendingSessionIntent(path, target.version, sessionHash);
   if (!intent || !sameFileIdentity(intent.stats, stats)) return null;
 
+  const invalidation = leaseInvalidationObserver();
   let leaseValid = true;
+  const invalidate = () => {
+    if (!leaseValid) return;
+    leaseValid = false;
+    invalidation.invalidate();
+  };
   const renew = () => {
     if (!leaseValid) return;
     try {
       const current = lstatSync(path);
       if (!sameFileIdentity(current, stats) || !writePendingSessionRegistration(pluginRoot, sessionId, stats)) {
-        leaseValid = false;
+        invalidate();
       }
     } catch {
-      leaseValid = false;
+      invalidate();
     }
   };
   const timer = setInterval(renew, LIVE_PIN_INTENT_RENEW_INTERVAL_MS);
@@ -1082,84 +1148,22 @@ function startPendingSessionIntentLease(pluginRoot, sessionId) {
   return {
     isValid() {
       if (!leaseValid || !isFreshPendingSessionIntent(pluginRoot, sessionId, stats)) {
-        leaseValid = false;
+        invalidate();
         return false;
       }
       return true;
+    },
+    onInvalidated(listener) {
+      return invalidation.onInvalidated(listener);
+    },
+    preserve() {
+      clearInterval(timer);
     },
     cleanup() {
       clearInterval(timer);
       removeVerifiedLockEntry(path, stats, content);
     },
   };
-}
-
-function hasLiveSessionPin(pluginRoot, sessionId) {
-  const sessionHash = createHash('sha256').update(sessionId.trim()).digest('hex');
-  let pinState;
-  try {
-    pinState = livePinDirectory(pluginRoot);
-  } catch {
-    return true;
-  }
-  if (!pinState) return true;
-  try {
-    const lockPath = join(pinState.cacheBase, livePinMutationLockName(pinState.version));
-    const mutationLock = readLivePinMutationLock(lockPath);
-    if (mutationLock && !removeDeadLivePinMutationLock(lockPath, mutationLock)) return true;
-    const entries = readdirSync(pinState.path, { withFileTypes: true });
-    for (const entry of entries) {
-      const pinPath = join(pinState.path, entry.name);
-      let stats;
-      try {
-        stats = lstatSync(pinPath);
-      } catch {
-        return true;
-      }
-      const ageMs = Date.now() - stats.mtimeMs;
-      if (entry.name.startsWith('.stage-')) {
-        if (!stats.isFile() || stats.isSymbolicLink() || !Number.isFinite(ageMs) || ageMs < 0 || ageMs <= 5 * 60 * 1000) return true;
-        continue;
-      }
-      if (entry.name.startsWith(LIVE_PIN_PENDING_PREFIX)) {
-        const file = readPendingSessionRegistration(pinPath, entry.name.slice(LIVE_PIN_PENDING_PREFIX.length, -'.json'.length));
-        if (!file || file.stats.dev !== stats.dev || file.stats.ino !== stats.ino) return true;
-        continue;
-      }
-      if (!entry.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || stats.size <= 0 || stats.size > 4096) return true;
-      const file = readNoFollowText(pinPath, 4096);
-      if (!file || file.stats.dev !== stats.dev || file.stats.ino !== stats.ino) return true;
-      let record;
-      try { record = JSON.parse(file.content); } catch { return true; }
-      if (
-        record?.version !== 1
-        || !Number.isSafeInteger(record.pid)
-        || record.pid <= 0
-        || (record.processStartHash !== null && (typeof record.processStartHash !== 'string' || !/^[0-9a-f]{24}$/.test(record.processStartHash)))
-        || typeof record.sessionHash !== 'string'
-        || !/^[0-9a-f]{64}$/.test(record.sessionHash)
-      ) return true;
-      if (isProcessAlive(record.pid)) {
-        if (
-          record.sessionHash === sessionHash
-          && Number.isFinite(ageMs)
-          && ageMs >= 0
-          && ageMs <= LIVE_PIN_OWNER_IDENTITY_RECHECK_MS
-        ) return true;
-        continue;
-      }
-      try {
-        unlinkSync(pinPath);
-      } catch {
-        return true;
-      }
-    }
-    return false;
-  } catch (error) {
-    return error?.code !== 'ENOENT';
-  } finally {
-    closeLivePinDirectory(pinState);
-  }
 }
 
 function hasKnownLiveSessionPin(pluginRoot, sessionId) {
@@ -1194,9 +1198,10 @@ function hasKnownLiveSessionPin(pluginRoot, sessionId) {
         && !Object.keys(record).some((key) => !['version', 'pid', 'processStartHash', 'sessionHash'].includes(key))
         && isProcessAlive(record.pid)
         && record.processStartHash !== null
-        // Identity lookup is only used by the fail-closed startup fallback, not per hook.
         && processStartHashForPid(record.pid) === record.processStartHash
-      ) return true;
+      ) {
+        return true;
+      }
     }
     return false;
   } catch {
@@ -1206,7 +1211,60 @@ function hasKnownLiveSessionPin(pluginRoot, sessionId) {
   }
 }
 
-function writePendingSessionPin(pluginRoot, sessionId) {
+function hasLivePinForDelegate(pluginRoot) {
+  let pinState;
+  try {
+    pinState = livePinDirectory(pluginRoot);
+  } catch (error) {
+    return error?.code !== 'ENOENT';
+  }
+  if (!pinState) {
+    try {
+      lstatSync(join(resolve(pluginRoot), '.omx-live-pin'));
+      return true;
+    } catch (error) {
+      return error?.code !== 'ENOENT';
+    }
+  }
+  try {
+    for (const entry of readdirSync(pinState.path, { withFileTypes: true })) {
+      if (!entry.name.startsWith('pin-')) continue;
+      // Retirement treats any unreadable or malformed durable pin entry as a
+      // reason to preserve the snapshot; keep an already-running delegate too.
+      if (!entry.isFile() || entry.isSymbolicLink()) return true;
+      const pinPath = join(pinState.path, entry.name);
+      const stats = lstatSync(pinPath);
+      if (!stats.isFile() || stats.isSymbolicLink() || stats.nlink !== 1 || stats.size <= 0 || stats.size > 4096) return true;
+      const file = readNoFollowText(pinPath, 4096);
+      if (!file || !sameFileIdentity(file.stats, stats)) return true;
+      let record;
+      try { record = JSON.parse(file.content); } catch { return true; }
+      const expectedName = typeof record?.sessionHash === 'string'
+        ? `pin-${record.pid}-${record.sessionHash.slice(0, 24)}-${record.processStartHash ?? 'unknown'}.json`
+        : '';
+      if (
+        record?.version !== 1
+        || !Number.isSafeInteger(record.pid)
+        || record.pid <= 0
+        || (record.processStartHash !== null && (typeof record.processStartHash !== 'string' || !/^[0-9a-f]{24}$/.test(record.processStartHash)))
+        || typeof record.sessionHash !== 'string'
+        || !/^[0-9a-f]{64}$/.test(record.sessionHash)
+        || entry.name !== expectedName
+      ) return true;
+      if (!isProcessAlive(record.pid)) continue;
+      if (record.processStartHash === null) return true;
+      const currentProcessStartHash = processStartHashForPid(record.pid);
+      if (currentProcessStartHash === null || currentProcessStartHash === record.processStartHash) return true;
+    }
+    return false;
+  } catch (error) {
+    return error?.code !== 'ENOENT';
+  } finally {
+    closeLivePinDirectory(pinState);
+  }
+}
+
+function writePendingSessionPin(pluginRoot, sessionId, stableSessionMarker = false) {
   let pinState;
   let mutationLock;
   try {
@@ -1227,7 +1285,9 @@ function writePendingSessionPin(pluginRoot, sessionId) {
     if (livePinRetirementGateExists(pinDir) || !livePinRootMatches(pinState) || !livePinMutationLockMatches(mutationLock)) return null;
     // This is a leased bootstrap guard, not the durable session record. A unique
     // pending marker expires after a crash instead of pinning on a reused PID.
-    const sessionHash = createHash('sha256').update(`${sessionId.trim()}\0${process.pid}\0${randomUUID()}`).digest('hex');
+    const sessionHash = stableSessionMarker
+      ? createHash('sha256').update(sessionId.trim()).digest('hex')
+      : createHash('sha256').update(`${sessionId.trim()}\0${process.pid}\0${randomUUID()}`).digest('hex');
     const record = { version: 1, sessionHash };
     const content = `${JSON.stringify(record)}\n`;
     const stageName = `.stage-pending-${sessionHash}-${process.pid}-${randomUUID()}`;
@@ -1266,8 +1326,8 @@ function writePendingSessionPin(pluginRoot, sessionId) {
   }
 }
 
-function startPendingSessionPinLease(pluginRoot, sessionId) {
-  const path = writePendingSessionPin(pluginRoot, sessionId);
+function startPendingSessionPinLease(pluginRoot, sessionId, stableSessionMarker = false) {
+  const path = writePendingSessionPin(pluginRoot, sessionId, stableSessionMarker);
   if (!path) return null;
   const match = basename(path).match(/^\.pending-([0-9a-f]{64})\.json$/);
   const pending = match ? readPendingSessionRegistration(path, match[1]) : null;
@@ -1276,10 +1336,16 @@ function startPendingSessionPinLease(pluginRoot, sessionId) {
     return null;
   }
   const stats = pending.stats;
+  const invalidation = leaseInvalidationObserver();
   let leaseValid = true;
+  const invalidate = () => {
+    if (!leaseValid) return;
+    leaseValid = false;
+    invalidation.invalidate();
+  };
   const renew = () => {
     if (!leaseValid) return;
-    if (!renewPendingSessionPinLease(pluginRoot, path, match[1], stats)) leaseValid = false;
+    if (!renewPendingSessionPinLease(pluginRoot, path, match[1], stats)) invalidate();
   };
   const timer = setInterval(renew, LIVE_PIN_INTENT_RENEW_INTERVAL_MS);
   timer.unref();
@@ -1287,10 +1353,16 @@ function startPendingSessionPinLease(pluginRoot, sessionId) {
     path,
     isValid() {
       if (!leaseValid || !isFreshPendingSessionPin(path, stats)) {
-        leaseValid = false;
+        invalidate();
         return false;
       }
       return true;
+    },
+    onInvalidated(listener) {
+      return invalidation.onInvalidated(listener);
+    },
+    preserve() {
+      clearInterval(timer);
     },
     cleanup() {
       clearInterval(timer);
@@ -1348,6 +1420,14 @@ function cleanupPendingSessionPin(pendingPin) {
     return;
   }
   removePendingSessionPin(pendingPin);
+}
+
+function finishSessionPendingPin(pluginRoot, sessionId, pendingPin) {
+  if (pendingPin && sessionId && hasPendingSessionRegistration(pluginRoot, sessionId)) {
+    if (typeof pendingPin.preserve === 'function') pendingPin.preserve();
+    return;
+  }
+  cleanupPendingSessionPin(pendingPin);
 }
 
 function isTerminalOutcome(value) {
@@ -1467,9 +1547,10 @@ function parseSingleJsonObjectOutput(raw) {
   return parseJsonObjectCandidate(lastLine);
 }
 
-async function pinUnroutedSession(input, launcher, pluginRoot, pendingPin) {
+async function pinUnroutedSession(input, launcher, pluginRoot, pendingPin, sessionId) {
+  let registered = false;
   try {
-    if (!launcher) return;
+    if (!launcher) return false;
     const { command, argsPrefix } = launcher;
     const child = spawn(
       command,
@@ -1483,11 +1564,13 @@ async function pinUnroutedSession(input, launcher, pluginRoot, pendingPin) {
     child.stderr.pipe(process.stderr);
     child.stdin.on('error', () => {});
     child.stdin.end(input);
-    await new Promise((resolveChild) => {
+    const result = await new Promise((resolveChild) => {
       let settled = false;
       let killTimeout;
+      let timedOut = false;
       const timeout = setTimeout(() => {
         if (settled) return;
+        timedOut = true;
         console.error('[oh-my-codex] live plugin cache pin helper timed out; a later hook may retry');
         child.kill('SIGTERM');
         child.stdin.destroy();
@@ -1497,26 +1580,29 @@ async function pinUnroutedSession(input, launcher, pluginRoot, pendingPin) {
         killTimeout = setTimeout(() => {
           if (settled) return;
           child.kill('SIGKILL');
-          finish();
+          finish(null, 'SIGKILL');
         }, LIVE_PIN_HELPER_KILL_GRACE_MS);
       }, LIVE_PIN_HELPER_TIMEOUT_MS);
-      const finish = () => {
+      const finish = (code, signal, error = null) => {
         if (settled) return;
         settled = true;
         clearTimeout(timeout);
         if (killTimeout) clearTimeout(killTimeout);
-        resolveChild();
+        resolveChild({ code, signal, error, timedOut });
       };
       child.once('error', (error) => {
         console.error(`[oh-my-codex] unable to launch live plugin cache pin writer: ${error.message}`);
-        finish();
+        finish(null, null, error);
       });
-      child.once('close', finish);
+      child.once('close', (code, signal) => finish(code, signal));
     });
+    registered = result.code === 0 && !result.signal && !result.error && !result.timedOut;
+    return registered;
   } catch (error) {
     console.error(`[oh-my-codex] unable to launch live plugin cache pin writer: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
   } finally {
-    cleanupPendingSessionPin(pendingPin);
+    finishSessionPendingPin(pluginRoot, sessionId, pendingPin);
   }
 }
 
@@ -1575,19 +1661,22 @@ async function main() {
     && sessionId.trim().length <= 256;
   const pendingRegistration = validSessionId && hasPendingSessionRegistration(pluginRoot, sessionId);
   let sessionIntentPublished = false;
+  let sessionIntentLease = null;
   let pinRegistrationPending = false;
   let pendingPin = null;
-  if (validSessionId && (sessionStart || pendingRegistration || !hasLiveSessionPin(pluginRoot, sessionId))) {
+  if (managedCacheStartup && validSessionId) {
     pinRegistrationPending = true;
-    sessionIntentPublished = writePendingSessionRegistration(pluginRoot, sessionId);
-    pendingPin = startupPendingPin ?? startPendingSessionPinLease(pluginRoot, sessionId);
+    sessionIntentLease = startPendingSessionIntentLease(pluginRoot, sessionId);
+    sessionIntentPublished = sessionIntentLease !== null;
+    if (sessionIntentLease) process.once('exit', sessionIntentLease.preserve);
+    pendingPin = startPendingSessionPinLease(pluginRoot, sessionId, true);
   }
 
   const startupIntentValid = startupIntentCleanup?.isValid() ?? false;
   const startupPendingPinValid = startupPendingPin?.isValid() ?? false;
   const sessionIntentValid = validSessionId
     && sessionIntentPublished
-    && isFreshPendingSessionIntent(pluginRoot, sessionId);
+    && (sessionIntentLease?.isValid() ?? isFreshPendingSessionIntent(pluginRoot, sessionId));
   const pendingPinValid = pendingPin && typeof pendingPin.isValid === 'function'
     ? pendingPin.isValid()
     : isFreshPendingSessionPin(pendingPin);
@@ -1606,7 +1695,8 @@ async function main() {
 
   if (!routedByLaunchCorrelation) {
     const pinLauncher = configuredLauncherAtStart;
-    if (pinRegistrationPending) await pinUnroutedSession(input, pinLauncher, pluginRoot, pendingPin);
+    if (pinRegistrationPending) await pinUnroutedSession(input, pinLauncher, pluginRoot, pendingPin, sessionId);
+    sessionIntentLease?.preserve();
     writePlainCodexNoop(isStop || isSubagentStop);
     return;
   }
@@ -1636,19 +1726,54 @@ async function main() {
   }
 
   if (configuredLauncherError || !configuredLauncherAtStart) {
-    cleanupPendingSessionPin(pendingPin);
+    finishSessionPendingPin(pluginRoot, sessionId, pendingPin);
     failLauncher(configuredLauncherError ?? new Error('plugin hook launcher is unavailable'), isStop, isCompact, isSubagentStop);
     return;
   }
 
   const { command, argsPrefix } = configuredLauncherAtStart;
   const extraEnv = { OMX_PLUGIN_ROOT: pluginRoot };
-  if (pinRegistrationPending) extraEnv.OMX_PLUGIN_CACHE_PIN_PENDING = '1';
+  if (pinRegistrationPending) {
+    extraEnv.OMX_PLUGIN_CACHE_PIN_PENDING = '1';
+    // Temporary leases protect only this registration attempt, never a delegated hook.
+    extraEnv.OMX_PLUGIN_CACHE_PIN_REQUIRED = '1';
+  }
   const child = spawn(
     command,
     [...argsPrefix, 'codex-native-hook'],
     buildSpawnOptions(command, extraEnv),
   );
+
+  let childClosed = false;
+  let protectionLost = false;
+  let checkingProtection = false;
+  let protectionKillTimeout = null;
+  const protectionLeases = [...new Set([
+    startupIntentCleanup,
+    startupPendingPin,
+    sessionIntentLease,
+    pendingPin,
+  ].filter((lease) => lease && typeof lease.isValid === 'function'))];
+  const stopChildWithoutProtection = () => {
+    if (childClosed || protectionLost || checkingProtection) return;
+    checkingProtection = true;
+    try {
+      if (protectionLeases.some((lease) => lease.isValid())) return;
+      if (hasLivePinForDelegate(pluginRoot)) return;
+      protectionLost = true;
+      console.error('[oh-my-codex] stopping native hook delegate after all live plugin cache guards were lost');
+      terminateHookDelegate(child, 'SIGTERM');
+      protectionKillTimeout = setTimeout(() => {
+        if (!childClosed) terminateHookDelegate(child, 'SIGKILL');
+      }, LIVE_PIN_HELPER_KILL_GRACE_MS);
+      protectionKillTimeout.unref?.();
+    } finally {
+      checkingProtection = false;
+    }
+  };
+  const removeProtectionListeners = protectionLeases
+    .filter((lease) => typeof lease.onInvalidated === 'function')
+    .map((lease) => lease.onInvalidated(stopChildWithoutProtection));
 
   const stdoutChunks = [];
   let stdoutBytes = 0;
@@ -1684,10 +1809,25 @@ async function main() {
   });
   child.on('error', (error) => {
     childSpawnError = error;
-    cleanupPendingSessionPin(pendingPin);
+    finishSessionPendingPin(pluginRoot, sessionId, pendingPin);
+    sessionIntentLease?.preserve();
   });
   child.on('close', (code, signal) => {
-    cleanupPendingSessionPin(pendingPin);
+    childClosed = true;
+    if (protectionKillTimeout) clearTimeout(protectionKillTimeout);
+    for (const removeListener of removeProtectionListeners) removeListener();
+    finishSessionPendingPin(pluginRoot, sessionId, pendingPin);
+    sessionIntentLease?.preserve();
+    if (protectionLost) {
+      if (isStop) {
+        writeStopFallback('plugin_stop_hook_cache_pin_lease_lost', 'native hook delegate lost every live plugin cache guard before completion');
+      } else if (isSubagentStop) {
+        writePlainCodexNoop(true);
+      } else {
+        process.exitCode = 1;
+      }
+      return;
+    }
     if (isStop && hookStdoutOversized) {
       writeStopFallback('plugin_stop_hook_launcher_stdout_oversized', `codex-native-hook produced more than ${MAX_BUFFERED_HOOK_STDOUT_BYTES} bytes of Stop hook stdout`);
       return;
