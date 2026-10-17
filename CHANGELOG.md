@@ -4,17 +4,19 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
-## [0.21.17] - 2026-10-17
+## [0.21.18] - 2026-10-17
 
-Patch release for the frozen range `v0.21.16..85c4aebd9ce08ad1dc3ac5ac20f92cd52259c5e4` (1 commit, 20 files, +4,261/−364; PR #3810).
+Patch release for the frozen range `v0.21.17..8edbeb8686a9f7288b45f03d8f553a72216832f1` (2 commits, 4 files, +358/−27; PR #3819).
 
 ### Fixed
 
-- Isolate mailbox delivery messages and recovery by team, preventing cross-team mailbox interference in multi-team sessions (#3810, authored by @Yeachan-Heo).
+- Bound managed hook-trust marker ranges and deduplicate repeated fences so foreign approved hook trust remains intact while tampered managed hashes remain fail-closed (#3819, reported in #3818 by @hetingyi; implemented by @Yeachan-Heo).
 
-Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.17.md).
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.18.md).
 
-**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.16...v0.21.17
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.17...v0.21.18
+
+## [0.21.17] - 2026-10-17
 
 ## [0.21.16] - 2026-10-16
 
