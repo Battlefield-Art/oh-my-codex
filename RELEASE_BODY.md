@@ -1,32 +1,35 @@
-# oh-my-codex 0.21.17
+# oh-my-codex 0.21.18
 
-`0.21.17` is a patch release for the frozen range `v0.21.16..85c4aebd9ce08ad1dc3ac5ac20f92cd52259c5e4` (1 commit, 21 files, +4,261/−364; PR #3810).
+`0.21.18` is a patch release for the frozen range `v0.21.17..8edbeb8686a9f7288b45f03d8f553a72216832f1` (2 commits, 4 files, +358/−27; PR #3819).
 
 ## Highlights
 
-- **Team-scoped mailbox delivery (#3810):** isolate mailbox messages and recovery by team, preventing cross-team mailbox interference in multi-team sessions and preserving message identity across recovery.
+- **Preserve foreign hook trust (#3819, fixing #3818):** clamp managed marker ranges at their first matching end, deduplicate repeated fences during refresh, and limit coordinate-family trust matching to indices OMX manages. Codex-approved foreign hook trust is preserved while tampered managed hashes remain fail-closed.
 
 ## Compatibility
 
-- Mailbox delivery and acknowledgement are now team-scoped; legacy mailbox records without team qualification are rejected at recovery.
-- Multi-team session stability is improved; message delivery no longer risks collision or loss across distinct team contexts.
+- Setup and doctor no longer treat approved foreign hook trust as a tampered managed-trust key when repeated OMX banners occur near the end of `config.toml`.
+- Repeated managed fences are normalized during refresh; managed hook trust remains bounded to OMX-owned coordinates.
 
-## Validation evidence
+## Validation
 
-- Frozen candidate `85c4aebd9ce08ad1dc3ac5ac20f92cd52259c5e4`: will be validated by required CI checks before merge and release workflow execution.
-- Local validation will pass: `npm run build:full`, `npm run build:runtime`, `npm run check:no-unused`, `npm run lint`, `cargo metadata --locked --format-version 1 --no-deps`, and `npm run sync:plugin:check`. Version and release tests will pass. `git diff --check` will pass.
+- Pinned candidate `8edbeb8686a9f7288b45f03d8f553a72216832f1`: 17 latest-per-name check runs succeeded and 8 were skipped; none failed or remained incomplete.
+- Local checks passed: `npm run build:full`, `npm run build:runtime`, `npm run check:no-unused`, `npm run lint`, `npm run sync:plugin:check`, and `cargo metadata --locked --format-version 1 --no-deps`.
+- Focused generator, setup-refresh, doctor-invalid-config, and plugin-cache regression tests: 105 passed.
 
 ## Merged PR inventory
 
 | PR | Author | Title |
 |---|---|---|
-| [#3810](https://github.com/Yeachan-Heo/oh-my-codex/pull/3810) | @Yeachan-Heo | fix(team): isolate mailbox messages by team |
+| [#3819](https://github.com/Yeachan-Heo/oh-my-codex/pull/3819) | @Yeachan-Heo | fix(config): clamp managed marker ranges and preserve foreign hook trust |
+
+Issue #3818 was reported by @hetingyi.
 
 ## Contributors
 
-Thanks to @Yeachan-Heo for implementation and release integration.
+Thanks to @Yeachan-Heo for the fix and @hetingyi for reporting the issue.
 
-**Full Changelog**: [`v0.21.16...v0.21.17`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.16...v0.21.17)
+**Full Changelog**: [`v0.21.17...v0.21.18`](https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.17...v0.21.18)
 
 —
 *[repo owner's gaebal-gajae (clawdbot) 🦞]*
