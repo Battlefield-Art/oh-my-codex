@@ -17,6 +17,9 @@ import {
   getMainDefaultModel,
   getSparkDefaultModel,
   getStandardDefaultModel,
+  getCodexConfigEffectiveModelProvider,
+  isBuiltinProvider,
+  isModelConfiguredAtRoot,
   type PerAgentReasoningEffort,
 } from "../config/models.js";
 import { getRootModelName } from "../config/generator.js";
@@ -140,6 +143,11 @@ interface RoleInstructionMetadata {
 
 interface ComposeRoleInstructionsOptions {
   nativeAgent?: boolean;
+  /**
+   * When true, suppress the exact-model overlay even if the agent has exactModel defined.
+   * Used when the agent will inherit from a custom provider at runtime.
+   */
+  suppressExactModelOverlay?: boolean;
 }
 
 function readConfigTomlContent(
@@ -181,7 +189,15 @@ function resolveAgentModel(
   if (modelOverride) {
     return modelOverride;
   }
-  if (agent.exactModel) {
+  const effectiveProvider = getCodexConfigEffectiveModelProvider(options.codexHomeOverride);
+  const isBuiltin = isBuiltinProvider(effectiveProvider);
+  const hasConfiguredModel = isModelConfiguredAtRoot(options.codexHomeOverride);
+  // Only use exactModel when a built-in provider is configured.
+  // When a custom/third-party provider is configured, skip exactModel and resolve based on modelClass,
+  // allowing the agent to work with models available in that provider.
+  // Also skip exactModel when no model is configured at root (even if a custom provider is set),
+  // to avoid baking astra guidance for provider-only configurations.
+  if (agent.exactModel && isBuiltin && (hasConfiguredModel || !effectiveProvider)) {
     return agent.exactModel;
   }
 
@@ -222,7 +238,7 @@ export function composeRoleInstructions(
   const exactModel = normalizedResolvedModel === EXACT_GPT_5_6_TERRA_MODEL
     ? EXACT_GPT_5_6_TERRA_MODEL
     : metadata?.exactModel;
-  if (exactModel && normalizedResolvedModel === exactModel) {
+  if (exactModel && normalizedResolvedModel === exactModel && !options.suppressExactModelOverlay) {
     parts.push("", buildExactModelOverlay(exactModel));
   }
 
@@ -347,9 +363,20 @@ export function generateAgentToml(
 ): string {
   const resolvedModel = resolveAgentModel(agent, options);
   const reasoningOverride = getAgentReasoningOverride(agent.name, options.codexHomeOverride);
-  const hasExactModel = !!agent.exactModel;
+  const effectiveProvider = getCodexConfigEffectiveModelProvider(options.codexHomeOverride);
+  const isBuiltin = isBuiltinProvider(effectiveProvider);
+  const hasConfiguredModel = isModelConfiguredAtRoot(options.codexHomeOverride);
+  // Only bake exactModel pin when using a built-in provider and a model is configured.
+  // When a custom/third-party provider is configured, agents should inherit the model from config.toml
+  // at runtime instead, allowing them to work with models available in that provider.
+  // Also suppress exact pins when no model is configured at root (even if a built-in provider is used).
+  const shouldBakeExactModel = !!agent.exactModel && isBuiltin && (hasConfiguredModel || !effectiveProvider);
   const hasAgentModelOverride = !!getAgentModelOverride(agent.name, options.codexHomeOverride);
   
+  // Suppress exact model overlay when the provider is custom without a configured model.
+  // In this case, the agent will inherit from the provider at runtime.
+  const suppressOverlay = !isBuiltin && !hasConfiguredModel;
+
   return generateStandaloneAgentToml({
     name: agent.name,
     description: agent.description,
@@ -357,11 +384,12 @@ export function generateAgentToml(
       promptContent,
       agent,
       resolvedModel,
-      { nativeAgent: true },
+      { nativeAgent: true, suppressExactModelOverlay: suppressOverlay },
     ),
-    // Only include model field if agent has explicit specification: exactModel or per-agent override.
+    // Only include model field if agent has explicit specification: exactModel (when using default provider) or per-agent override.
     // Without explicit specs, agents inherit from config.toml at runtime, staying current when config changes.
-    model: (hasExactModel || hasAgentModelOverride) ? resolvedModel : undefined,
+    // For custom/third-party providers, exactModel pins are omitted to allow the agent to work with the provider's available models.
+    model: (shouldBakeExactModel || hasAgentModelOverride) ? resolvedModel : undefined,
     // Never include modelProvider field in agent TOMLs to prevent staleness.
     // Agents inherit model_provider from config.toml at runtime. Not pinning provider for
     // model-only overrides allows independent provider updates at runtime.
