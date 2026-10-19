@@ -6,17 +6,19 @@ All notable changes to this project are documented in this file.
 
 ## [0.21.19] - 2026-10-19
 
-Patch release for agent model configuration and third-party provider fixes (4 commits, 6 files, +41/−29; PRs #3824, #3825, #3827, #3828).
+Patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution (7 commits, 8 files, +89/−54; PRs #3824, #3825, #3827, #3828, #3829, #3831).
 
 ### Fixed
 
 - Don't bake `exactModel` pins for third-party provider agents, so providers can rotate models and agents remain resolvable (#3824, fixes #3823, reported by @hetingyi; implemented by @Yeachan-Heo).
 - Align `omx doctor` spark-lane model check with runtime-inherited agent models, eliminating false "stale install" positives on valid configurations (#3825, fixes #3822, reported by @hetingyi; implemented by @Yeachan-Heo).
 - Honor profile-scoped model overrides and guidance in agent runtime config (#3827, @Yeachan-Heo).
+- Resolve the active profile model before root fallbacks, keep exact pins when built-in providers omit models, and avoid claiming fallback models for provider-only configs (#3831, @Yeachan-Heo).
 
 ### Maintenance
 
 - Make MDM-marker readiness termination deterministic by removing timing-sensitive sleeps for adaptive backoff (#3828, @Yeachan-Heo).
+- Always take a final readiness poll before the readiness deadline (#3829, @Yeachan-Heo).
 
 Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.19.md).
 
