@@ -1,6 +1,6 @@
 # oh-my-codex 0.21.19
 
-`0.21.19` is a patch release for agent model configuration and third-party provider fixes (4 commits, 6 files, +41/−29; PRs #3824, #3825, #3827, #3828).
+`0.21.19` is a patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution (7 commits, 8 files, +89/−54; PRs #3824, #3825, #3827, #3828, #3829, #3831).
 
 Versioning continues the 0.21.x patch train. This release corrects agent model resolution when third-party providers omit explicit models or when profile-scoped model configurations are active, and eliminates false "stale install" diagnostics from `omx doctor` when using runtime-inherited agent models.
 
@@ -9,6 +9,8 @@ Versioning continues the 0.21.x patch train. This release corrects agent model r
 - **Third-party provider model pins (#3824, fixing #3823):** stop baking `exactModel` pins for agents using third-party providers, allowing providers to rotate their default models while keeping agents resolvable. Authored by @Yeachan-Heo. Reported by @hetingyi.
 - **Runtime-inherited model detection (#3825, fixing #3822):** align `omx doctor` spark-lane model checks with runtime-inherited agent model behavior, eliminating false positives that `omx setup --force` could never clear. Authored by @Yeachan-Heo. Reported by @hetingyi.
 - **Profile-scoped model overrides (#3827):** honor profile-scoped agent model settings and override guidance in generated agent runtime config. Authored by @Yeachan-Heo.
+- **Effective profile model resolution (#3831):** resolve active profile models before built-in fallbacks, keep exact pins when built-in providers omit models, and avoid claiming fallback models for provider-only configs. Authored by @Yeachan-Heo.
+- **Final readiness poll (#3829):** always perform final team readiness poll before the timeout deadline. Authored by @Yeachan-Heo.
 
 ## Compatibility
 
@@ -28,6 +30,8 @@ The pinned candidate `987f4b0d73f1f6c369ad24758c31197412dc3451` passed latest-pe
 | [#3825](https://github.com/Yeachan-Heo/oh-my-codex/pull/3825) | @Yeachan-Heo | fix(doctor): align spark-lane model check with runtime-inherited agents |
 | [#3827](https://github.com/Yeachan-Heo/oh-my-codex/pull/3827) | @Yeachan-Heo | fix(agents): honor profile-scoped models and override guidance |
 | [#3828](https://github.com/Yeachan-Heo/oh-my-codex/pull/3828) | @Yeachan-Heo | test(team): make MDM-marker readiness termination deterministic |
+| [#3829](https://github.com/Yeachan-Heo/oh-my-codex/pull/3829) | @Yeachan-Heo | fix(team): always take a final readiness poll before the deadline |
+| [#3831](https://github.com/Yeachan-Heo/oh-my-codex/pull/3831) | @Yeachan-Heo | fix(agents): resolve the effective profile model for pins, metadata and guidance |
 
 Issue #3822 was reported by @hetingyi.
 Issue #3823 was reported by @hetingyi.
