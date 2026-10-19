@@ -4,6 +4,24 @@ All notable changes to this project are documented in this file.
 
 ## [Unreleased]
 
+## [0.21.19] - 2026-10-19
+
+Patch release for agent model configuration and third-party provider fixes (4 commits, 6 files, +41/−29; PRs #3824, #3825, #3827, #3828).
+
+### Fixed
+
+- Don't bake `exactModel` pins for third-party provider agents, so providers can rotate models and agents remain resolvable (#3824, fixes #3823, reported by @hetingyi; implemented by @Yeachan-Heo).
+- Align `omx doctor` spark-lane model check with runtime-inherited agent models, eliminating false "stale install" positives on valid configurations (#3825, fixes #3822, reported by @hetingyi; implemented by @Yeachan-Heo).
+- Honor profile-scoped model overrides and guidance in agent runtime config (#3827, @Yeachan-Heo).
+
+### Maintenance
+
+- Make MDM-marker readiness termination deterministic by removing timing-sensitive sleeps for adaptive backoff (#3828, @Yeachan-Heo).
+
+Full inventory, contributors, compatibility notes, and verification: [release notes](docs/release-notes-0.21.19.md).
+
+**Full Changelog**: https://github.com/Yeachan-Heo/oh-my-codex/compare/v0.21.18...v0.21.19
+
 ## [0.21.18] - 2026-10-17
 
 Patch release for the frozen range `v0.21.17..8edbeb8686a9f7288b45f03d8f553a72216832f1` (2 commits, 4 files, +358/−27; PR #3819).
