@@ -2,6 +2,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { spawn, spawnSync } from "node:child_process";
 import { chmod, cp, link, lstat, mkdir, mkdtemp, readFile, readdir, rm, utimes, writeFile } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { delimiter, dirname, join } from "node:path";
 import { describe, it } from "node:test";
@@ -17,6 +18,7 @@ import {
 } from "../plugin-marketplace.js";
 
 const packageRoot = process.cwd();
+const packageVersion = JSON.parse(readFileSync(join(packageRoot, "package.json"), "utf-8")) as { version: string };
 
 async function withIsolatedUserHome<T>(
 	wd: string,
@@ -366,7 +368,7 @@ describe("issue 3790 live plugin cache pins", () => {
 				const packaged = await resolvePackagedOmxMarketplace(packageRoot);
 				assert.ok(packaged);
 				const pluginManifest = JSON.parse(await readFile(packaged.pluginManifestPath, "utf-8")) as { version: string };
-				assert.equal(pluginManifest.version, "0.21.20");
+				assert.equal(pluginManifest.version, packageVersion.version);
 
 				const published = await materializePackagedOmxPluginCache(codexHomeDir, packaged);
 				assert.equal(published.status, "materialized");
