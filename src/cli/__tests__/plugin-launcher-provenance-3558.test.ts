@@ -331,7 +331,7 @@ describe("issue 3558 launcher provenance", () => {
             await setup({ scope: "user", installMode: "plugin" });
           });
           assert.doesNotMatch(output, /already exposes/);
-          assert.match(output, /not safe to use as current/);
+          assert.match(output, /incompatible launcher provenance/);
           assert.match(output, /provenance mismatch/);
           const packaged = await resolvePackagedOmxMarketplace(packageRoot);
           assert.ok(packaged);
