@@ -1004,4 +1004,124 @@ describe("agents/native-config", () => {
       await rm(codexHome, { recursive: true, force: true });
     }
   });
+
+  it("preserves exactModel pins for profile-scoped built-in provider model (Codex finding 4309255932)", async () => {
+    const codexHome = join(tmpdir(), `omx-profile-builtin-model-test-${process.pid}`);
+    try {
+      // Create a config.toml with profile-scoped built-in provider and model, but no root model
+      // This reproduces the scenario from finding 4309255932
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, "config.toml"), [
+        'profile = "work-lane"',
+        '',
+        '[profiles.work-lane]',
+        'model_provider = "openai-chatgpt"',
+        'model = "gpt-6-luna"',
+      ].join("\n"));
+
+      // With profile-scoped built-in provider and model (no root model),
+      // planner SHOULD bake exactModel because:
+      // - It has exactModel (gpt-6-astra)
+      // - The effective provider is built-in (openai-chatgpt from profile)
+      // - The effective model is configured (gpt-6-luna in profile)
+      const plannerToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.match(plannerToml, /model = "gpt-6-astra"/, "planner should bake exactModel with profile-scoped built-in provider and model");
+      assert.match(plannerToml, /exact gpt-6-astra model/, "planner should receive astra guidance with profile-scoped built-in provider and model");
+
+      // Same for architect
+      const architectToml = generateAgentToml(AGENT_DEFINITIONS.architect, "architect prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.match(architectToml, /model = "gpt-6-astra"/, "architect should bake exactModel with profile-scoped built-in provider and model");
+      assert.match(architectToml, /exact gpt-6-astra model/, "architect should receive astra guidance with profile-scoped built-in provider and model");
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("preserves exact guidance for custom provider with per-agent override (Codex finding 4309255938)", async () => {
+    const codexHome = join(tmpdir(), `omx-custom-override-test-${process.pid}`);
+    try {
+      // Create a config.toml with custom provider, no root model, but explicit agentModels override
+      // This reproduces the scenario from finding 4309255938
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, "config.toml"), [
+        'model_provider = "custom_provider"',
+        '',
+        '[model_providers.custom_provider]',
+        'name = "custom_provider"',
+        'base_url = "http://localhost:3000/v1"',
+        'wire_api = "responses"',
+        'requires_openai_auth = true',
+        'env_key = "CUSTOM_PROVIDER_API_KEY"',
+      ].join("\n"));
+      await writeFile(join(codexHome, ".omx-config.json"), JSON.stringify({
+        agentModels: { planner: "gpt-5.6-terra" }
+      }));
+
+      // With custom provider, no root model, but explicit planner override to gpt-5.6-terra,
+      // planner SHOULD bake the override model AND receive terra guidance because:
+      // - There IS an explicit per-agent override (planner: "gpt-5.6-terra")
+      // - The overlay should NOT be suppressed when there's an override
+      const plannerToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.match(plannerToml, /model = "gpt-5\.6-terra"/, "planner should bake override model with per-agent override");
+      assert.match(plannerToml, /exact gpt-5\.6-terra model/, "planner should receive terra guidance with per-agent override");
+
+      // Architect should NOT have override or guidance (no override specified)
+      const architectToml = generateAgentToml(AGENT_DEFINITIONS.architect, "architect prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.doesNotMatch(architectToml, /^model\s*=/m, "architect should not bake model without override");
+      assert.doesNotMatch(architectToml, /exact gpt-6-astra model/, "architect should not emit astra guidance without override");
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("resolves profile model before falling back to env vars (Codex P2 finding)", async () => {
+    const codexHome = join(tmpdir(), `omx-profile-env-priority-test-${process.pid}`);
+    const origFrontierModel = process.env.OMX_DEFAULT_FRONTIER_MODEL;
+    try {
+      // Create a config.toml with profile-scoped built-in provider and model, but no root model
+      // Also set OMX_DEFAULT_FRONTIER_MODEL env var to a different model
+      // The profile model should take precedence and planner should return exactModel
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, "config.toml"), [
+        'profile = "work-lane"',
+        '',
+        '[profiles.work-lane]',
+        'model_provider = "openai-chatgpt"',
+        'model = "gpt-6-luna"',
+      ].join("\n"));
+
+      // Set env var to a different model
+      process.env.OMX_DEFAULT_FRONTIER_MODEL = "gpt-5.6-terra";
+
+      // With profile-scoped built-in provider and model + env var set,
+      // planner should return exactModel (gpt-6-astra), not the env var default
+      const plannerToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.match(plannerToml, /model = "gpt-6-astra"/, "planner should bake exactModel, not env var default, when profile model is set");
+      assert.match(plannerToml, /exact gpt-6-astra model/, "planner should receive astra guidance, not fall back to env var");
+
+      // Same for architect
+      const architectToml = generateAgentToml(AGENT_DEFINITIONS.architect, "architect prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.match(architectToml, /model = "gpt-6-astra"/, "architect should bake exactModel, not env var default");
+      assert.match(architectToml, /exact gpt-6-astra model/, "architect should receive astra guidance");
+    } finally {
+      if (typeof origFrontierModel === "string") {
+        process.env.OMX_DEFAULT_FRONTIER_MODEL = origFrontierModel;
+      } else {
+        delete process.env.OMX_DEFAULT_FRONTIER_MODEL;
+      }
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
 });
