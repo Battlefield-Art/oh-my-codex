@@ -20,10 +20,13 @@ import {
   getCodexConfigEffectiveModel,
   getCodexConfigEffectiveModelProvider,
   isBuiltinProvider,
+  isProfileScopedModel,
   type PerAgentReasoningEffort,
 } from "../config/models.js";
 import { getRootModelName } from "../config/generator.js";
 import { codexAgentsDir } from "../utils/paths.js";
+
+
 
 export const EXACT_GPT_5_6_TERRA_MODEL = "gpt-5.6-terra";
 
@@ -190,9 +193,9 @@ function resolveAgentModel(
     return modelOverride;
   }
   const effectiveProvider = getCodexConfigEffectiveModelProvider(options.codexHomeOverride);
-  // Normalize provider for case-insensitive built-in check
-  const normalizedProvider = effectiveProvider?.toLowerCase();
-  const isBuiltin = isBuiltinProvider(normalizedProvider);
+  // Use case-sensitive provider classification for consistency.
+  // Custom providers like "OpenAI" should not match built-in "openai".
+  const isBuiltin = isBuiltinProvider(effectiveProvider);
   const effectiveModel = getCodexConfigEffectiveModel(options.codexHomeOverride);
   
   // Decision logic for exact model pins and resolution:
@@ -200,7 +203,9 @@ function resolveAgentModel(
   // 2. If custom provider (explicitly set):
   //    a. If a model is configured (root or profile): return it for metadata
   //    b. If no model configured: return undefined (don't emit fallback metadata)
-  // 3. Otherwise (built-in + no exactModel or implicit default): use modelClass-based defaults
+  // 3. If built-in provider with no exactModel, but a model is configured (profile or root):
+  //    Return the configured model before falling back to modelClass defaults (fixes #4310223529)
+  // 4. Otherwise (built-in + no exactModel + no configured model): use modelClass-based defaults
   
   if (agent.exactModel && isBuiltin) {
     // Built-in provider (or implicit default): always use exactModel for roles that have it
@@ -221,6 +226,15 @@ function resolveAgentModel(
       // (agent inherits from provider's unknown default; don't emit astra fallback metadata)
       return undefined;
     }
+  }
+
+  // Apply profile models before class-based fallbacks (fixing #4310223529)
+  // If a built-in provider has a profile-scoped model, use it
+  // instead of falling back to env/class-based defaults.
+  // Note: Root models follow the existing precedence (env > root), so don't override for those.
+  if (effectiveModel && isBuiltin && isProfileScopedModel(options.codexHomeOverride)) {
+    // Built-in provider with profile-scoped model configuration
+    return effectiveModel;
   }
 
   if (agent.name === "executor") {
@@ -386,6 +400,9 @@ export function generateAgentToml(
   const resolvedModel = resolveAgentModel(agent, options);
   const reasoningOverride = getAgentReasoningOverride(agent.name, options.codexHomeOverride);
   const effectiveProvider = getCodexConfigEffectiveModelProvider(options.codexHomeOverride);
+  // Use case-sensitive provider classification for consistency.
+  // Both functions use the raw provider ID without normalization to correctly
+  // distinguish between built-in "openai" and custom providers like "OpenAI".
   const isBuiltin = isBuiltinProvider(effectiveProvider);
   const hasAgentModelOverride = !!getAgentModelOverride(agent.name, options.codexHomeOverride);
   

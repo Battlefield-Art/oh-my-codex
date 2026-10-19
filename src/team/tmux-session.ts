@@ -3618,8 +3618,9 @@ export function waitForWorkerReady(
     delayMs = Math.min(maxBackoffMs, delayMs * 2);
   }
 
-  // Final check before returning false, guaranteed to happen before the deadline
-  if (check()) return true;
+  // Final check before returning false, only if budget remains (finding #4310223535)
+  const finalRemaining = timeoutMs - (Date.now() - startedAt);
+  if (finalRemaining > 0 && check()) return true;
   if (blockedByTrustPrompt) return false;
 
   return false;
@@ -3728,8 +3729,9 @@ export async function waitForWorkerReadyDetailedAsync(
     delayMs = Math.min(maxBackoffMs, delayMs * 2);
   }
 
-  // Final check before returning false, guaranteed to happen before the deadline
-  if (await check()) return true;
+  // Final check before returning false, only if budget remains (finding #4310223535)
+  const finalRemaining = timeoutMs - (Date.now() - startedAt);
+  if (finalRemaining > 0 && await check()) return true;
   if (startupIncompatible) return false;
   if (blockedByTrustPrompt) return false;
 
