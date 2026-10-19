@@ -1,6 +1,6 @@
 # oh-my-codex 0.21.19
 
-`0.21.19` is a patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution (7 commits, 8 files, +89/−54; PRs #3824, #3825, #3827, #3828, #3829, #3831).
+`0.21.19` is a patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution and provider classification (19 commits, 16 files, +925/−41; PRs #3824, #3825, #3827, #3828, #3829, #3831, #3832).
 
 ## Highlights
 

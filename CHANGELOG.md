@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file.
 
 ## [0.21.19] - 2026-10-19
 
-Patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution and provider classification (9 commits, 10 files, +151/−73; PRs #3824, #3825, #3827, #3828, #3829, #3831, #3832).
+Patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution and provider classification (19 commits, 16 files, +925/−41; PRs #3824, #3825, #3827, #3828, #3829, #3831, #3832).
 
 ### Fixed
 

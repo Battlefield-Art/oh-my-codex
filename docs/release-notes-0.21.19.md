@@ -1,6 +1,6 @@
 # oh-my-codex 0.21.19
 
-`0.21.19` is a patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution and provider classification (9 commits, 10 files, +151/−73; PRs #3824, #3825, #3827, #3828, #3829, #3831, #3832).
+`0.21.19` is a patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution and provider classification (19 commits, 16 files, +925/−41; PRs #3824, #3825, #3827, #3828, #3829, #3831, #3832).
 
 Versioning continues the 0.21.x patch train. This release corrects agent model resolution when third-party providers omit explicit models or when profile-scoped model configurations are active, and eliminates false "stale install" diagnostics from `omx doctor` when using runtime-inherited agent models.
 
