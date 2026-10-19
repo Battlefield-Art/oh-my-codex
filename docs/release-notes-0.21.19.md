@@ -1,6 +1,6 @@
 # oh-my-codex 0.21.19
 
-`0.21.19` is a patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution (7 commits, 8 files, +89/−54; PRs #3824, #3825, #3827, #3828, #3829, #3831).
+`0.21.19` is a patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution and provider classification (9 commits, 10 files, +151/−73; PRs #3824, #3825, #3827, #3828, #3829, #3831, #3832).
 
 Versioning continues the 0.21.x patch train. This release corrects agent model resolution when third-party providers omit explicit models or when profile-scoped model configurations are active, and eliminates false "stale install" diagnostics from `omx doctor` when using runtime-inherited agent models.
 
@@ -11,6 +11,7 @@ Versioning continues the 0.21.x patch train. This release corrects agent model r
 - **Profile-scoped model overrides (#3827):** honor profile-scoped agent model settings and override guidance in generated agent runtime config. Authored by @Yeachan-Heo.
 - **Effective profile model resolution (#3831):** resolve active profile models before built-in fallbacks, keep exact pins when built-in providers omit models, and avoid claiming fallback models for provider-only configs. Authored by @Yeachan-Heo.
 - **Final readiness poll (#3829):** always perform final team readiness poll before the timeout deadline. Authored by @Yeachan-Heo.
+- **Provider classification normalization (#3832):** normalize provider IDs consistently to preserve case sensitivity while ensuring matching behavior across configuration generation, exact pins, and metadata. Bound final readiness poll to avoid blocking startup when timeout budget is exhausted. Authored by @Yeachan-Heo.
 
 ## Compatibility
 
@@ -32,6 +33,7 @@ The pinned candidate `987f4b0d73f1f6c369ad24758c31197412dc3451` passed latest-pe
 | [#3828](https://github.com/Yeachan-Heo/oh-my-codex/pull/3828) | @Yeachan-Heo | test(team): make MDM-marker readiness termination deterministic |
 | [#3829](https://github.com/Yeachan-Heo/oh-my-codex/pull/3829) | @Yeachan-Heo | fix(team): always take a final readiness poll before the deadline |
 | [#3831](https://github.com/Yeachan-Heo/oh-my-codex/pull/3831) | @Yeachan-Heo | fix(agents): resolve the effective profile model for pins, metadata and guidance |
+| [#3832](https://github.com/Yeachan-Heo/oh-my-codex/pull/3832) | @Yeachan-Heo | fix(agents,team): preserve case-sensitive provider IDs and bound the final readiness poll |
 
 Issue #3822 was reported by @hetingyi.
 Issue #3823 was reported by @hetingyi.

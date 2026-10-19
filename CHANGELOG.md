@@ -6,7 +6,7 @@ All notable changes to this project are documented in this file.
 
 ## [0.21.19] - 2026-10-19
 
-Patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution (7 commits, 8 files, +89/−54; PRs #3824, #3825, #3827, #3828, #3829, #3831).
+Patch release for agent model configuration and third-party provider fixes with correctness improvements for profile-scoped model resolution and provider classification (9 commits, 10 files, +151/−73; PRs #3824, #3825, #3827, #3828, #3829, #3831, #3832).
 
 ### Fixed
 
@@ -14,6 +14,8 @@ Patch release for agent model configuration and third-party provider fixes with 
 - Align `omx doctor` spark-lane model check with runtime-inherited agent models, eliminating false "stale install" positives on valid configurations (#3825, fixes #3822, reported by @hetingyi; implemented by @Yeachan-Heo).
 - Honor profile-scoped model overrides and guidance in agent runtime config (#3827, @Yeachan-Heo).
 - Resolve the active profile model before root fallbacks, keep exact pins when built-in providers omit models, and avoid claiming fallback models for provider-only configs (#3831, @Yeachan-Heo).
+- Normalize provider IDs consistently to preserve case sensitivity in generated configs while applying the same classification for exact pins and metadata (#3832, @Yeachan-Heo).
+- Bound the final readiness poll to the configured timeout to prevent startup blocking when the remaining budget is exhausted (#3832, @Yeachan-Heo).
 
 ### Maintenance
 
