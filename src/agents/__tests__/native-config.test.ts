@@ -618,9 +618,10 @@ describe("agents/native-config", () => {
           OMX_DEFAULT_SPARK_MODEL: "gpt-5.6-luna",
         },
       }));
+      // Use lowercase "openai" (built-in) instead of "OpenAI" (custom) to match expected behavior
       await writeFile(join(codexHome, "config.toml"), [
         'model = "gpt-5.6-sol"',
-        'model_provider = "OpenAI"',
+        'model_provider = "openai"',  // Built-in provider
         '',
       ].join('\n'));
       await writeFile(join(promptsDir, "explore.md"), "explore prompt");
@@ -630,7 +631,7 @@ describe("agents/native-config", () => {
         catalogManifest: manifestWithAgents(["explore"]),
       });
       const exploreToml = await readFile(join(outDir, "explore.toml"), "utf8");
-      // Model resolved from env config, but without explicit per-agent override, not written to TOML
+      // Model resolved from env default for Spark-lane agents (gpt-5.6-luna), not from root config
       assert.match(exploreToml, /resolved_model: gpt-5\.6-luna/);
       assert.doesNotMatch(exploreToml, /model_provider = /);
     } finally {
@@ -1220,6 +1221,64 @@ describe("agents/native-config", () => {
       assert.doesNotMatch(architectToml, /^model\s*=/m, "architect should not bake model field with custom provider and no root model");
       assert.doesNotMatch(architectToml, /resolved_model:/, "architect should not emit resolved_model metadata with custom provider and no root model");
       assert.doesNotMatch(architectToml, /exact gpt-6-astra model/, "architect should not emit astra guidance with custom provider and no root model");
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("treats mixed-case provider IDs as custom providers (Codex finding new)", async () => {
+    const codexHome = join(tmpdir(), `omx-mixed-case-provider-test-${process.pid}`);
+    try {
+      // Create a config.toml with mixed-case provider ID ("OpenAI" instead of lowercase "openai")
+      // This should be treated as a custom provider, NOT the built-in "openai" provider,
+      // to preserve intentional custom provider configurations.
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, "config.toml"), [
+        'model_provider = "OpenAI"',  // Custom provider (not built-in)
+        'model = "gpt-6-astra"',
+      ].join("\n"));
+
+      // With a custom provider, planner should NOT bake exactModel
+      const plannerToml = generateAgentToml(AGENT_DEFINITIONS.planner, "planner prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.doesNotMatch(plannerToml, /^model\s*=/m, "planner should not bake model field with custom provider");
+      assert.doesNotMatch(plannerToml, /exact gpt-6-astra model/, "planner should not receive exact guidance with custom provider");
+
+      // Same for architect
+      const architectToml = generateAgentToml(AGENT_DEFINITIONS.architect, "architect prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.doesNotMatch(architectToml, /^model\s*=/m, "architect should not bake model field with custom provider");
+      assert.doesNotMatch(architectToml, /exact gpt-6-astra model/, "architect should not receive exact guidance with custom provider");
+    } finally {
+      await rm(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  it("applies profile models before built-in fallbacks (Codex finding 4310223529)", async () => {
+    // This test verifies that when a built-in provider has an explicit model configured
+    // (from profile or root), roles without exactModel get that model instead of
+    // falling back to env/class-based defaults.
+    const codexHome = join(tmpdir(), `omx-profile-model-test-${process.pid}`);
+    try {
+      // Create a config with built-in provider and explicit model
+      // For roles without exactModel (like debugger), this model should be used
+      // instead of falling back to resolveStandardModel/resolveFrontierModel
+      await mkdir(codexHome, { recursive: true });
+      await writeFile(join(codexHome, "config.toml"), [
+        'model = "gpt-5.6-terra"',
+        'model_provider = "openai"',  // Built-in provider
+      ].join("\n"));
+
+      // Debugger has no exactModel, so with this fix it should:
+      // 1. See built-in provider (openai)
+      // 2. See configured model (gpt-5.6-terra)
+      // 3. Return the configured model instead of falling back to modelClass defaults
+      const debuggerToml = generateAgentToml(AGENT_DEFINITIONS.debugger, "debugger prompt", {
+        codexHomeOverride: codexHome,
+      });
+      assert.match(debuggerToml, /resolved_model: gpt-5\.6-terra/, "debugger should resolve to configured model with built-in provider");
     } finally {
       await rm(codexHome, { recursive: true, force: true });
     }

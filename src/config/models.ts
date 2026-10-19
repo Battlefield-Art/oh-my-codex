@@ -340,6 +340,26 @@ export function isModelConfigured(codexHomeOverride?: string): boolean {
   return !!getCodexConfigEffectiveModel(codexHomeOverride);
 }
 
+/**
+ * Check if a model is configured by an active profile (not at root).
+ * Used to determine if profile models should apply before class-based fallbacks.
+ */
+export function isProfileScopedModel(codexHomeOverride?: string): boolean {
+  const config = readCodexConfigFile(codexHomeOverride);
+  if (!config) return false;
+  
+  const activeProfile = normalizeConfiguredValue(config.profile);
+  if (!activeProfile) return false;
+  
+  const profiles = config.profiles;
+  if (!profiles || typeof profiles !== 'object' || Array.isArray(profiles)) return false;
+  
+  const profileConfig = profiles[activeProfile];
+  if (!profileConfig || typeof profileConfig !== 'object' || Array.isArray(profileConfig)) return false;
+  
+  return !!normalizeConfiguredValue(profileConfig.model);
+}
+
 export function getCodexConfigRootModelProvider(codexHomeOverride?: string): string | undefined {
   return normalizeConfiguredValue(readCodexConfigFile(codexHomeOverride)?.model_provider);
 }
